@@ -97,6 +97,31 @@ test("role prompts preserve placeholder-shaped requests and artifact handoffs li
   assert.match(resolver, /classification \{\{REQUEST\}\}/);
 });
 
+test("rendered builder prompts preserve the simplification contract", async () => {
+  const prompt = await buildRolePrompt(
+    "builder",
+    makeRun("implement the approved change"),
+    artifactStore({}),
+  );
+
+  assert.match(
+    prompt,
+    /before declaring the implementation ready for deterministic CI and subsequent independent verification/i,
+  );
+  assert.match(
+    prompt,
+    /Simplification review outcome: summarize safe in-scope simplifications applied, or state that none were identified\./,
+  );
+  assert.match(
+    prompt,
+    /Do not weaken safety, security, concurrency, recovery, idempotency, audit, evidence, parity, compatibility, or operator-facing guarantees through simplification\./,
+  );
+  assert.match(
+    prompt,
+    /Preserve public and operator-facing interfaces, persisted state, checkpoint contracts, errors, and observable outcomes unless the approved change explicitly revises them\./,
+  );
+});
+
 test("comment classifier prompts preserve placeholder-shaped review comments literally", async () => {
   const prompt = await buildCommentClassifierPrompt(
     makeRun("request {{DESIGN}}"),

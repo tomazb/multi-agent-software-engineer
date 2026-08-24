@@ -25,7 +25,7 @@ This repository implements a deterministic multi-agent software delivery orchest
 
 ## Builder simplification gate
 
-Before declaring the implementation ready for deterministic CI and verification, the builder must review the changed code and the directly affected collaborators needed to understand the change for avoidable complexity introduced or materially worsened by the implementation.
+Before declaring the implementation ready for deterministic CI and subsequent independent verification, the builder must review the changed code and the directly affected collaborators needed to understand the change for avoidable complexity introduced or materially worsened by the implementation.
 
 Apply safe, behavior-preserving simplifications when they are local, within the approved scope, and materially improve the changed implementation. Examples include duplicated logic, unnecessarily complex control flow, unclear local interfaces, avoidable indirection, and mixed responsibilities directly involved in the change.
 
