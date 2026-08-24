@@ -505,6 +505,7 @@ Cover:
 - successful retry clears terminal cleanup metadata atomically with return to nonterminal state;
 - supersede explicitly abandons preserved predecessor recovery before cleanup;
 - repeated cleanup after success is idempotent;
+- repeated-run resource bound: create and terminalize at least 20 sequential isolated-worktree runs in one repository, complete successful cleanup for each, assert each managed path is absent after cleanup, and assert the final Git worktree-registration set and managed-worktree directory count return to the pre-test baseline (except any explicitly created `preserved` recovery fixtures, whose exact residual set must be asserted);
 - cleanup does not mutate quality, verification, merge-ready, or GitHub evidence;
 - physical success followed by cleanup-state publication failure is recovered by a later cleanup invocation;
 - concurrent cleanup versus retry/supersede follows the serialized outcomes in Section 12.
@@ -561,6 +562,7 @@ Also require exact-head CI, independent exact-head review, and zero unresolved a
 - **AC-30.14:** Cleanup/retry/supersede races are serialized through the existing per-run mutation journal.
 - **AC-30.15:** Production cleanup tests remain separate from #18 smoke-fixture cleanup ownership.
 - **AC-30.16:** Supported Node baselines, package checks, exact-head CI, independent review, and review-thread gates pass before merge.
+- **AC-30.17:** Repeated terminal-run cleanup proves bounded production resource usage: after at least 20 sequential isolated-worktree runs are terminalized and successfully cleaned, managed worktree paths and Git registrations return to the pre-test baseline, with only an explicitly asserted preserved-recovery set allowed to remain.
 
 ## 20. Non-goals
 
