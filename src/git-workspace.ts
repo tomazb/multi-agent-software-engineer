@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { appendFile, lstat, mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { RunRecord, RunWorkspace } from "./domain.ts";
+import type { RunRecord, RunWorkspace, TerminalCleanupFailureCode } from "./domain.ts";
 import {
   gitChangedFiles,
   gitCurrentBranch,
@@ -177,6 +177,234 @@ export function parseGitWorktreeRegistrationsPorcelain(
     registrations.push({ worktreePath, headSha, ...(branch ? { branch } : {}), prunable });
   }
   return registrations;
+}
+
+export class TerminalCleanupError extends Error {
+  readonly code: TerminalCleanupFailureCode;
+
+  constructor(code: TerminalCleanupFailureCode, message: string) {
+    super(message);
+    this.name = "TerminalCleanupError";
+    this.code = code;
+  }
+}
+
+export type TerminalCleanupPathState = "absent" | "directory" | "unsafe";
+
+export interface TerminalCleanupDependencies {
+  listRegistrations(repositoryPath: string): Promise<GitWorktreeRegistration[]>;
+  inspectPath(candidatePath: string): Promise<TerminalCleanupPathState>;
+  removeWorktree(
+    repositoryPath: string,
+    worktreePath: string,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+}
+
+async function inspectTerminalCleanupPath(
+  candidatePath: string,
+): Promise<TerminalCleanupPathState> {
+  try {
+    const stat = await lstat(candidatePath);
+    return stat.isDirectory() && !stat.isSymbolicLink() ? "directory" : "unsafe";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+    throw error;
+  }
+}
+
+async function defaultRemoveWorktree(
+  repositoryPath: string,
+  worktreePath: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
+}
+
+function throwTerminalCleanup(code: TerminalCleanupFailureCode, message: string): never {
+  throw new TerminalCleanupError(code, message);
+}
+
+function resolveRegistrationPath(registration: GitWorktreeRegistration): string {
+  return path.resolve(registration.worktreePath);
+}
+
+function findRegistrationForPath(
+  registrations: GitWorktreeRegistration[],
+  worktreePath: string,
+): GitWorktreeRegistration | undefined {
+  const resolved = path.resolve(worktreePath);
+  return registrations.find((registration) => resolveRegistrationPath(registration) === resolved);
+}
+
+function findRegistrationForBranch(
+  registrations: GitWorktreeRegistration[],
+  branch: string,
+): GitWorktreeRegistration | undefined {
+  return registrations.find((registration) => registration.branch === branch);
+}
+
+export async function reconcileTerminalWorktreeCleanup(
+  run: RunRecord,
+  invocationRepositoryPath: string,
+  dependencies?: Partial<TerminalCleanupDependencies>,
+): Promise<void> {
+  const deps: TerminalCleanupDependencies = {
+    listRegistrations: dependencies?.listRegistrations ?? listGitWorktreeRegistrations,
+    inspectPath: dependencies?.inspectPath ?? inspectTerminalCleanupPath,
+    removeWorktree: dependencies?.removeWorktree ?? defaultRemoveWorktree,
+  };
+
+  const repositoryPath = run.repositoryPath;
+  const workspace = run.workspace;
+  const worktreePath = workspace?.worktreePath;
+  const expectedBranch = `maswe/${run.id}`;
+
+  if (path.resolve(invocationRepositoryPath) !== path.resolve(repositoryPath)) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Cleanup invocation repository root must match the run repositoryPath exactly",
+    );
+  }
+  if (!workspace || !worktreePath) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Terminal worktree cleanup requires a recorded managed worktree path",
+    );
+  }
+  if (path.resolve(worktreePath) === path.resolve(repositoryPath)) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Refusing to delete the operator checkout worktree path",
+    );
+  }
+  if (path.resolve(worktreePath) !== path.resolve(externalWorktreePath(repositoryPath, run.id))) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Recorded worktree path does not match the deterministic external worktree path",
+    );
+  }
+  if (workspace.branch !== expectedBranch) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      `Recorded branch ${workspace.branch} does not match expected ${expectedBranch}`,
+    );
+  }
+
+  let registrations: GitWorktreeRegistration[];
+  try {
+    registrations = await deps.listRegistrations(repositoryPath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to inspect Git worktree registrations",
+    );
+  }
+
+  let pathState: TerminalCleanupPathState;
+  try {
+    pathState = await deps.inspectPath(worktreePath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to inspect worktree path",
+    );
+  }
+
+  if (pathState === "unsafe") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree path is not an ordinary directory",
+    );
+  }
+
+  const branchRegistration = findRegistrationForBranch(registrations, expectedBranch);
+  if (
+    branchRegistration &&
+    resolveRegistrationPath(branchRegistration) !== path.resolve(worktreePath)
+  ) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      `Expected branch ${expectedBranch} is registered at a different worktree path`,
+    );
+  }
+
+  const targetRegistration = findRegistrationForPath(registrations, worktreePath);
+  if (targetRegistration) {
+    if (targetRegistration.branch !== expectedBranch) {
+      throwTerminalCleanup(
+        "cleanup-ownership-mismatch",
+        "Target worktree registration branch does not match the run workspace branch",
+      );
+    }
+    if (targetRegistration.headSha !== workspace.headSha.toLowerCase()) {
+      throwTerminalCleanup(
+        "cleanup-ownership-mismatch",
+        "Target worktree registration HEAD does not match the run workspace headSha",
+      );
+    }
+  }
+
+  if (!targetRegistration && pathState === "directory") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Refusing to delete an unregistered worktree directory",
+    );
+  }
+
+  if (!targetRegistration && pathState === "absent") {
+    return;
+  }
+
+  const removeResult = await deps.removeWorktree(repositoryPath, worktreePath);
+
+  let postRegistrations: GitWorktreeRegistration[];
+  try {
+    postRegistrations = await deps.listRegistrations(repositoryPath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to re-inspect Git worktree registrations",
+    );
+  }
+
+  let postPathState: TerminalCleanupPathState;
+  try {
+    postPathState = await deps.inspectPath(worktreePath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to re-inspect worktree path",
+    );
+  }
+
+  const postTargetRegistration = findRegistrationForPath(postRegistrations, worktreePath);
+  if (!postTargetRegistration && postPathState === "absent") {
+    return;
+  }
+
+  if (postTargetRegistration && postPathState === "directory") {
+    if (removeResult.exitCode !== 0) {
+      throwTerminalCleanup(
+        "cleanup-remove-failed",
+        removeResult.stderr || removeResult.stdout || "git worktree remove failed",
+      );
+    }
+    throwTerminalCleanup(
+      "cleanup-postcondition-failed",
+      "Worktree registration and directory remained after git worktree remove",
+    );
+  }
+
+  if (postTargetRegistration && postPathState === "absent") {
+    throwTerminalCleanup(
+      "cleanup-postcondition-failed",
+      "Worktree registration remained after the target path disappeared",
+    );
+  }
+
+  throwTerminalCleanup(
+    "cleanup-postcondition-failed",
+    "Worktree cleanup postconditions were not satisfied",
+  );
 }
 
 export async function listGitWorktreeRegistrations(
