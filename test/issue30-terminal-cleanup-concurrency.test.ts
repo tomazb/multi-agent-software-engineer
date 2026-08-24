@@ -471,6 +471,74 @@ test("supersede wins: terminal-recovery abandons preserved predecessor before cl
   await access(otherWorktree);
 });
 
+test("supersede wins recovery: queued retry refuses superseded predecessor before cleanup", async (t) => {
+  const cwd = await initGitRepo();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const inner = new FileRunStore(cwd);
+  const store = new PredecessorAbandonBarrierStore(inner);
+  const config = isolatedConfig();
+  const abandonGate = createGate();
+  store.gate = abandonGate;
+  const failed = await createRetryableFailedPending(cwd, inner, config);
+  store.predecessorId = failed.id;
+  const worktreePath = failed.workspace?.worktreePath;
+  assert.ok(worktreePath);
+  const overlap = createOverlapTracker();
+  const supersedeOrchestrator = new Orchestrator(cwd, config, new MockRuntime(), store, {
+    terminalCleanupDependencies: {
+      removeWorktree: async (repositoryPath, candidatePath) => {
+        overlap.enter("cleanup");
+        const ops = await unreleasedOperations(cwd, failed.id);
+        assert.equal(
+          ops.includes("run-terminal-recovery"),
+          false,
+          "shared cleanup must run only after terminal-recovery is released",
+        );
+        assert.ok(ops.includes("run-terminal-cleanup"));
+        overlap.leave("cleanup");
+        return gitRemoveWorktree(repositoryPath, candidatePath);
+      },
+    },
+  });
+  const retryOrchestrator = new Orchestrator(cwd, config, new MockRuntime(), store);
+
+  const supersedePromise = supersedeOrchestrator.supersede(failed.id);
+  await abandonGate.entered;
+  const retryPromise = retryOrchestrator.retryFromFailed(failed.id);
+  await Promise.race([
+    waitFor("queued terminal-recovery behind supersede abandon", async () => {
+      const ops = await unreleasedOperations(cwd, failed.id);
+      return ops.filter((operation) => operation === "run-terminal-recovery").length >= 2;
+    }),
+    retryPromise.then((result) => {
+      throw new Error(
+        `retry finished while supersede still held recovery; state=${result.state}`,
+      );
+    }),
+    supersedePromise.then((result) => {
+      throw new Error(
+        `supersede finished before queued retry was observed; replacement=${result.id}`,
+      );
+    }),
+  ]);
+  assert.equal((await inner.load(failed.id)).supersededBy, undefined);
+  abandonGate.release();
+
+  await assert.rejects(
+    retryPromise,
+    (error: unknown) =>
+      error instanceof Error && /was already superseded by/.test(error.message),
+  );
+  const replacement = await supersedePromise;
+  const abandoned = await inner.load(failed.id);
+  assert.equal(abandoned.state, "FAILED");
+  assert.equal(abandoned.supersededBy, replacement.id);
+  assert.equal(abandoned.terminalCleanup?.status, "complete");
+  assert.equal(retryEvents(abandoned).length, 0);
+  assertNoCleanupWorkflowEvent(abandoned);
+  await assert.rejects(access(worktreePath), /ENOENT/);
+});
+
 test("publication vs cleanup: one FIFO journal owner at a time with no overlap", async (t) => {
   const cwd = await initGitRepo();
   t.after(async () => rm(cwd, { recursive: true, force: true }));

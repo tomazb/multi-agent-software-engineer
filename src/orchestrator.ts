@@ -2623,9 +2623,15 @@ export class Orchestrator {
     if (prior.state !== "FAILED" || !prior.failure?.resumeState || !prior.failure) {
       throw new Error("retry requires a FAILED run with failure.resumeState");
     }
+    if (prior.supersededBy) {
+      throw new Error(`Run ${runId} was already superseded by ${prior.supersededBy}`);
+    }
     prior = await this.reconcileFailedRevalidationTarget(prior);
     if (prior.state !== "FAILED" || !prior.failure?.resumeState || !prior.failure) {
       throw new Error("retry requires a FAILED run with failure.resumeState");
+    }
+    if (prior.supersededBy) {
+      throw new Error(`Run ${runId} was already superseded by ${prior.supersededBy}`);
     }
 
     let resumed = await withRunMutationFence(
@@ -2641,6 +2647,11 @@ export class Orchestrator {
           !authoritative.failure
         ) {
           throw new Error("retry requires a FAILED run with failure.resumeState");
+        }
+        if (authoritative.supersededBy) {
+          throw new Error(
+            `Run ${runId} was already superseded by ${authoritative.supersededBy}`,
+          );
         }
         const previousFailure = structuredClone(authoritative.failure);
         const priorEventIds = new Set(authoritative.events.map((event) => event.id));
