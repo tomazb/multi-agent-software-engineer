@@ -27,7 +27,7 @@ This repository implements a deterministic multi-agent software delivery orchest
 
 Before declaring the implementation ready for deterministic CI and verification, the builder must review the changed code and the directly affected collaborators needed to understand the change for avoidable complexity introduced or materially worsened by the implementation.
 
-Apply safe, behavior-preserving simplifications when they are local, within the authorized scope, and materially improve the changed implementation. Examples include duplicated logic, unnecessarily complex control flow, unclear local interfaces, avoidable indirection, and mixed responsibilities directly involved in the change.
+Apply safe, behavior-preserving simplifications when they are local, within the approved scope, and materially improve the changed implementation. Examples include duplicated logic, unnecessarily complex control flow, unclear local interfaces, avoidable indirection, and mixed responsibilities directly involved in the change.
 
 - Inspection may extend to directly affected collaborators when necessary to understand the changed implementation, but this does not expand edit authority. Do not edit outside the governing scope. Record worthwhile out-of-scope simplifications for disposition under the governing issue, design, or plan rather than implementing them.
 - Do not turn a scoped feature, correctness, safety, or review fix into a general refactoring effort. Pre-existing complexity alone is not authorization to restructure it.
