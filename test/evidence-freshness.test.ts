@@ -15,7 +15,11 @@ import type {
   RuntimeRequest,
   RuntimeResult,
 } from "../src/domain.ts";
-import { ensureRunWorkspace, refreshWorkspaceHead } from "../src/git-workspace.ts";
+import {
+  ensureRunWorkspace,
+  refreshWorkspaceHead,
+  TerminalCleanupError,
+} from "../src/git-workspace.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import {
   RevalidationOptimisticConflictError,
@@ -872,15 +876,34 @@ test("quality command that edits a tracked file fails closed before verifier", a
 
 test("quality command that creates a commit invalidates and fails before verifier", async () => {
   const cwd = await initRepo();
+  const store = new FileRunStore(cwd);
   const config = baseConfig((c) => {
     c.quality.commands = [
       `node -e "require('fs').writeFileSync('src/ok.ts','export const y=1\\n'); require('child_process').execFileSync('git',['add','src/ok.ts']); require('child_process').execFileSync('git',['commit','-qm','ci commit'])"`,
     ];
   });
-  const orchestrator = new Orchestrator(cwd, config, new EditingBuilder());
-  const run = await orchestrator.start("CI commit", "Quality must not commit.");
+  const orchestrator = new Orchestrator(cwd, config, new EditingBuilder(), store);
+  await assert.rejects(
+    () => orchestrator.start("CI commit", "Quality must not commit."),
+    (error: unknown) =>
+      error instanceof TerminalCleanupError &&
+      error.code === "cleanup-ownership-mismatch",
+  );
+  const runs = await store.list();
+  assert.equal(runs.length, 1);
+  const run = await store.load(runs[0]!.id);
   assert.equal(run.state, "FAILED");
   assert.match(run.failure?.message ?? "", /clean worktree|HEAD moved|dirty|commit/i);
+  assert.equal(run.events.some((e) => e.type === "VERIFY_PASSED"), false);
+  assert.equal(run.terminalCleanup?.status, "failed");
+  assert.equal(
+    run.terminalCleanup?.lastError?.code,
+    "cleanup-ownership-mismatch",
+  );
+  assert.equal(
+    run.events.filter((event) => event.type === "FAIL").length,
+    1,
+  );
 });
 
 test("HEAD change between CI and verifier fails closed", async () => {

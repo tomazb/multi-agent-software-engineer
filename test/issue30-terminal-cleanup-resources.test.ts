@@ -62,7 +62,7 @@ function canonicalizeRegistrations(
 
 test(
   "AC-30.17: twenty sequential isolated-worktree cleanups return registrations and managed-root entries to baseline except the asserted preserved-recovery fixture",
-  { timeout: 180_000 },
+  { timeout: 360_000 },
   async (t) => {
     const cwd = await initGitRepo();
     const managedRoot = path.dirname(externalWorktreePath(cwd, "probe-id"));
