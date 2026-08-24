@@ -6,7 +6,9 @@ import type {
   RoleId,
   RunFailureCode,
   RunRecord,
+  RunTerminalCleanup,
   RuntimeFinishedResult,
+  TerminalCleanupPreservationReason,
   WorkflowState,
 } from "./domain.ts";
 import { buildCommentClassifierPrompt, buildRolePrompt } from "./prompt-builder.ts";
@@ -164,6 +166,44 @@ function requiresWorkspacePreservation(error: unknown): boolean {
     }
   }
   return false;
+}
+
+function terminalCleanupIntent(
+  run: RunRecord,
+  preservationReason?: TerminalCleanupPreservationReason,
+): RunTerminalCleanup {
+  const updatedAt = new Date().toISOString();
+  if (!run.config.policy.useIsolatedWorktree || !run.workspace?.worktreePath) {
+    return { status: "complete", updatedAt };
+  }
+  if (preservationReason) {
+    return { status: "preserved", updatedAt, preservationReason };
+  }
+  return { status: "pending", updatedAt };
+}
+
+function attachTerminalCleanupIntent(
+  run: RunRecord,
+  preservationReason?: TerminalCleanupPreservationReason,
+): void {
+  run.terminalCleanup = terminalCleanupIntent(run, preservationReason);
+}
+
+function failRunPreservationReason(
+  run: RunRecord,
+  error: unknown,
+): TerminalCleanupPreservationReason | undefined {
+  if (run.revalidation !== undefined) return "revalidation-recovery";
+  if (requiresWorkspacePreservation(error)) return "publication-outcome-unknown";
+  return undefined;
+}
+
+function optionalFailRunPreservation(
+  run: RunRecord,
+  error: unknown,
+): { preservationReason?: TerminalCleanupPreservationReason } {
+  const preservationReason = failRunPreservationReason(run, error);
+  return preservationReason ? { preservationReason } : {};
 }
 
 function isCanonicalFileStoreTimestamp(value: string): boolean {
@@ -437,7 +477,7 @@ export class Orchestrator {
           runFailureMessage(error),
           runFailureCode(error),
           runFailureRuntime(error),
-          { preserveCreatedWorkspace: true },
+          { preservationReason: "bootstrap-recovery" },
         );
       }
       throw new Error(
@@ -505,7 +545,7 @@ export class Orchestrator {
             runFailureMessage(error),
             runFailureCode(error),
             runFailureRuntime(error),
-            { preserveWorkspace: true },
+            { preservationReason: "revalidation-recovery" },
           );
         }
       }
@@ -1303,10 +1343,7 @@ export class Orchestrator {
                   runFailureMessage(error),
                   runFailureCode(error),
                   runFailureRuntime(error),
-                  {
-                    preserveWorkspace:
-                      run.revalidation !== undefined || requiresWorkspacePreservation(error),
-                  },
+                  optionalFailRunPreservation(run, error),
                 ),
               };
             }
@@ -1337,10 +1374,7 @@ export class Orchestrator {
                   runFailureMessage(error),
                   runFailureCode(error),
                   runFailureRuntime(error),
-                  {
-                    preserveWorkspace:
-                      run.revalidation !== undefined || requiresWorkspacePreservation(error),
-                  },
+                  optionalFailRunPreservation(run, error),
                 ),
               };
             }
@@ -1629,10 +1663,7 @@ export class Orchestrator {
         runFailureMessage(error),
         runFailureCode(error),
         runFailureRuntime(error),
-        {
-          preserveWorkspace:
-            run.revalidation !== undefined || requiresWorkspacePreservation(error),
-        },
+        optionalFailRunPreservation(run, error),
       );
     }
   }
@@ -1902,14 +1933,14 @@ export class Orchestrator {
     message: string,
     code: RunFailureCode = "workflow-failure",
     runtime?: DurableRuntimeFailureSummary,
-    options: { preserveCreatedWorkspace?: boolean; preserveWorkspace?: boolean } = {},
+    options: { preservationReason?: TerminalCleanupPreservationReason } = {},
   ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
-    if (options.preserveCreatedWorkspace && resumeState !== "CREATED") {
+    if (options.preservationReason === "bootstrap-recovery" && resumeState !== "CREATED") {
       throw new Error("Workspace preservation is allowed only for a CREATED bootstrap failure");
     }
     const finishFailure = (record: RunRecord): Promise<RunRecord> =>
-      options.preserveCreatedWorkspace || options.preserveWorkspace
+      options.preservationReason
         ? Promise.resolve(record)
         : this.finalizeTerminal(record);
     const safeMessage = safeFailureMessage(message);
@@ -1921,6 +1952,7 @@ export class Orchestrator {
       ...(resumeState ? { resumeState } : {}),
       ...(runtime ? { runtime } : {}),
     };
+    attachTerminalCleanupIntent(candidate, options.preservationReason);
     if (isTerminal(candidate.state)) {
       await this.store.save(candidate);
       return finishFailure(candidate);
@@ -2262,16 +2294,20 @@ export class Orchestrator {
     const completed = await this.withFinalGatePublicationFence(
       runId,
       "complete",
-      async (run, headSha) => this.store.applyEvent(run, "COMPLETE", "user", {
-        headSha,
-        mergeReadySha: headSha,
-      }),
+      async (run, headSha) => {
+        attachTerminalCleanupIntent(run);
+        return this.store.applyEvent(run, "COMPLETE", "user", {
+          headSha,
+          mergeReadySha: headSha,
+        });
+      },
     );
     return this.finalizeTerminal(completed);
   }
 
   async cancel(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
+    attachTerminalCleanupIntent(run);
     const cancelled = await this.store.applyEvent(run, "CANCEL", "user");
     return this.finalizeTerminal(cancelled);
   }
@@ -2347,6 +2383,7 @@ export class Orchestrator {
     if (workspace) candidate.workspace = workspace;
     else delete candidate.workspace;
     delete candidate.failure;
+    delete candidate.terminalCleanup;
     await this.beforeRetryPublication?.(candidate);
     await this.assertOptionalRevalidationFence(prior, retryFence);
     const publicationCandidate = structuredClone(candidate);
@@ -2439,6 +2476,7 @@ export class Orchestrator {
         at: new Date().toISOString(),
         resumeState: existing.state as WorkflowState,
       };
+      attachTerminalCleanupIntent(existing);
       const cancelled = await this.store.applyEvent(existing, "CANCEL", "user", {
         reason: "superseded",
         supersededBy: replacement.id,
