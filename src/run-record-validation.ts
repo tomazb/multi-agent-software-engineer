@@ -5,6 +5,10 @@ import {
   type ArtifactReference,
   type MasweConfig,
   type RunRecord,
+  type RunTerminalCleanup,
+  type TerminalCleanupFailureCode,
+  type TerminalCleanupPreservationReason,
+  type TerminalCleanupStatus,
   type WorkflowEvent,
   type WorkflowEventType,
   type WorkflowState,
@@ -375,6 +379,120 @@ function validateFailure(value: unknown): NonNullable<RunRecord["failure"]> {
   };
 }
 
+const TERMINAL_CLEANUP_STATUSES = [
+  "pending",
+  "complete",
+  "failed",
+  "preserved",
+] as const satisfies readonly TerminalCleanupStatus[];
+
+const TERMINAL_CLEANUP_PRESERVATION_REASONS = [
+  "bootstrap-recovery",
+  "revalidation-recovery",
+  "publication-outcome-unknown",
+] as const satisfies readonly TerminalCleanupPreservationReason[];
+
+const TERMINAL_CLEANUP_FAILURE_CODES = [
+  "cleanup-inspection-failed",
+  "cleanup-ownership-mismatch",
+  "cleanup-remove-failed",
+  "cleanup-postcondition-failed",
+  "cleanup-legacy-state-ambiguous",
+] as const satisfies readonly TerminalCleanupFailureCode[];
+
+function validateTerminalCleanup(value: unknown): NonNullable<RunRecord["terminalCleanup"]> {
+  const cleanup = exactObject(
+    value,
+    "run record terminalCleanup",
+    ["status", "updatedAt", "preservationReason", "lastError"],
+    ["status", "updatedAt"],
+  );
+  if (
+    !TERMINAL_CLEANUP_STATUSES.includes(cleanup.status as TerminalCleanupStatus)
+  ) {
+    throw new Error("Run record terminalCleanup.status is invalid");
+  }
+  const status = cleanup.status as TerminalCleanupStatus;
+  const updatedAt = canonicalTimestamp(
+    cleanup.updatedAt,
+    "Run record terminalCleanup.updatedAt",
+  );
+  const hasPreservationReason = cleanup.preservationReason !== undefined;
+  const hasLastError = cleanup.lastError !== undefined;
+
+  if (status === "pending" || status === "complete") {
+    if (hasPreservationReason) {
+      throw new Error(
+        "Run record terminalCleanup must not include preservationReason for pending or complete status",
+      );
+    }
+    if (hasLastError) {
+      throw new Error(
+        "Run record terminalCleanup must not include lastError for pending or complete status",
+      );
+    }
+    return { status, updatedAt };
+  }
+
+  if (status === "preserved") {
+    if (!hasPreservationReason) {
+      throw new Error(
+        "Run record terminalCleanup.preservationReason is required for preserved status",
+      );
+    }
+    if (hasLastError) {
+      throw new Error(
+        "Run record terminalCleanup must not include lastError for preserved status",
+      );
+    }
+    if (
+      !TERMINAL_CLEANUP_PRESERVATION_REASONS.includes(
+        cleanup.preservationReason as TerminalCleanupPreservationReason,
+      )
+    ) {
+      throw new Error("Run record terminalCleanup.preservationReason is invalid");
+    }
+    return {
+      status,
+      updatedAt,
+      preservationReason:
+        cleanup.preservationReason as TerminalCleanupPreservationReason,
+    };
+  }
+
+  if (hasPreservationReason) {
+    throw new Error(
+      "Run record terminalCleanup must not include preservationReason for failed status",
+    );
+  }
+  if (!hasLastError) {
+    throw new Error("Run record terminalCleanup.lastError is required for failed status");
+  }
+  const lastError = exactObject(
+    cleanup.lastError,
+    "run record terminalCleanup.lastError",
+    ["code", "message"],
+  );
+  if (
+    !TERMINAL_CLEANUP_FAILURE_CODES.includes(
+      lastError.code as TerminalCleanupFailureCode,
+    )
+  ) {
+    throw new Error("Run record terminalCleanup.lastError.code is invalid");
+  }
+  return {
+    status,
+    updatedAt,
+    lastError: {
+      code: lastError.code as TerminalCleanupFailureCode,
+      message: requiredRunRecordString(
+        lastError.message,
+        "Run record terminalCleanup.lastError.message",
+      ),
+    },
+  };
+}
+
 export function exactRunRecord(
   candidate: Record<string, unknown>,
   version: number,
@@ -460,7 +578,16 @@ export function exactRunRecord(
     ...(candidate.failure !== undefined
       ? { failure: validateFailure(candidate.failure) }
       : {}),
+    ...(candidate.terminalCleanup !== undefined
+      ? { terminalCleanup: validateTerminalCleanup(candidate.terminalCleanup) }
+      : {}),
   };
   validateRecoveryLifecycle(run);
+  if (
+    run.terminalCleanup &&
+    !["COMPLETED", "FAILED", "CANCELLED"].includes(run.state)
+  ) {
+    throw new Error("Run record terminalCleanup requires a terminal workflow state");
+  }
   return run;
 }

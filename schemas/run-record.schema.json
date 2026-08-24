@@ -231,6 +231,90 @@
         "resumeState": { "$ref": "#/$defs/workflowState" },
         "runtime": { "$ref": "#/$defs/durableRuntimeFailureSummary" }
       }
+    },
+    "terminalCleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "updatedAt"],
+      "properties": {
+        "status": {
+          "enum": ["pending", "complete", "failed", "preserved"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+        },
+        "preservationReason": {
+          "enum": [
+            "bootstrap-recovery",
+            "revalidation-recovery",
+            "publication-outcome-unknown"
+          ]
+        },
+        "lastError": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": {
+            "code": {
+              "enum": [
+                "cleanup-inspection-failed",
+                "cleanup-ownership-mismatch",
+                "cleanup-remove-failed",
+                "cleanup-postcondition-failed",
+                "cleanup-legacy-state-ambiguous"
+              ]
+            },
+            "message": { "type": "string" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "pending" } },
+            "required": ["status"]
+          },
+          "then": {
+            "allOf": [
+              { "not": { "required": ["preservationReason"] } },
+              { "not": { "required": ["lastError"] } }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "complete" } },
+            "required": ["status"]
+          },
+          "then": {
+            "allOf": [
+              { "not": { "required": ["preservationReason"] } },
+              { "not": { "required": ["lastError"] } }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "preserved" } },
+            "required": ["status"]
+          },
+          "then": {
+            "required": ["preservationReason"],
+            "not": { "required": ["lastError"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "failed" } },
+            "required": ["status"]
+          },
+          "then": {
+            "required": ["lastError"],
+            "not": { "required": ["preservationReason"] }
+          }
+        }
+      ]
     }
   },
   "$defs": {

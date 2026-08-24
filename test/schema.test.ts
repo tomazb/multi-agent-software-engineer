@@ -30,6 +30,7 @@ type JsonSchema = {
   enum?: unknown[];
   additionalProperties?: boolean;
   dependentRequired?: Record<string, string[]>;
+  not?: JsonSchema;
 };
 
 function resolveRef(root: JsonSchema, schema: JsonSchema): JsonSchema {
@@ -62,6 +63,39 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     }
     if (conditionMatches) {
       assertMatches(root, effective.then, value, `${label}.then`);
+    }
+  }
+  if (effective.not) {
+    let forbiddenMatches = true;
+    try {
+      assertMatches(root, effective.not, value, `${label}.not`);
+    } catch {
+      forbiddenMatches = false;
+    }
+    assert.equal(forbiddenMatches, false, `${label} not`);
+  }
+  if (
+    effective.required &&
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const obj = value as Record<string, unknown>;
+    for (const key of effective.required) {
+      assert.ok(Object.hasOwn(obj, key), `${label}.${key} required`);
+    }
+  }
+  if (
+    effective.properties &&
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const obj = value as Record<string, unknown>;
+    for (const [key, child] of Object.entries(effective.properties)) {
+      if (Object.hasOwn(obj, key)) {
+        assertMatches(root, child, obj[key], `${label}.${key}`);
+      }
     }
   }
   if (effective.const !== undefined) {
@@ -408,6 +442,92 @@ test("run-record schema and migration accept exact legal recovery metadata", asy
   revalidation.unknown = true;
   assert.throws(() => assertMatches(schema, schema, persisted, "run"), /additionalProperties/);
   assert.throws(() => migrateRunRecord(persisted), /unsupported.*revalidation.*unknown/i);
+});
+
+test("run-record schema and migration accept exact legal terminal cleanup metadata", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-terminal-cleanup-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "terminal cleanup contract", DEFAULT_CONFIG);
+  const at = "2026-08-24T12:00:00.000Z";
+  const legalForms = [
+    { status: "pending", updatedAt: at },
+    { status: "complete", updatedAt: at },
+    {
+      status: "preserved",
+      updatedAt: at,
+      preservationReason: "bootstrap-recovery",
+    },
+    {
+      status: "failed",
+      updatedAt: at,
+      lastError: {
+        code: "cleanup-remove-failed",
+        message: "exact worktree remained registered",
+      },
+    },
+  ] as const;
+
+  for (const terminalCleanup of legalForms) {
+    const candidate = structuredClone(await store.load(run.id));
+    candidate.state = "COMPLETED";
+    candidate.terminalCleanup = structuredClone(terminalCleanup);
+    await store.save(candidate);
+    const persisted = await store.load(candidate.id);
+    assert.doesNotThrow(() => assertMatches(schema, schema, persisted, "terminal cleanup run"));
+    assert.doesNotThrow(() => migrateRunRecord(persisted));
+    assert.deepEqual(persisted.terminalCleanup, terminalCleanup);
+  }
+
+  const illegalForms = [
+    { status: "pending", updatedAt: at, preservationReason: "bootstrap-recovery" },
+    {
+      status: "complete",
+      updatedAt: at,
+      lastError: { code: "cleanup-remove-failed", message: "x" },
+    },
+    { status: "preserved", updatedAt: at },
+    {
+      status: "preserved",
+      updatedAt: at,
+      preservationReason: "bootstrap-recovery",
+      lastError: { code: "cleanup-remove-failed", message: "x" },
+    },
+    { status: "failed", updatedAt: at },
+    {
+      status: "failed",
+      updatedAt: at,
+      preservationReason: "revalidation-recovery",
+      lastError: { code: "cleanup-remove-failed", message: "x" },
+    },
+  ] as const;
+
+  for (const terminalCleanup of illegalForms) {
+    const candidate = structuredClone(run);
+    candidate.state = "COMPLETED";
+    candidate.terminalCleanup = structuredClone(terminalCleanup) as NonNullable<
+      typeof run.terminalCleanup
+    >;
+    assert.throws(
+      () => assertMatches(schema, schema, candidate, "illegal terminal cleanup"),
+      /required|not|preservationReason|lastError/i,
+    );
+    assert.throws(
+      () => migrateRunRecord(candidate),
+      /terminalCleanup|preservationReason|lastError/i,
+    );
+  }
+
+  const nonterminal = structuredClone(run);
+  nonterminal.state = "PR_READY";
+  nonterminal.terminalCleanup = { status: "pending", updatedAt: at };
+  assert.throws(
+    () => migrateRunRecord(nonterminal),
+    /terminalCleanup requires a terminal workflow state/i,
+  );
 });
 
 test("run-record schema workflow enums and exact event records stay synchronized with runtime validation", async (t) => {
