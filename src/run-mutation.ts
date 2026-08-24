@@ -15,7 +15,18 @@ import {
 
 export const RUN_MUTATION_JOURNAL_DIRECTORY = ".mutation-journal-v1";
 
-export type RunMutationRole = "target" | "publication";
+export type RunMutationRole =
+  | "target"
+  | "publication"
+  | "terminal-cleanup"
+  | "terminal-recovery";
+
+const operationByRole = {
+  target: "run-target-mutation",
+  publication: "run-publication",
+  "terminal-cleanup": "run-terminal-cleanup",
+  "terminal-recovery": "run-terminal-recovery",
+} as const;
 
 export interface RunMutationFenceOptions {
   timeoutMs?: number;
@@ -106,7 +117,7 @@ async function acquire(
   const handle = await publishLockClaim(
     root,
     "data",
-    role === "target" ? "run-target-mutation" : "run-publication",
+    operationByRole[role],
     publishOptions,
   );
   const started = Date.now();

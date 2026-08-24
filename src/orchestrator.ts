@@ -29,8 +29,11 @@ import {
   externalWorktreePath,
   invalidateStaleEvidence,
   listGitWorktreeRegistrations,
+  reconcileTerminalWorktreeCleanup,
   refreshWorkspaceHead,
   workingDirectoryFor,
+  TerminalCleanupError,
+  type TerminalCleanupDependencies,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
 import {
@@ -88,6 +91,10 @@ import {
 } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import { spawnCaptured } from "./process.ts";
+import {
+  FAILURE_AGGREGATE_MAX_CODE_POINTS,
+  sanitizeDiagnostic,
+} from "./redaction.ts";
 import {
   RunMutationSupersededError,
   withRunMutationFence,
@@ -270,6 +277,8 @@ export interface OrchestratorOptions {
   afterRoleFailureRollbackObserved?: () => Promise<void>;
   /** Test-only timeout for mutable-role ref publication. */
   roleRefPublishTimeoutMs?: number;
+  /** Test seam for exact terminal worktree cleanup reconciliation. */
+  terminalCleanupDependencies?: Partial<TerminalCleanupDependencies>;
 }
 
 interface ActiveRevalidationPreflight {
@@ -328,6 +337,7 @@ export class Orchestrator {
   private readonly beforeRoleFailureRollback: OrchestratorOptions["beforeRoleFailureRollback"];
   private readonly afterRoleFailureRollbackObserved: OrchestratorOptions["afterRoleFailureRollbackObserved"];
   private readonly roleRefPublishTimeoutMs: number;
+  private readonly terminalCleanupDependencies: Partial<TerminalCleanupDependencies> | undefined;
 
   constructor(
     cwd: string,
@@ -353,6 +363,7 @@ export class Orchestrator {
     this.beforeRoleFailureRollback = options.beforeRoleFailureRollback;
     this.afterRoleFailureRollbackObserved = options.afterRoleFailureRollbackObserved;
     this.roleRefPublishTimeoutMs = options.roleRefPublishTimeoutMs ?? 120_000;
+    this.terminalCleanupDependencies = options.terminalCleanupDependencies;
     if (
       !Number.isSafeInteger(this.automaticTransitionLimit) ||
       this.automaticTransitionLimit <= 0
@@ -497,15 +508,92 @@ export class Orchestrator {
   }
 
   private async finalizeTerminal(run: RunRecord): Promise<RunRecord> {
-    if (isTerminal(run.state)) {
-      try {
-        await cleanupRunWorkspace(run);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`Run reached ${run.state} but worktree cleanup failed: ${message}`);
-      }
+    const status = run.terminalCleanup?.status;
+    if (status === "complete" || status === "preserved") {
+      return run;
     }
-    return run;
+    return this.reconcileTerminalCleanup(run.id, { allowLegacy: false });
+  }
+
+  async cleanupTerminal(runId: string): Promise<RunRecord> {
+    return this.reconcileTerminalCleanup(runId, { allowLegacy: false });
+  }
+
+  private async reconcileTerminalCleanup(
+    runId: string,
+    options: { allowLegacy: boolean },
+  ): Promise<RunRecord> {
+    return withRunMutationFence(this.cwd, runId, "terminal-cleanup", async () => {
+      const authoritative = await this.store.load(runId);
+      if (!isTerminal(authoritative.state)) {
+        throw new Error(
+          `cleanupTerminal requires a terminal run; currently ${authoritative.state}`,
+        );
+      }
+      const status = authoritative.terminalCleanup?.status;
+      if (status === "complete") return authoritative;
+      if (status === "preserved") {
+        throw new Error(
+          `cleanupTerminal refuses a preserved recovery worktree (${authoritative.terminalCleanup?.preservationReason ?? "preserved"})`,
+        );
+      }
+      if (status !== "pending" && status !== "failed") {
+        throw new Error(
+          options.allowLegacy
+            ? `cleanupTerminal legacy classification is not implemented for run ${runId}`
+            : `cleanupTerminal requires explicit pending or failed cleanup intent`,
+        );
+      }
+      try {
+        await reconcileTerminalWorktreeCleanup(
+          authoritative,
+          this.cwd,
+          this.terminalCleanupDependencies,
+        );
+      } catch (error) {
+        if (error instanceof TerminalCleanupError) {
+          try {
+            await this.persistTerminalCleanupState(authoritative, {
+              status: "failed",
+              lastError: {
+                code: error.code,
+                message: sanitizeDiagnostic(
+                  error.message,
+                  FAILURE_AGGREGATE_MAX_CODE_POINTS,
+                ).text,
+              },
+            });
+          } catch (persistError) {
+            throw new AggregateError(
+              [error, persistError],
+              `Terminal cleanup failed and cleanup failure persistence also failed for run ${runId}`,
+            );
+          }
+          throw error;
+        }
+        throw error;
+      }
+      return this.persistTerminalCleanupState(authoritative, { status: "complete" });
+    });
+  }
+
+  private async persistTerminalCleanupState(
+    run: RunRecord,
+    update:
+      | { status: "complete" }
+      | {
+          status: "failed";
+          lastError: { code: TerminalCleanupError["code"]; message: string };
+        },
+  ): Promise<RunRecord> {
+    const latest = await this.store.load(run.id);
+    const updatedAt = new Date().toISOString();
+    latest.terminalCleanup =
+      update.status === "complete"
+        ? { status: "complete", updatedAt }
+        : { status: "failed", updatedAt, lastError: update.lastError };
+    await this.store.save(latest);
+    return this.store.load(run.id);
   }
 
   async start(title: string, request: string): Promise<RunRecord> {
@@ -1325,6 +1413,9 @@ export class Orchestrator {
                 run: await this.failRun(
                   run,
                   "Maximum PR comment resolution cycles exceeded.",
+                  undefined,
+                  undefined,
+                  { deferTerminalFinalization: true },
                 ),
               };
             }
@@ -1343,7 +1434,10 @@ export class Orchestrator {
                   runFailureMessage(error),
                   runFailureCode(error),
                   runFailureRuntime(error),
-                  optionalFailRunPreservation(run, error),
+                  {
+                    deferTerminalFinalization: true,
+                    ...optionalFailRunPreservation(run, error),
+                  },
                 ),
               };
             }
@@ -1353,7 +1447,13 @@ export class Orchestrator {
             if (run.counters.buildVerifyCycles > run.config.policy.maxBuildVerifyCycles) {
               return {
                 kind: "completed",
-                run: await this.failRun(run, "Maximum build/verify cycles exceeded."),
+                run: await this.failRun(
+                  run,
+                  "Maximum build/verify cycles exceeded.",
+                  undefined,
+                  undefined,
+                  { deferTerminalFinalization: true },
+                ),
               };
             }
             try {
@@ -1374,7 +1474,10 @@ export class Orchestrator {
                   runFailureMessage(error),
                   runFailureCode(error),
                   runFailureRuntime(error),
-                  optionalFailRunPreservation(run, error),
+                  {
+                    deferTerminalFinalization: true,
+                    ...optionalFailRunPreservation(run, error),
+                  },
                 ),
               };
             }
@@ -1597,7 +1700,11 @@ export class Orchestrator {
           run.state === "RESOLVING"
         ) {
           const attempt = await this.advanceGitDependentAutomaticWork(run, headSha);
-          if (attempt.kind === "completed") return attempt.run;
+          if (attempt.kind === "completed") {
+            return isTerminal(attempt.run.state)
+              ? this.finalizeTerminal(attempt.run)
+              : attempt.run;
+          }
           run = attempt.run;
           if (entryAttempt + 1 >= REVALIDATION_STABILITY_ATTEMPTS) {
             throw new Error(`Run ${run.id} automatic work authority did not stabilize`);
@@ -1657,7 +1764,12 @@ export class Orchestrator {
         }
       }
     } catch (error) {
-      if (error instanceof RunMutationSupersededError) throw error;
+      if (
+        error instanceof RunMutationSupersededError ||
+        error instanceof TerminalCleanupError
+      ) {
+        throw error;
+      }
       return this.failRun(
         run,
         runFailureMessage(error),
@@ -1933,14 +2045,17 @@ export class Orchestrator {
     message: string,
     code: RunFailureCode = "workflow-failure",
     runtime?: DurableRuntimeFailureSummary,
-    options: { preservationReason?: TerminalCleanupPreservationReason } = {},
+    options: {
+      preservationReason?: TerminalCleanupPreservationReason;
+      deferTerminalFinalization?: boolean;
+    } = {},
   ): Promise<RunRecord> {
     const resumeState = isTerminal(run.state) ? undefined : run.state;
     if (options.preservationReason === "bootstrap-recovery" && resumeState !== "CREATED") {
       throw new Error("Workspace preservation is allowed only for a CREATED bootstrap failure");
     }
     const finishFailure = (record: RunRecord): Promise<RunRecord> =>
-      options.preservationReason
+      options.preservationReason || options.deferTerminalFinalization
         ? Promise.resolve(record)
         : this.finalizeTerminal(record);
     const safeMessage = safeFailureMessage(message);
