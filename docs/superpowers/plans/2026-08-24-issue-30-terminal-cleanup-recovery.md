@@ -299,10 +299,10 @@ Parse the complete registration set through `listGitWorktreeRegistrations()`. Re
 
 - [ ] **Step 3: Implement removal and authoritative post-inspection**
 
-Only after ownership proof call exact:
+Only after ownership proof call the existing Git execution seam with these exact arguments:
 
-```text
-git worktree remove --force <recorded-worktree-path>
+```ts
+["worktree", "remove", "--force", run.workspace!.worktreePath!]
 ```
 
 After every attempted remove, regardless of exit code, re-read registrations and path state.
@@ -741,11 +741,11 @@ Do not add cleanup to `PROJECT_CONFIG_COMMANDS`.
 
 - [ ] **Step 3: Write rendering + snapshotted-config tests**
 
-Require human output:
+Require human output with concrete fixture values:
 
 ```text
 Terminal cleanup: complete
-Terminal cleanup: failed (cleanup-remove-failed): <sanitized message>
+Terminal cleanup: failed (cleanup-remove-failed): exact worktree remained registered
 Terminal cleanup: preserved (publication-outcome-unknown)
 Terminal cleanup: unknown (legacy record)
 ```
@@ -973,19 +973,18 @@ If any criterion lacks passing test/direct inspection evidence, add it in the ow
 
 - [ ] **Step 6: Prepare the external-review handoff without remote mutation**
 
-Capture the exact implementation head with:
+Emit the immutable identity block directly from Git:
 
 ```bash
-IMPLEMENTATION_HEAD="$(git rev-parse HEAD)"
-printf 'IMPLEMENTATION_HEAD=%s\n' "$IMPLEMENTATION_HEAD"
+printf '%s\n' \
+  'BASE_SHA=71252f0b996143085778d9fb64b22d8a90ed0fd1' \
+  'DESIGN_SHA=8c7799923b1d82ffd1d7ca461d3b14ae4f64f998' \
+  "IMPLEMENTATION_HEAD=$(git rev-parse HEAD)"
 ```
 
-Copy the emitted 40-character SHA into the report. Include:
+Paste those three emitted lines verbatim into the handoff report, followed by:
 
 ```text
-BASE_SHA=71252f0b996143085778d9fb64b22d8a90ed0fd1
-DESIGN_SHA=8c7799923b1d82ffd1d7ca461d3b14ae4f64f998
-IMPLEMENTATION_HEAD=<copy the concrete SHA emitted by the command above into the actual report>
 Node 24.18.0 focused/full/package/diff results
 Node 22.22.2 full/package/diff results
 changed-file list
@@ -993,7 +992,7 @@ AC-30.1..17 evidence map
 known non-blocking follow-ups, if any
 ```
 
-The angle-bracket line above is a report-format instruction, not a value to submit: the external agent must replace that line with the concrete emitted SHA before handing the report to the owner. Stop for owner authorization before any push/PR/review-request action.
+Stop for owner authorization before any push/PR/review-request action.
 
 ---
 
