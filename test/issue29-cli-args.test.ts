@@ -68,6 +68,7 @@ const documentedCommands: Array<[name: string, argv: string[]]> = [
   ["unlock-admin", ["unlock-admin", "run-1", "--force"]],
   ["github-webhook", ["github-webhook"]],
   ["github-publish-checks", ["github-publish-checks", "run-1", "--json"]],
+  ["cleanup", ["cleanup", "run-1"]],
 ];
 
 for (const [name, argv] of documentedCommands) {
@@ -184,6 +185,10 @@ const invalidPositionalCases: Array<[name: string, argv: string[]]> = [
   ["review extra operand", ["review-comment", "r1", "r2", "--text=x"]],
   ["github-webhook operand", ["github-webhook", "extra"]],
   ["github-publish-checks missing run ID", ["github-publish-checks"]],
+  ["cleanup missing run ID", ["cleanup"]],
+  ["cleanup extra operand", ["cleanup", "r1", "r2"]],
+  ["cleanup force forbidden", ["cleanup", "r1", "--force"]],
+  ["cleanup json forbidden", ["cleanup", "r1", "--json"]],
 ];
 
 for (const [name, argv] of invalidPositionalCases) {
