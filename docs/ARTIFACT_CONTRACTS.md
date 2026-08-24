@@ -230,6 +230,38 @@ object reconstructs and sanitizes only the documented fields before status/inspe
 The existing schema-version-1 `failure.message` field keeps its historical unconstrained schema
 shape; migration and every new write enforce the current 8,192-code-point runtime policy.
 
+### Terminal cleanup record
+
+Optional schema-version-1 object `terminalCleanup` is operational lifecycle metadata, not workflow
+evidence. Terminal workflow state is durable before any worktree deletion. Cleanup retries append
+no workflow events and change no artifacts, approvals, counters, GitHub association, or
+engineering `failure` classification. Production cleanup retains the `maswe/<run-id>` branch.
+Ownership is re-proved from the exact repository, recorded path, Git worktree registration,
+branch, HEAD, and type before deletion.
+
+```json
+{
+  "status": "pending",
+  "updatedAt": "2026-08-24T12:04:00.000Z"
+}
+```
+
+Allowed `status` values:
+
+- `pending` and `complete` permit neither `preservationReason` nor `lastError`.
+- `preserved` requires exactly one `preservationReason`
+  (`bootstrap-recovery`, `revalidation-recovery`, or `publication-outcome-unknown`) and
+  forbids `lastError`.
+- `failed` requires `lastError` (`code` plus `message`) and forbids `preservationReason`.
+  Durable codes are `cleanup-inspection-failed`, `cleanup-ownership-mismatch`,
+  `cleanup-remove-failed`, `cleanup-postcondition-failed`, and
+  `cleanup-legacy-state-ambiguous`.
+
+`pending` and `failed` are retryable through `maswe cleanup`. `preserved` retains governed
+Issue #28 recovery state and rejects cleanup. Legacy terminal records may omit `terminalCleanup`;
+that omission is unknown until reconciled and must not be inferred as `complete` or `preserved`.
+Ambiguous legacy `FAILED` preservation fails closed as `cleanup-legacy-state-ambiguous`.
+
 Cursor CLI runtime error results are not artifacts. Raw stderr, raw error metadata, and stderr
 digests are never part of the run or artifact contract. Safe runtime diagnostics expose a stable
 code plus applicable exit code, timeout, duration, requested/configured model, prompt transport,

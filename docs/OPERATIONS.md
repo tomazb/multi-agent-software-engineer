@@ -357,7 +357,7 @@ Commands execute with the system shell and are trusted code. Only repository adm
 
 ## 5. Prefer isolated worktrees
 
-By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended via `git rev-parse --git-path info/exclude` so local run storage does not dirty `git status` even when the operator is already inside a linked worktree. Builder and resolver roles execute in that worktree. With `policy.trustManagedWorktrees` (default `true`), Cursor CLI invocations pass `--trust` for every role in MASWE-created worktrees. Completed, cancelled, failed, and superseded runs remove their worktrees but **preserve** the `maswe/<run-id>` branch ref so failed-run provenance (builder `outputHeadSha`) can be restored on `retry`. Cleanup failures are surfaced to the operator.
+By default `policy.useIsolatedWorktree` is `true`. On `start`, MASWE creates branch `maswe/<run-id>` and a linked worktree under an **external** directory (`$TMPDIR/maswe-worktrees/...`), not inside the operator checkout. `.maswe/` is appended via `git rev-parse --git-path info/exclude` so local run storage does not dirty `git status` even when the operator is already inside a linked worktree. Builder and resolver roles execute in that worktree. With `policy.trustManagedWorktrees` (default `true`), Cursor CLI invocations pass `--trust` for every role in MASWE-created worktrees. After a run is durably `COMPLETED`, `CANCELLED`, or ordinary `FAILED`, MASWE removes that run's managed worktree but **preserves** the `maswe/<run-id>` branch ref so failed-run provenance (builder `outputHeadSha`) can be restored on `retry`. Workflow failure and cleanup failure are independent: a terminal workflow state is already durable before deletion begins, and a later cleanup retry cannot change it. `pending` and `failed` cleanup are retryable through `maswe cleanup`. `preserved` cleanup retains governed Issue #28 recovery worktrees and rejects cleanup. There is no `--force` cleanup bypass. Manual `rm -rf`, branch deletion, and global `git worktree prune` are not supported recovery procedures because they skip ownership re-proof and can destroy recovery or provenance state. Cleanup failures are surfaced independently of `run.failure`.
 
 Every production-created run, including a superseding replacement, persists workspace bootstrap
 intent before branch or worktree side effects and durably checkpoints the established workspace
@@ -397,6 +397,23 @@ The command returns a run ID and stops at `WAITING_FOR_BRAINSTORM_APPROVAL`.
 maswe status <run-id>
 cat .maswe/runs/<run-id>/artifacts/02-brainstorm.md
 ```
+
+Human and JSON status expose `terminalCleanup` independently from workflow state and
+`run.failure`. A legacy terminal record that omits `terminalCleanup` renders as unknown until
+reconciled.
+
+### Retry terminal worktree cleanup
+
+```bash
+maswe cleanup <run-id>
+```
+
+Use this when workflow state is already `COMPLETED`, `CANCELLED`, or ordinary `FAILED` and cleanup
+is `pending` or `failed`. The command re-proves exact repository, path, Git registration, branch,
+HEAD, and type ownership, then removes only that owned worktree. It appends no workflow events,
+changes no workflow evidence, and retains the `maswe/<run-id>` branch. It refuses `preserved`
+Issue #28 recovery worktrees. It has no `--force` flag. Do not recover a stuck worktree with
+`rm -rf`, branch deletion, or `git worktree prune`.
 
 ### Approve discovery
 
@@ -486,6 +503,27 @@ maswe run <run-id>
 ```
 
 `maswe run` works only for actionable automatic states. Approval and review states require their specific commands.
+
+### Terminal cleanup failure
+
+A workflow failure (`FAILED`, engineering `run.failure`) is not a cleanup failure. Cleanup
+lifecycle lives in `terminalCleanup` and is inspected with `maswe status <run-id>`.
+
+- `pending` or `failed`: retry with `maswe cleanup <run-id>`. The retry is idempotent. Success
+  publishes `complete` without rewriting workflow state, evidence, artifacts, approvals, counters,
+  GitHub association, or engineering failure classification.
+- `complete`: already cleaned; a further `maswe cleanup` is an idempotent no-op when the
+  registration and path are already absent.
+- `preserved`: governed Issue #28 recovery (`bootstrap-recovery`, `revalidation-recovery`, or
+  `publication-outcome-unknown`). Cleanup is rejected until that recovery is consumed or the run
+  is superseded. Do not delete the worktree by hand.
+- omitted on a legacy terminal record: unknown until `maswe cleanup` reconciles it. Ambiguous
+  legacy `FAILED` preservation fails closed.
+
+`maswe cleanup` has no `--force`. Production cleanup retains the branch. Manual `rm -rf` of a
+managed worktree, deletion of `maswe/<run-id>`, and global `git worktree prune` are not supported
+recovery procedures: they skip exact ownership re-proof, can remove another run's or the operator
+checkout's tree, and can destroy Issue #28 recovery or failed-run provenance.
 
 For a bootstrap failure whose `failure.resumeState` is `CREATED`, inspect `workspaceBootstrap` and
 `workspace` in `run.json` before running `maswe retry <run-id>`. Intent without a workspace means
