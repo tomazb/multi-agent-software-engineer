@@ -38,6 +38,24 @@ test("renderTerminalCleanup renders complete disposition", () => {
   assert.equal(renderTerminalCleanup(run), "Terminal cleanup: complete");
 });
 
+test("renderTerminalCleanup renders pending disposition", () => {
+  const run = terminalRun({
+    state: "FAILED",
+    terminalCleanup: { status: "pending", updatedAt: new Date().toISOString() },
+  });
+  assert.equal(renderTerminalCleanup(run), "Terminal cleanup: pending");
+});
+
+test("renderRun includes pending terminal cleanup line", () => {
+  const output = renderRun(
+    terminalRun({
+      state: "CANCELLED",
+      terminalCleanup: { status: "pending", updatedAt: new Date().toISOString() },
+    }),
+  );
+  assert.match(output, /Terminal cleanup: pending/);
+});
+
 test("renderTerminalCleanup renders failed cleanup with sanitized diagnostic", () => {
   const run = terminalRun({
     state: "FAILED",

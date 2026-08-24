@@ -525,7 +525,23 @@ test("run-record schema and migration accept exact legal terminal cleanup metada
   nonterminal.state = "PR_READY";
   nonterminal.terminalCleanup = { status: "pending", updatedAt: at };
   assert.throws(
+    () => assertMatches(schema, schema, nonterminal, "nonterminal terminal cleanup"),
+    /terminalCleanup|COMPLETED|FAILED|CANCELLED|state/i,
+  );
+  assert.throws(
     () => migrateRunRecord(nonterminal),
+    /terminalCleanup requires a terminal workflow state/i,
+  );
+
+  const nonterminalBuilding = structuredClone(run);
+  nonterminalBuilding.state = "BUILDING";
+  nonterminalBuilding.terminalCleanup = { status: "pending", updatedAt: at };
+  assert.throws(
+    () => assertMatches(schema, schema, nonterminalBuilding, "building terminal cleanup"),
+    /terminalCleanup|COMPLETED|FAILED|CANCELLED|state/i,
+  );
+  assert.throws(
+    () => migrateRunRecord(nonterminalBuilding),
     /terminalCleanup requires a terminal workflow state/i,
   );
 });

@@ -18,6 +18,9 @@ export function renderTerminalCleanup(run: RunRecord): string | undefined {
   if (cleanup.status === "complete") {
     return "Terminal cleanup: complete";
   }
+  if (cleanup.status === "pending") {
+    return "Terminal cleanup: pending";
+  }
   if (cleanup.status === "preserved") {
     return `Terminal cleanup: preserved (${cleanup.preservationReason})`;
   }

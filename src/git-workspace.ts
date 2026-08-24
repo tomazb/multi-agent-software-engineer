@@ -242,6 +242,137 @@ function findRegistrationForBranch(
   return registrations.find((registration) => registration.branch === branch);
 }
 
+type RemoveWorktreeAttempt = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  invocationError?: Error;
+};
+
+function assertExpectedBranchNotRegisteredElsewhere(
+  registrations: GitWorktreeRegistration[],
+  expectedBranch: string,
+  worktreePath: string,
+): void {
+  const branchRegistration = findRegistrationForBranch(registrations, expectedBranch);
+  if (
+    branchRegistration &&
+    resolveRegistrationPath(branchRegistration) !== path.resolve(worktreePath)
+  ) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      `Expected branch ${expectedBranch} is registered at a different worktree path`,
+    );
+  }
+}
+
+function assertTargetRegistrationOwnership(
+  targetRegistration: GitWorktreeRegistration | undefined,
+  expectedBranch: string,
+  workspaceHeadSha: string,
+): void {
+  if (!targetRegistration) return;
+  if (targetRegistration.branch !== expectedBranch) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree registration branch does not match the run workspace branch",
+    );
+  }
+  if (targetRegistration.headSha !== workspaceHeadSha.toLowerCase()) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree registration HEAD does not match the run workspace headSha",
+    );
+  }
+}
+
+function classifyPostRemovalState(
+  postRegistrations: GitWorktreeRegistration[],
+  postPathState: TerminalCleanupPathState,
+  worktreePath: string,
+  expectedBranch: string,
+  workspaceHeadSha: string,
+  removeAttempt: RemoveWorktreeAttempt,
+): void {
+  if (postPathState === "unsafe") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree path is not an ordinary directory after cleanup attempt",
+    );
+  }
+
+  assertExpectedBranchNotRegisteredElsewhere(
+    postRegistrations,
+    expectedBranch,
+    worktreePath,
+  );
+
+  const postTargetRegistration = findRegistrationForPath(postRegistrations, worktreePath);
+  assertTargetRegistrationOwnership(
+    postTargetRegistration,
+    expectedBranch,
+    workspaceHeadSha,
+  );
+
+  if (!postTargetRegistration && postPathState === "absent") {
+    return;
+  }
+
+  if (postTargetRegistration && postPathState === "directory") {
+    const removeFailed =
+      removeAttempt.exitCode !== 0 || removeAttempt.invocationError !== undefined;
+    if (removeFailed) {
+      const diagnostic =
+        removeAttempt.invocationError?.message ??
+        (removeAttempt.stderr ||
+          removeAttempt.stdout ||
+          "git worktree remove failed");
+      throwTerminalCleanup("cleanup-remove-failed", diagnostic);
+    }
+    throwTerminalCleanup(
+      "cleanup-postcondition-failed",
+      "Worktree registration and directory remained after git worktree remove",
+    );
+  }
+
+  if (postTargetRegistration && postPathState === "absent") {
+    throwTerminalCleanup(
+      "cleanup-postcondition-failed",
+      "Worktree registration remained after the target path disappeared",
+    );
+  }
+
+  if (!postTargetRegistration && postPathState === "directory") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Refusing to delete an unregistered worktree directory after cleanup attempt",
+    );
+  }
+
+  throwTerminalCleanup(
+    "cleanup-postcondition-failed",
+    "Worktree cleanup postconditions were not satisfied",
+  );
+}
+
+async function attemptRemoveWorktree(
+  deps: TerminalCleanupDependencies,
+  repositoryPath: string,
+  worktreePath: string,
+): Promise<RemoveWorktreeAttempt> {
+  try {
+    const result = await deps.removeWorktree(repositoryPath, worktreePath);
+    return { ...result };
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+      invocationError: error instanceof Error ? error : new Error(String(error)),
+    };
+  }
+}
+
 export async function reconcileTerminalWorktreeCleanup(
   run: RunRecord,
   invocationRepositoryPath: string,
@@ -257,6 +388,19 @@ export async function reconcileTerminalWorktreeCleanup(
   const workspace = run.workspace;
   const worktreePath = workspace?.worktreePath;
   const expectedBranch = `maswe/${run.id}`;
+
+  if (!["COMPLETED", "FAILED", "CANCELLED"].includes(run.state)) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Terminal worktree cleanup requires a terminal workflow state",
+    );
+  }
+  if (!run.config.policy.useIsolatedWorktree) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Terminal worktree cleanup requires an isolated managed worktree policy",
+    );
+  }
 
   if (path.resolve(invocationRepositoryPath) !== path.resolve(repositoryPath)) {
     throwTerminalCleanup(
@@ -328,20 +472,7 @@ export async function reconcileTerminalWorktreeCleanup(
   }
 
   const targetRegistration = findRegistrationForPath(registrations, worktreePath);
-  if (targetRegistration) {
-    if (targetRegistration.branch !== expectedBranch) {
-      throwTerminalCleanup(
-        "cleanup-ownership-mismatch",
-        "Target worktree registration branch does not match the run workspace branch",
-      );
-    }
-    if (targetRegistration.headSha !== workspace.headSha.toLowerCase()) {
-      throwTerminalCleanup(
-        "cleanup-ownership-mismatch",
-        "Target worktree registration HEAD does not match the run workspace headSha",
-      );
-    }
-  }
+  assertTargetRegistrationOwnership(targetRegistration, expectedBranch, workspace.headSha);
 
   if (!targetRegistration && pathState === "directory") {
     throwTerminalCleanup(
@@ -351,10 +482,11 @@ export async function reconcileTerminalWorktreeCleanup(
   }
 
   if (!targetRegistration && pathState === "absent") {
+    assertExpectedBranchNotRegisteredElsewhere(registrations, expectedBranch, worktreePath);
     return;
   }
 
-  const removeResult = await deps.removeWorktree(repositoryPath, worktreePath);
+  const removeAttempt = await attemptRemoveWorktree(deps, repositoryPath, worktreePath);
 
   let postRegistrations: GitWorktreeRegistration[];
   try {
@@ -376,34 +508,13 @@ export async function reconcileTerminalWorktreeCleanup(
     );
   }
 
-  const postTargetRegistration = findRegistrationForPath(postRegistrations, worktreePath);
-  if (!postTargetRegistration && postPathState === "absent") {
-    return;
-  }
-
-  if (postTargetRegistration && postPathState === "directory") {
-    if (removeResult.exitCode !== 0) {
-      throwTerminalCleanup(
-        "cleanup-remove-failed",
-        removeResult.stderr || removeResult.stdout || "git worktree remove failed",
-      );
-    }
-    throwTerminalCleanup(
-      "cleanup-postcondition-failed",
-      "Worktree registration and directory remained after git worktree remove",
-    );
-  }
-
-  if (postTargetRegistration && postPathState === "absent") {
-    throwTerminalCleanup(
-      "cleanup-postcondition-failed",
-      "Worktree registration remained after the target path disappeared",
-    );
-  }
-
-  throwTerminalCleanup(
-    "cleanup-postcondition-failed",
-    "Worktree cleanup postconditions were not satisfied",
+  classifyPostRemovalState(
+    postRegistrations,
+    postPathState,
+    worktreePath,
+    expectedBranch,
+    workspace.headSha,
+    removeAttempt,
   );
 }
 

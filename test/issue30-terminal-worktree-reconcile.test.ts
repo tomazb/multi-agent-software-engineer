@@ -316,3 +316,227 @@ test("14 successful cleanup leaves branch ref untouched", async (t) => {
   assert.equal(afterRef, beforeRef);
   await assert.rejects(access(workspace.worktreePath!), /ENOENT/);
 });
+
+test("15 nonterminal run rejects cleanup without calling removeWorktree", async () => {
+  const cwd = "/tmp/maswe-i30-nonterminal";
+  const runId = "run-nonterminal";
+  const headSha = "7".repeat(40);
+  const run = terminalRun(cwd, runId, headSha);
+  run.state = "PR_READY";
+  let removeCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    removeWorktree: async () => {
+      removeCalls += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-ownership-mismatch",
+  );
+  assert.equal(removeCalls, 0);
+});
+
+test("16 useIsolatedWorktree=false rejects cleanup without calling removeWorktree", async () => {
+  const cwd = "/tmp/maswe-i30-no-isolated";
+  const runId = "run-no-isolated";
+  const headSha = "8".repeat(40);
+  const run = terminalRun(cwd, runId, headSha);
+  run.config.policy.useIsolatedWorktree = false;
+  let removeCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    removeWorktree: async () => {
+      removeCalls += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-ownership-mismatch",
+  );
+  assert.equal(removeCalls, 0);
+});
+
+test("A1 removeWorktree throws and post absent/absent succeeds", async () => {
+  const cwd = "/tmp/maswe-i30-throw-success";
+  const runId = "run-throw-success";
+  const headSha = "9".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  let listCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => {
+      listCalls += 1;
+      return listCalls === 1 ? [registration] : [];
+    },
+    inspectPath: async () => (listCalls <= 1 ? "directory" : "absent") as TerminalCleanupPathState,
+    removeWorktree: async () => {
+      throw new Error("spawn EACCES");
+    },
+  };
+  await reconcileTerminalWorktreeCleanup(run, cwd, deps);
+});
+
+test("A2 removeWorktree throws and exact owned registration/path remains -> cleanup-remove-failed", async () => {
+  const cwd = "/tmp/maswe-i30-throw-remove-failed";
+  const runId = "run-throw-remove-failed";
+  const headSha = "a".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => [registration],
+    inspectPath: async () => "directory",
+    removeWorktree: async () => {
+      throw new Error("injected timeout");
+    },
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-remove-failed",
+  );
+});
+
+test("A3 removeWorktree throws and branch relocates -> cleanup-ownership-mismatch", async () => {
+  const cwd = "/tmp/maswe-i30-throw-relocated";
+  const runId = "run-throw-relocated";
+  const headSha = "b".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const otherPath = path.join(os.tmpdir(), "maswe-relocated-after-throw");
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  let listCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => {
+      listCalls += 1;
+      if (listCalls === 1) return [registration];
+      return [exactRegistration(otherPath, `maswe/${runId}`, headSha)];
+    },
+    inspectPath: async () => (listCalls <= 1 ? "directory" : "absent") as TerminalCleanupPathState,
+    removeWorktree: async () => {
+      throw new Error("remove exploded");
+    },
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-ownership-mismatch",
+  );
+});
+
+test("A4 post-inspection failure after removeWorktree throw -> cleanup-inspection-failed", async () => {
+  const cwd = "/tmp/maswe-i30-throw-post-inspect";
+  const runId = "run-throw-post-inspect";
+  const headSha = "c".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  let listCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => {
+      listCalls += 1;
+      if (listCalls === 1) return [registration];
+      throw new Error("post list failed");
+    },
+    inspectPath: async () => "directory",
+    removeWorktree: async () => {
+      throw new Error("remove exploded");
+    },
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-inspection-failed",
+  );
+});
+
+test("B1 post absent target/path but branch registered elsewhere -> cleanup-ownership-mismatch", async () => {
+  const cwd = "/tmp/maswe-i30-post-branch-elsewhere";
+  const runId = "run-post-branch-elsewhere";
+  const headSha = "d".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const otherPath = path.join(os.tmpdir(), "maswe-post-other-path");
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  let listCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => {
+      listCalls += 1;
+      if (listCalls === 1) return [registration];
+      return [exactRegistration(otherPath, `maswe/${runId}`, headSha)];
+    },
+    inspectPath: async () => (listCalls <= 1 ? "directory" : "absent") as TerminalCleanupPathState,
+    removeWorktree: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-ownership-mismatch",
+  );
+});
+
+test("B2 post target registration survives with changed branch -> cleanup-ownership-mismatch", async () => {
+  const cwd = "/tmp/maswe-i30-post-branch-changed";
+  const runId = "run-post-branch-changed";
+  const headSha = "e".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  let listCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => {
+      listCalls += 1;
+      if (listCalls === 1) return [registration];
+      return [exactRegistration(worktreePath, "maswe/wrong-branch", headSha)];
+    },
+    inspectPath: async () => (listCalls <= 1 ? "directory" : "directory") as TerminalCleanupPathState,
+    removeWorktree: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-ownership-mismatch",
+  );
+});
+
+test("B3 post target registration survives with changed HEAD -> cleanup-ownership-mismatch", async () => {
+  const cwd = "/tmp/maswe-i30-post-head-changed";
+  const runId = "run-post-head-changed";
+  const headSha = "f".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  let listCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => {
+      listCalls += 1;
+      if (listCalls === 1) return [registration];
+      return [exactRegistration(worktreePath, `maswe/${runId}`, "0".repeat(40))];
+    },
+    inspectPath: async () => "directory",
+    removeWorktree: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-ownership-mismatch",
+  );
+});
+
+test("B4 post target becomes unsafe after removal -> cleanup-ownership-mismatch", async () => {
+  const cwd = "/tmp/maswe-i30-post-unsafe";
+  const runId = "run-post-unsafe";
+  const headSha = "0".repeat(40);
+  const worktreePath = externalWorktreePath(cwd, runId);
+  const run = terminalRun(cwd, runId, headSha);
+  const registration = exactRegistration(worktreePath, `maswe/${runId}`, headSha);
+  let listCalls = 0;
+  const deps: Partial<TerminalCleanupDependencies> = {
+    listRegistrations: async () => {
+      listCalls += 1;
+      return listCalls === 1 ? [registration] : [];
+    },
+    inspectPath: async () => (listCalls <= 1 ? "directory" : "unsafe") as TerminalCleanupPathState,
+    removeWorktree: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  };
+  await assertCleanupError(
+    reconcileTerminalWorktreeCleanup(run, cwd, deps),
+    "cleanup-ownership-mismatch",
+  );
+});

@@ -98,3 +98,20 @@ test("maswe cleanup dispatches through persisted run snapshot after config corru
   assert.equal(reloaded.config.runtime.command, "snapshotted-agent");
   assert.equal(reloaded.config.roles.brainstormer.model, "snapshotted-model");
 });
+
+test("maswe status reports pending terminal cleanup from persisted run record", async () => {
+  const cwd = await initRepo("maswe-cleanup-status-");
+  const config = snapshottedConfig();
+  await writeProjectConfig(cwd, config);
+
+  const store = new FileRunStore(cwd);
+  const run = await store.create("cleanup-status", "request", config);
+  run.state = "FAILED";
+  run.terminalCleanup = { status: "pending", updatedAt: new Date().toISOString() };
+  await store.save(run);
+
+  const result = await runCli(cwd, ["status", run.id]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /State: FAILED/);
+  assert.match(result.stdout, /Terminal cleanup: pending/);
+});

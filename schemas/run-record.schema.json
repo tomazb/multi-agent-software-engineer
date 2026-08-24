@@ -317,6 +317,16 @@
       ]
     }
   },
+  "allOf": [
+    {
+      "if": { "required": ["terminalCleanup"] },
+      "then": {
+        "properties": {
+          "state": { "enum": ["COMPLETED", "FAILED", "CANCELLED"] }
+        }
+      }
+    }
+  ],
   "$defs": {
     "workflowState": {
       "enum": [
