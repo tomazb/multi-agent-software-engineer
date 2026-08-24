@@ -23,6 +23,20 @@ This repository implements a deterministic multi-agent software delivery orchest
 - Persist handoffs through artifacts; do not add hidden cross-agent conversation state.
 - Do not store credentials, model responses containing secrets, or repository tokens in committed files.
 
+## Builder simplification gate
+
+Before declaring the implementation ready for deterministic CI and verification, the builder must review the changed code and the directly affected collaborators needed to understand the change for avoidable complexity introduced or materially worsened by the implementation.
+
+Apply safe, behavior-preserving simplifications when they are local, within the authorized scope, and materially improve the changed implementation. Examples include duplicated logic, unnecessarily complex control flow, unclear local interfaces, avoidable indirection, and mixed responsibilities directly involved in the change.
+
+- Inspection may extend to directly affected collaborators when necessary to understand the changed implementation, but this does not expand edit authority. Do not edit outside the governing scope. Record worthwhile out-of-scope simplifications for disposition under the governing issue, design, or plan rather than implementing them.
+- Do not turn a scoped feature, correctness, safety, or review fix into a general refactoring effort. Pre-existing complexity alone is not authorization to restructure it.
+- Do not weaken safety, security, concurrency, recovery, idempotency, audit, evidence, parity, compatibility, or operator-facing guarantees for the sake of fewer lines, files, branches, or abstractions.
+- Preserve public and operator-facing interfaces, persisted state and checkpoint contracts, errors, and observable outcomes unless the approved change explicitly includes their revision.
+- Prefer readability, explicit control flow, and clear responsibilities over minimizing line count or abstraction count.
+- After any simplification, rerun targeted tests first, then every verification gate invalidated by the resulting changes. Do not declare builder completion while the required local gate set is failing.
+- Record the simplification review in the builder completion report. Summarize simplifications applied, or state that no safe in-scope simplification was identified. If a later integration creates a pull request, propagate that outcome into the PR description when practical.
+
 ## Definition of done
 
 A change is complete only when requirements are mapped to tests, tests pass on the required Node baselines, type checking passes, the build succeeds, documentation is updated, and no unrelated files are changed.
