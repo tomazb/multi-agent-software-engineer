@@ -24,7 +24,6 @@ import {
   assertChangeScope,
   assertExpectedBranch,
   assertWorkingTreeScope,
-  cleanupRunWorkspace,
   createDeterministicCommit,
   externalWorktreePath,
   invalidateStaleEvidence,
@@ -34,6 +33,7 @@ import {
   workingDirectoryFor,
   TerminalCleanupError,
   type TerminalCleanupDependencies,
+  type TerminalCleanupPathState,
 } from "./git-workspace.ts";
 import { parseRoleMarker } from "./markers.ts";
 import {
@@ -516,7 +516,115 @@ export class Orchestrator {
   }
 
   async cleanupTerminal(runId: string): Promise<RunRecord> {
-    return this.reconcileTerminalCleanup(runId, { allowLegacy: false });
+    return this.reconcileTerminalCleanup(runId, { allowLegacy: true });
+  }
+
+  private refusePreservedRecoveryWorktree(reason: string): never {
+    throw new Error(`cleanupTerminal refuses a preserved recovery worktree (${reason})`);
+  }
+
+  private async inspectTerminalCleanupPath(
+    candidatePath: string,
+  ): Promise<TerminalCleanupPathState> {
+    try {
+      const stat = await lstat(candidatePath);
+      return stat.isDirectory() && !stat.isSymbolicLink() ? "directory" : "unsafe";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw error;
+    }
+  }
+
+  private async legacyManagedTargetPresent(run: RunRecord): Promise<boolean> {
+    const worktreePath = run.workspace?.worktreePath;
+    if (!worktreePath) return false;
+    if (path.resolve(this.cwd) !== path.resolve(run.repositoryPath)) {
+      throw new TerminalCleanupError(
+        "cleanup-ownership-mismatch",
+        "Cleanup invocation repository root must match the run repositoryPath exactly",
+      );
+    }
+    const listRegistrations =
+      this.terminalCleanupDependencies?.listRegistrations ?? listGitWorktreeRegistrations;
+    const inspectPath =
+      this.terminalCleanupDependencies?.inspectPath ??
+      ((candidatePath: string) => this.inspectTerminalCleanupPath(candidatePath));
+    let registrations;
+    let pathState: TerminalCleanupPathState;
+    try {
+      registrations = await listRegistrations(run.repositoryPath);
+      pathState = await inspectPath(worktreePath);
+    } catch (error) {
+      throw error instanceof TerminalCleanupError
+        ? error
+        : new TerminalCleanupError(
+            "cleanup-inspection-failed",
+            error instanceof Error ? error.message : "Failed to inspect legacy worktree state",
+          );
+    }
+    const expectedBranch = `maswe/${run.id}`;
+    const resolved = path.resolve(worktreePath);
+    return (
+      pathState !== "absent" ||
+      registrations.some(
+        (registration) =>
+          path.resolve(registration.worktreePath) === resolved ||
+          registration.branch === expectedBranch,
+      )
+    );
+  }
+
+  private async classifyLegacyTerminalCleanup(
+    run: RunRecord,
+  ): Promise<
+    | { kind: "complete" }
+    | { kind: "reconcile" }
+    | {
+        kind: "preserved";
+        preservationReason: Exclude<
+          TerminalCleanupPreservationReason,
+          "publication-outcome-unknown"
+        >;
+      }
+    | { kind: "ambiguous" }
+  > {
+    if (!run.workspace?.worktreePath) {
+      return { kind: "complete" };
+    }
+    if (run.state === "FAILED" && run.workspaceBootstrap) {
+      return { kind: "preserved", preservationReason: "bootstrap-recovery" };
+    }
+    if (run.state === "FAILED" && run.revalidation) {
+      return { kind: "preserved", preservationReason: "revalidation-recovery" };
+    }
+    if (run.state !== "FAILED") {
+      return { kind: "reconcile" };
+    }
+    if (await this.legacyManagedTargetPresent(run)) {
+      return { kind: "ambiguous" };
+    }
+    return { kind: "complete" };
+  }
+
+  private async persistCleanupFailure(
+    run: RunRecord,
+    error: TerminalCleanupError,
+  ): Promise<never> {
+    try {
+      await this.persistTerminalCleanupState(run, {
+        status: "failed",
+        lastError: {
+          code: error.code,
+          message: sanitizeDiagnostic(error.message, FAILURE_AGGREGATE_MAX_CODE_POINTS).text,
+        },
+      });
+    } catch (persistError) {
+      throw new AggregateError(
+        [error, persistError],
+        `Terminal cleanup failed and cleanup failure persistence also failed for run ${run.id}`,
+      );
+    }
+    throw error;
   }
 
   private async reconcileTerminalCleanup(
@@ -533,16 +641,53 @@ export class Orchestrator {
       const status = authoritative.terminalCleanup?.status;
       if (status === "complete") return authoritative;
       if (status === "preserved") {
-        throw new Error(
-          `cleanupTerminal refuses a preserved recovery worktree (${authoritative.terminalCleanup?.preservationReason ?? "preserved"})`,
+        this.refusePreservedRecoveryWorktree(
+          authoritative.terminalCleanup?.preservationReason ?? "preserved",
+        );
+      }
+      if (
+        status === "failed" &&
+        authoritative.terminalCleanup?.lastError?.code === "cleanup-legacy-state-ambiguous"
+      ) {
+        throw new TerminalCleanupError(
+          "cleanup-legacy-state-ambiguous",
+          authoritative.terminalCleanup.lastError.message,
         );
       }
       if (status !== "pending" && status !== "failed") {
-        throw new Error(
-          options.allowLegacy
-            ? `cleanupTerminal legacy classification is not implemented for run ${runId}`
-            : `cleanupTerminal requires explicit pending or failed cleanup intent`,
-        );
+        if (!options.allowLegacy || authoritative.terminalCleanup !== undefined) {
+          throw new Error(
+            `cleanupTerminal requires explicit pending or failed cleanup intent`,
+          );
+        }
+        let decision;
+        try {
+          decision = await this.classifyLegacyTerminalCleanup(authoritative);
+        } catch (error) {
+          if (error instanceof TerminalCleanupError) {
+            return this.persistCleanupFailure(authoritative, error);
+          }
+          throw error;
+        }
+        if (decision.kind === "complete") {
+          return this.persistTerminalCleanupState(authoritative, { status: "complete" });
+        }
+        if (decision.kind === "preserved") {
+          await this.persistTerminalCleanupState(authoritative, {
+            status: "preserved",
+            preservationReason: decision.preservationReason,
+          });
+          this.refusePreservedRecoveryWorktree(decision.preservationReason);
+        }
+        if (decision.kind === "ambiguous") {
+          return this.persistCleanupFailure(
+            authoritative,
+            new TerminalCleanupError(
+              "cleanup-legacy-state-ambiguous",
+              "Legacy FAILED run has a surviving worktree without durable preservation proof",
+            ),
+          );
+        }
       }
       try {
         await reconcileTerminalWorktreeCleanup(
@@ -552,24 +697,7 @@ export class Orchestrator {
         );
       } catch (error) {
         if (error instanceof TerminalCleanupError) {
-          try {
-            await this.persistTerminalCleanupState(authoritative, {
-              status: "failed",
-              lastError: {
-                code: error.code,
-                message: sanitizeDiagnostic(
-                  error.message,
-                  FAILURE_AGGREGATE_MAX_CODE_POINTS,
-                ).text,
-              },
-            });
-          } catch (persistError) {
-            throw new AggregateError(
-              [error, persistError],
-              `Terminal cleanup failed and cleanup failure persistence also failed for run ${runId}`,
-            );
-          }
-          throw error;
+          return this.persistCleanupFailure(authoritative, error);
         }
         throw error;
       }
@@ -582,6 +710,10 @@ export class Orchestrator {
     update:
       | { status: "complete" }
       | {
+          status: "preserved";
+          preservationReason: TerminalCleanupPreservationReason;
+        }
+      | {
           status: "failed";
           lastError: { code: TerminalCleanupError["code"]; message: string };
         },
@@ -591,7 +723,13 @@ export class Orchestrator {
     latest.terminalCleanup =
       update.status === "complete"
         ? { status: "complete", updatedAt }
-        : { status: "failed", updatedAt, lastError: update.lastError };
+        : update.status === "preserved"
+          ? {
+              status: "preserved",
+              updatedAt,
+              preservationReason: update.preservationReason,
+            }
+          : { status: "failed", updatedAt, lastError: update.lastError };
     await this.store.save(latest);
     return this.store.load(run.id);
   }
@@ -2486,86 +2624,103 @@ export class Orchestrator {
       throw new Error("retry requires a FAILED run with failure.resumeState");
     }
     prior = await this.reconcileFailedRevalidationTarget(prior);
-    const resumeState = prior.failure?.resumeState;
-    if (prior.state !== "FAILED" || !resumeState || !prior.failure) {
+    if (prior.state !== "FAILED" || !prior.failure?.resumeState || !prior.failure) {
       throw new Error("retry requires a FAILED run with failure.resumeState");
     }
-    const previousFailure = structuredClone(prior.failure);
-    const priorEventIds = new Set(prior.events.map((event) => event.id));
-    const retryFence = this.captureOptionalRevalidationFence(prior);
-    const candidate = structuredClone(prior);
-    const workspace = await reconcileRetryWorkspace(this.cwd, candidate);
-    if (workspace) candidate.workspace = workspace;
-    else delete candidate.workspace;
-    delete candidate.failure;
-    delete candidate.terminalCleanup;
-    await this.beforeRetryPublication?.(candidate);
-    await this.assertOptionalRevalidationFence(prior, retryFence);
-    const publicationCandidate = structuredClone(candidate);
 
-    let resumed: RunRecord;
-    try {
-      resumed = await this.store.applyEvent(candidate, "RETRY_FROM_FAILED", "user", {
-        resumeState,
-        previousFailure,
-      });
-    } catch (error) {
-      const observed = await this.store.load(runId);
-      const newEvents = observed.events.filter((event) => !priorEventIds.has(event.id));
-      const retryEvent = newEvents.length === 1 ? newEvents[0] : undefined;
-      const historicalPrefixExact =
-        observed.events.length === prior.events.length + 1 &&
-        this.recordsEqual(
-          { ...prior, events: observed.events.slice(0, prior.events.length) },
-          prior,
-        );
-      const expected = structuredClone(publicationCandidate);
-      expected.state = resumeState;
-      expected.version = observed.version;
-      expected.updatedAt = observed.updatedAt;
-      expected.events = observed.events;
-      const completePublication =
-        observed.version === prior.version + 1 &&
-        areCanonicalFileStoreTimestamps(
-          prior.updatedAt,
-          retryEvent?.at,
-          observed.updatedAt,
-        ) &&
-        historicalPrefixExact &&
-        observed.failure === undefined &&
-        retryEvent?.type === "RETRY_FROM_FAILED" &&
-        retryEvent.actor === "user" &&
-        retryEvent.from === "FAILED" &&
-        retryEvent.to === resumeState &&
-        this.recordsEqual(retryEvent.details, { resumeState, previousFailure }) &&
-        this.recordsEqual(observed, expected);
-      if (completePublication) {
-        resumed = observed;
-      } else {
-        const unchangedPrior = this.recordsEqual(observed, prior);
-        const oneStepConflict = structuredClone(prior);
-        oneStepConflict.version = prior.version + 1;
-        oneStepConflict.updatedAt = observed.updatedAt;
-        const validOneStepConflict =
-          observed.version === prior.version + 1 &&
-          areCanonicalFileStoreTimestamps(
-            prior.updatedAt,
-            undefined,
-            observed.updatedAt,
-          ) &&
-          this.recordsEqual(observed, oneStepConflict);
-        const originalRetryRemains =
-          newEvents.length === 0 &&
-          observed.state === "FAILED" &&
-          this.recordsEqual(observed.failure, previousFailure) &&
-          (unchangedPrior || validOneStepConflict);
-        if (originalRetryRemains) throw error;
-        throw new Error(
-          "Retry publication outcome is inconsistent: authoritative state is neither the original retryable FAILED record nor one complete retry publication.",
-          { cause: error },
-        );
-      }
-    }
+    let resumed = await withRunMutationFence(
+      this.cwd,
+      runId,
+      "terminal-recovery",
+      async () => {
+        const authoritative = await this.store.load(runId);
+        const resumeState = authoritative.failure?.resumeState;
+        if (
+          authoritative.state !== "FAILED" ||
+          !resumeState ||
+          !authoritative.failure
+        ) {
+          throw new Error("retry requires a FAILED run with failure.resumeState");
+        }
+        const previousFailure = structuredClone(authoritative.failure);
+        const priorEventIds = new Set(authoritative.events.map((event) => event.id));
+        const retryFence = this.captureOptionalRevalidationFence(authoritative);
+        const candidate = structuredClone(authoritative);
+        const workspace = await reconcileRetryWorkspace(this.cwd, candidate);
+        if (workspace) candidate.workspace = workspace;
+        else delete candidate.workspace;
+        delete candidate.failure;
+        delete candidate.terminalCleanup;
+        await this.beforeRetryPublication?.(candidate);
+        await this.assertOptionalRevalidationFence(authoritative, retryFence);
+        const publicationCandidate = structuredClone(candidate);
+
+        try {
+          return await this.store.applyEvent(candidate, "RETRY_FROM_FAILED", "user", {
+            resumeState,
+            previousFailure,
+          });
+        } catch (error) {
+          const observed = await this.store.load(runId);
+          const newEvents = observed.events.filter((event) => !priorEventIds.has(event.id));
+          const retryEvent = newEvents.length === 1 ? newEvents[0] : undefined;
+          const historicalPrefixExact =
+            observed.events.length === authoritative.events.length + 1 &&
+            this.recordsEqual(
+              {
+                ...authoritative,
+                events: observed.events.slice(0, authoritative.events.length),
+              },
+              authoritative,
+            );
+          const expected = structuredClone(publicationCandidate);
+          expected.state = resumeState;
+          expected.version = observed.version;
+          expected.updatedAt = observed.updatedAt;
+          expected.events = observed.events;
+          const completePublication =
+            observed.version === authoritative.version + 1 &&
+            areCanonicalFileStoreTimestamps(
+              authoritative.updatedAt,
+              retryEvent?.at,
+              observed.updatedAt,
+            ) &&
+            historicalPrefixExact &&
+            observed.failure === undefined &&
+            retryEvent?.type === "RETRY_FROM_FAILED" &&
+            retryEvent.actor === "user" &&
+            retryEvent.from === "FAILED" &&
+            retryEvent.to === resumeState &&
+            this.recordsEqual(retryEvent.details, { resumeState, previousFailure }) &&
+            this.recordsEqual(observed, expected);
+          if (completePublication) {
+            return observed;
+          }
+          const unchangedPrior = this.recordsEqual(observed, authoritative);
+          const oneStepConflict = structuredClone(authoritative);
+          oneStepConflict.version = authoritative.version + 1;
+          oneStepConflict.updatedAt = observed.updatedAt;
+          const validOneStepConflict =
+            observed.version === authoritative.version + 1 &&
+            areCanonicalFileStoreTimestamps(
+              authoritative.updatedAt,
+              undefined,
+              observed.updatedAt,
+            ) &&
+            this.recordsEqual(observed, oneStepConflict);
+          const originalRetryRemains =
+            newEvents.length === 0 &&
+            observed.state === "FAILED" &&
+            this.recordsEqual(observed.failure, previousFailure) &&
+            (unchangedPrior || validOneStepConflict);
+          if (originalRetryRemains) throw error;
+          throw new Error(
+            "Retry publication outcome is inconsistent: authoritative state is neither the original retryable FAILED record nor one complete retry publication.",
+            { cause: error },
+          );
+        }
+      },
+    );
 
     if (resumed.state === "CREATED") {
       resumed = await this.bootstrapCreatedRun(resumed.id);
@@ -2584,23 +2739,42 @@ export class Orchestrator {
       existing.config,
       { supersedes: existing.id },
     );
-    existing.supersededBy = replacement.id;
-    if (!isTerminal(existing.state)) {
-      existing.failure = {
-        message: `Superseded by ${replacement.id}`,
-        at: new Date().toISOString(),
-        resumeState: existing.state as WorkflowState,
-      };
-      attachTerminalCleanupIntent(existing);
-      const cancelled = await this.store.applyEvent(existing, "CANCEL", "user", {
-        reason: "superseded",
-        supersededBy: replacement.id,
-      });
-      await this.finalizeTerminal(cancelled);
-    } else {
-      await this.store.save(existing);
-      await this.finalizeTerminal(existing);
-    }
+    const abandoned = await withRunMutationFence(
+      this.cwd,
+      runId,
+      "terminal-recovery",
+      async () => {
+        const authoritative = await this.store.load(runId);
+        if (authoritative.supersededBy) {
+          throw new Error(
+            `Run ${runId} was already superseded by ${authoritative.supersededBy}`,
+          );
+        }
+        authoritative.supersededBy = replacement.id;
+        if (!isTerminal(authoritative.state)) {
+          authoritative.failure = {
+            message: `Superseded by ${replacement.id}`,
+            at: new Date().toISOString(),
+            resumeState: authoritative.state as WorkflowState,
+          };
+          attachTerminalCleanupIntent(authoritative);
+          return this.store.applyEvent(authoritative, "CANCEL", "user", {
+            reason: "superseded",
+            supersededBy: replacement.id,
+          });
+        }
+        if (
+          authoritative.terminalCleanup === undefined ||
+          authoritative.terminalCleanup.status === "preserved" ||
+          authoritative.terminalCleanup.lastError?.code === "cleanup-legacy-state-ambiguous"
+        ) {
+          attachTerminalCleanupIntent(authoritative);
+        }
+        await this.store.save(authoritative);
+        return this.store.load(runId);
+      },
+    );
+    await this.finalizeTerminal(abandoned);
     await this.bootstrapCreatedRun(replacement.id);
     return this.runUntilBlocked(replacement.id);
   }
