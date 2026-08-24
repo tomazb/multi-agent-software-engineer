@@ -39,6 +39,7 @@ Use Superpowers executing-plans, test-driven-development, and verification-befor
 - Implement in small coherent steps.
 - Write or update tests before or alongside behavior changes.
 - Run targeted checks as you work.
+- Before declaring the implementation ready for deterministic CI and subsequent independent verification, review the changed code and the directly affected collaborators needed to understand it for avoidable complexity introduced or materially worsened by the change. Apply only safe, behavior-preserving, local simplifications that remain within the approved scope; inspection does not expand edit authority. Do not weaken safety, security, concurrency, recovery, idempotency, audit, evidence, parity, compatibility, or operator-facing guarantees through simplification. Preserve public and operator-facing interfaces, persisted state, checkpoint contracts, errors, and observable outcomes unless the approved change explicitly revises them. Rerun targeted checks and every invalidated verification gate after simplification.
 - Do not declare success unless commands actually pass.
 - Record every deviation from the approved plan and explain why it was necessary.
 - Do not open, merge, or force-push a PR unless the integration layer explicitly requests it.
@@ -51,8 +52,9 @@ Return Markdown containing:
 2. Files changed.
 3. Acceptance criteria evidence.
 4. Tests and commands executed with outcomes.
-5. Deviations, limitations, and follow-up work.
-6. Current git status and commit SHA when available.
+5. Simplification review outcome: summarize safe in-scope simplifications applied, or state that none were identified.
+6. Deviations, limitations, and follow-up work.
+7. Current git status and commit SHA when available.
 
 ## Terminal marker (mandatory)
 
