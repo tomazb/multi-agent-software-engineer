@@ -120,7 +120,7 @@ Validation rules are exact:
 - `preserved` requires exactly one `preservationReason` and forbids `lastError`;
 - `failed` requires `lastError` and forbids `preservationReason`;
 - `updatedAt` is a canonical ISO timestamp;
-- `lastError.message` is sanitized/redacted and bounded before persistence;
+- `lastError.message` is passed through the existing `sanitizeDiagnostic(..., FAILURE_AGGREGATE_MAX_CODE_POINTS)` durable diagnostic boundary before persistence;
 - unknown status/reason/code values fail closed.
 
 No attempt counter or cleanup event history is added in #30. The run record records current cleanup disposition; workflow event history remains reserved for engineering workflow transitions.
@@ -200,7 +200,7 @@ maswe cleanup <run-id>
 After acquiring the cleanup/recovery serialization fence and reloading the authoritative run:
 
 - nonterminal run -> reject without mutation;
-- `terminalCleanup.status === "complete"` -> idempotent success;
+- `terminalCleanup.status === "complete"` -> idempotent success without a destructive action;
 - `terminalCleanup.status === "preserved"` -> reject without mutation;
 - `pending` or `failed` -> run exact physical reconciliation;
 - terminal legacy record with no `terminalCleanup` -> apply the legacy rules in Section 11.
@@ -220,15 +220,16 @@ For a run with a recorded managed worktree, derive and validate all of the follo
 1. `run.state` is terminal.
 2. `run.config.policy.useIsolatedWorktree` is true.
 3. `run.workspace.worktreePath` exists in the record.
-4. The recorded worktree path resolves exactly to `externalWorktreePath(run.repositoryPath, run.id)`.
-5. The target path is not the operator checkout (`path.resolve(run.repositoryPath)`).
-6. The recorded branch is exactly the MASWE-owned branch expected for this run (`maswe/<run-id>`).
-7. Git worktree registrations for `run.repositoryPath` can be parsed completely and unambiguously.
-8. No other worktree registration uses the expected run branch.
-9. If a registration exists for the target path, its branch and HEAD match the run's recorded workspace identity.
-10. If the target filesystem object exists, it is an ordinary directory and not a symlink or another unsafe path type.
+4. The orchestrator/store repository root used for the cleanup invocation resolves exactly to `run.repositoryPath`; #30 does not migrate a run across local repository paths.
+5. The recorded worktree path resolves exactly to `externalWorktreePath(run.repositoryPath, run.id)`.
+6. The target path is not the operator checkout (`path.resolve(run.repositoryPath)`).
+7. The recorded branch is exactly the MASWE-owned branch expected for this run (`maswe/<run-id>`).
+8. Git worktree registrations for `run.repositoryPath` can be parsed completely and unambiguously.
+9. No other worktree registration uses the expected run branch.
+10. If a registration exists for the target path, its branch and HEAD match the run's recorded workspace identity.
+11. If the target filesystem object exists, it is an ordinary directory and not a symlink or another unsafe path type.
 
-A branch/head/path/repository conflict is `cleanup-ownership-mismatch`. Failure to inspect Git or required filesystem state is `cleanup-inspection-failed`.
+A repository/path/branch/HEAD/type conflict is `cleanup-ownership-mismatch`. Failure to inspect Git or required filesystem state is `cleanup-inspection-failed`.
 
 Cleanup does **not** require a clean working tree or an unchanged workspace fingerprint. The existing production policy already permits `git worktree remove --force` for an owned terminal worktree; uncommitted terminal contents are not promoted into authoritative provenance. Ownership proof, not cleanliness, controls deletion.
 
@@ -262,8 +263,9 @@ Classification:
 
 - registration absent **and** path absent -> physical cleanup succeeded;
 - exact expected registration/path still intact after a failed remove -> `cleanup-remove-failed`;
-- registration remains but path is absent, or another post-state prevents a unique safe conclusion -> `cleanup-postcondition-failed`;
-- changed/conflicting ownership -> `cleanup-ownership-mismatch`.
+- registration remains but path is absent, or another fully inspected post-state prevents a unique safe conclusion -> `cleanup-postcondition-failed`;
+- changed/conflicting ownership -> `cleanup-ownership-mismatch`;
+- failure to complete the post-removal inspection itself -> `cleanup-inspection-failed`.
 
 If physical cleanup succeeds but publishing `terminalCleanup.status = "complete"` fails, leave the durable record at its last known disposition and propagate the persistence error. A later `maswe cleanup` observes registration/path absence and idempotently publishes `complete`.
 
@@ -405,10 +407,10 @@ Stable durable cleanup codes:
 - `cleanup-inspection-failed` — Git/filesystem state cannot be inspected reliably;
 - `cleanup-ownership-mismatch` — observed repository/path/branch/HEAD/type conflicts with recorded ownership;
 - `cleanup-remove-failed` — exact removal was attempted and the exact owned worktree remains;
-- `cleanup-postcondition-failed` — removal outcome cannot be reconciled to a confirmed safe terminal postcondition;
+- `cleanup-postcondition-failed` — removal outcome cannot be reconciled to a confirmed safe terminal postcondition after successful inspection;
 - `cleanup-legacy-state-ambiguous` — a legacy FAILED run lacks sufficient durable intent to decide whether a surviving worktree is cleanup-eligible.
 
-Messages are sanitized/redacted using the repository's existing diagnostic boundary and bounded to a fixed durable size. Error control flow must use typed codes/classes, not message matching.
+Messages use `sanitizeDiagnostic(..., FAILURE_AGGREGATE_MAX_CODE_POINTS)` before persistence. Error control flow must use typed codes/classes, not message matching.
 
 A cleanup error never writes `run.failure`, changes `failure.code`, changes `failure.resumeState`, or publishes `FAIL`.
 
@@ -487,7 +489,8 @@ Cover at least:
 11. malformed/conflicting worktree-list output;
 12. operator checkout can never be selected;
 13. two runs in the same repository cannot delete each other's worktree;
-14. run branch survives successful cleanup.
+14. run branch survives successful cleanup;
+15. invoking cleanup from a repository root that does not match `run.repositoryPath` fails closed without Git mutation.
 
 ### 18.2 Orchestrator lifecycle
 
