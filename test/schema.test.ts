@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+import assert, { AssertionError } from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -27,6 +27,7 @@ type JsonSchema = {
   minItems?: number;
   maxItems?: number;
   pattern?: string;
+  format?: string;
   enum?: unknown[];
   additionalProperties?: boolean;
   dependentRequired?: Record<string, string[]>;
@@ -58,8 +59,9 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     let conditionMatches = true;
     try {
       assertMatches(root, effective.if, value, `${label}.if`);
-    } catch {
+    } catch (error) {
       conditionMatches = false;
+      if (!(error instanceof AssertionError)) throw error;
     }
     if (conditionMatches) {
       assertMatches(root, effective.then, value, `${label}.then`);
@@ -69,8 +71,9 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     let forbiddenMatches = true;
     try {
       assertMatches(root, effective.not, value, `${label}.not`);
-    } catch {
+    } catch (error) {
       forbiddenMatches = false;
+      if (!(error instanceof AssertionError)) throw error;
     }
     assert.equal(forbiddenMatches, false, `${label} not`);
   }
@@ -158,6 +161,15 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     if (effective.pattern) {
       assert.match(String(value), new RegExp(effective.pattern), `${label} pattern`);
     }
+    if (effective.format === "date-time") {
+      const timestamp = String(value);
+      const parsed = new Date(timestamp);
+      assert.ok(
+        !Number.isNaN(parsed.getTime()) &&
+          parsed.toISOString() === timestamp,
+        `${label} format`,
+      );
+    }
   }
   if (effective.type === "integer") {
     assert.equal(typeof value, "number", label);
@@ -221,6 +233,24 @@ test("schema assertion enforces dependent required object properties", () => {
   assert.throws(
     () => assertMatches(schema, schema, { suspensionReason: "closed" }, "github"),
     /github\.suspended dependentRequired/,
+  );
+});
+
+test("schema evaluator propagates non-assertion errors from if and not", () => {
+  const missingRef = { $ref: "#/$defs/missing" };
+  assert.throws(
+    () =>
+      assertMatches(
+        {},
+        { if: missingRef, then: { type: "string" } },
+        "value",
+        "if",
+      ),
+    /Missing \$ref target/,
+  );
+  assert.throws(
+    () => assertMatches({}, { not: missingRef }, "value", "not"),
+    /Missing \$ref target/,
   );
 });
 
@@ -544,6 +574,26 @@ test("run-record schema and migration accept exact legal terminal cleanup metada
     () => migrateRunRecord(nonterminalBuilding),
     /terminalCleanup requires a terminal workflow state/i,
   );
+});
+
+test("run-record schema and runtime reject impossible terminal cleanup timestamps", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-cleanup-timestamp-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const run = await new FileRunStore(cwd).create(
+    "cleanup timestamp",
+    "reject impossible dates",
+    DEFAULT_CONFIG,
+  );
+  run.state = "COMPLETED";
+  run.terminalCleanup = {
+    status: "pending",
+    updatedAt: "2026-99-99T12:00:00.000Z",
+  };
+  assert.throws(() => assertMatches(schema, schema, run, "run"), /format/);
+  assert.throws(() => migrateRunRecord(run), /terminalCleanup\.updatedAt/i);
 });
 
 test("run-record schema workflow enums and exact event records stay synchronized with runtime validation", async (t) => {
