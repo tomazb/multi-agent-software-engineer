@@ -591,16 +591,21 @@ export class Orchestrator {
     if (!run.workspace?.worktreePath) {
       return { kind: "complete" };
     }
-    if (run.state === "FAILED" && run.workspaceBootstrap) {
-      return { kind: "preserved", preservationReason: "bootstrap-recovery" };
-    }
-    if (run.state === "FAILED" && run.revalidation) {
-      return { kind: "preserved", preservationReason: "revalidation-recovery" };
-    }
     if (run.state !== "FAILED") {
       return { kind: "reconcile" };
     }
-    if (await this.legacyManagedTargetPresent(run)) {
+    const managedTargetPresent = await this.legacyManagedTargetPresent(run);
+    if (run.workspaceBootstrap) {
+      return managedTargetPresent
+        ? { kind: "preserved", preservationReason: "bootstrap-recovery" }
+        : { kind: "complete" };
+    }
+    if (run.revalidation) {
+      return managedTargetPresent
+        ? { kind: "preserved", preservationReason: "revalidation-recovery" }
+        : { kind: "complete" };
+    }
+    if (managedTargetPresent) {
       return { kind: "ambiguous" };
     }
     return { kind: "complete" };
