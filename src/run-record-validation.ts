@@ -166,6 +166,14 @@ function canonicalTimestamp(value: unknown, label: string): string {
   return result;
 }
 
+function canonicalTerminalCleanupTimestamp(value: unknown, label: string): string {
+  const result = canonicalTimestamp(value, label);
+  if (!/^\d{4}-/.test(result)) {
+    throw new Error(`${label} must use an unsigned four-digit year`);
+  }
+  return result;
+}
+
 function validateRevalidation(value: unknown): NonNullable<RunRecord["revalidation"]> {
   const revalidation = exactObject(
     value,
@@ -413,7 +421,7 @@ function validateTerminalCleanup(value: unknown): NonNullable<RunRecord["termina
     throw new Error("Run record terminalCleanup.status is invalid");
   }
   const status = cleanup.status as TerminalCleanupStatus;
-  const updatedAt = canonicalTimestamp(
+  const updatedAt = canonicalTerminalCleanupTimestamp(
     cleanup.updatedAt,
     "Run record terminalCleanup.updatedAt",
   );
