@@ -27,7 +27,6 @@ type JsonSchema = {
   minItems?: number;
   maxItems?: number;
   pattern?: string;
-  format?: string;
   enum?: unknown[];
   additionalProperties?: boolean;
   dependentRequired?: Record<string, string[]>;
@@ -160,15 +159,6 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     if (effective.maxLength) assert.ok(String(value).length <= effective.maxLength, label);
     if (effective.pattern) {
       assert.match(String(value), new RegExp(effective.pattern), `${label} pattern`);
-    }
-    if (effective.format === "date-time") {
-      const timestamp = String(value);
-      const parsed = new Date(timestamp);
-      assert.ok(
-        !Number.isNaN(parsed.getTime()) &&
-          parsed.toISOString() === timestamp,
-        `${label} format`,
-      );
     }
   }
   if (effective.type === "integer") {
@@ -576,7 +566,7 @@ test("run-record schema and migration accept exact legal terminal cleanup metada
   );
 });
 
-test("run-record schema and runtime reject impossible terminal cleanup timestamps", async (t) => {
+test("run-record schema and runtime enforce canonical terminal cleanup timestamps", async (t) => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
   ) as JsonSchema;
@@ -587,13 +577,29 @@ test("run-record schema and runtime reject impossible terminal cleanup timestamp
     "reject impossible dates",
     DEFAULT_CONFIG,
   );
-  run.state = "COMPLETED";
-  run.terminalCleanup = {
+  const invalidTimestamps = [
+    "2026-99-99T12:00:00.000Z",
+    "2025-02-29T12:00:00.000Z",
+    "2026-04-31T12:00:00.000Z",
+    "2026-01-01T24:00:00.000Z",
+    "2026-01-01T23:59:60.000Z",
+  ];
+  for (const updatedAt of invalidTimestamps) {
+    const candidate = structuredClone(run);
+    candidate.state = "COMPLETED";
+    candidate.terminalCleanup = { status: "pending", updatedAt };
+    assert.throws(() => assertMatches(schema, schema, candidate, "run"), /pattern/);
+    assert.throws(() => migrateRunRecord(candidate), /terminalCleanup\.updatedAt/i);
+  }
+
+  const valid = structuredClone(run);
+  valid.state = "COMPLETED";
+  valid.terminalCleanup = {
     status: "pending",
-    updatedAt: "2026-99-99T12:00:00.000Z",
+    updatedAt: "2024-02-29T23:59:59.999Z",
   };
-  assert.throws(() => assertMatches(schema, schema, run, "run"), /format/);
-  assert.throws(() => migrateRunRecord(run), /terminalCleanup\.updatedAt/i);
+  assert.doesNotThrow(() => assertMatches(schema, schema, valid, "run"));
+  assert.doesNotThrow(() => migrateRunRecord(valid));
 });
 
 test("run-record schema workflow enums and exact event records stay synchronized with runtime validation", async (t) => {
