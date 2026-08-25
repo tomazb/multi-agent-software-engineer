@@ -316,6 +316,7 @@ Required content:
 - Files changed.
 - Acceptance criteria evidence.
 - Tests and commands run.
+- Simplification review outcome: safe in-scope simplifications applied, or a statement that no safe in-scope simplification was identified.
 - Deviations and limitations.
 - Git status and commit SHA when available.
 
