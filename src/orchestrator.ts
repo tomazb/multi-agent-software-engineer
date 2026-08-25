@@ -2565,7 +2565,10 @@ export class Orchestrator {
     return this.finalizeTerminal(cancelled);
   }
 
-  private async reconcileFailedRevalidationTarget(prior: RunRecord): Promise<RunRecord> {
+  private async reconcileFailedRevalidationTarget(
+    prior: RunRecord,
+    lease: RunMutationLease,
+  ): Promise<RunRecord> {
     let snapshot = prior;
     for (let attempt = 0; attempt < REVALIDATION_STABILITY_ATTEMPTS; attempt += 1) {
       if (!snapshot.revalidation) return snapshot;
@@ -2588,14 +2591,20 @@ export class Orchestrator {
 
       let routed: RunRecord;
       try {
-        routed = await new RevalidationService(this.store).route(prior.id, {
-          source,
-          previousHeadSha: snapshot.revalidation.requestedHeadSha,
-          requestedHeadSha: requiredHeadSha,
-          expectedRunVersion: snapshot.version,
-          actor: source === "github" ? "github-app" : "local-runner",
-          ...(workspaceForRoute ? { observedWorkspace: workspaceForRoute } : {}),
-        });
+        routed = await new RevalidationService(
+          this.store,
+        ).routeWithHeldTerminalRecoveryLease(
+          prior.id,
+          {
+            source,
+            previousHeadSha: snapshot.revalidation.requestedHeadSha,
+            requestedHeadSha: requiredHeadSha,
+            expectedRunVersion: snapshot.version,
+            actor: source === "github" ? "github-app" : "local-runner",
+            ...(workspaceForRoute ? { observedWorkspace: workspaceForRoute } : {}),
+          },
+          lease,
+        );
       } catch (error) {
         if (!(error instanceof RevalidationOptimisticConflictError)) throw error;
         snapshot = await this.store.load(prior.id);
@@ -2619,41 +2628,38 @@ export class Orchestrator {
   }
 
   async retryFromFailed(runId: string): Promise<RunRecord> {
-    let prior = await this.store.load(runId);
-    if (prior.state !== "FAILED" || !prior.failure?.resumeState || !prior.failure) {
-      throw new Error("retry requires a FAILED run with failure.resumeState");
-    }
-    if (prior.supersededBy) {
-      throw new Error(`Run ${runId} was already superseded by ${prior.supersededBy}`);
-    }
-    prior = await this.reconcileFailedRevalidationTarget(prior);
-    if (prior.state !== "FAILED" || !prior.failure?.resumeState || !prior.failure) {
-      throw new Error("retry requires a FAILED run with failure.resumeState");
-    }
-    if (prior.supersededBy) {
-      throw new Error(`Run ${runId} was already superseded by ${prior.supersededBy}`);
-    }
-
     let resumed = await withRunMutationFence(
       this.cwd,
       runId,
       "terminal-recovery",
-      async () => {
-        const authoritative = await this.store.load(runId);
-        const resumeState = authoritative.failure?.resumeState;
-        if (
-          authoritative.state !== "FAILED" ||
-          !resumeState ||
-          !authoritative.failure
-        ) {
+      async (lease) => {
+        let authoritative = await this.store.load(runId);
+        const requireRetryableFailure = (): void => {
+          if (
+            authoritative.state !== "FAILED" ||
+            !authoritative.failure?.resumeState ||
+            !authoritative.failure
+          ) {
+            throw new Error("retry requires a FAILED run with failure.resumeState");
+          }
+          if (authoritative.supersededBy) {
+            throw new Error(
+              `Run ${runId} was already superseded by ${authoritative.supersededBy}`,
+            );
+          }
+        };
+        requireRetryableFailure();
+        authoritative = await this.reconcileFailedRevalidationTarget(
+          authoritative,
+          lease,
+        );
+        requireRetryableFailure();
+        const failure = authoritative.failure;
+        const resumeState = failure?.resumeState;
+        if (!failure || !resumeState) {
           throw new Error("retry requires a FAILED run with failure.resumeState");
         }
-        if (authoritative.supersededBy) {
-          throw new Error(
-            `Run ${runId} was already superseded by ${authoritative.supersededBy}`,
-          );
-        }
-        const previousFailure = structuredClone(authoritative.failure);
+        const previousFailure = structuredClone(failure);
         const priorEventIds = new Set(authoritative.events.map((event) => event.id));
         const retryFence = this.captureOptionalRevalidationFence(authoritative);
         const candidate = structuredClone(authoritative);

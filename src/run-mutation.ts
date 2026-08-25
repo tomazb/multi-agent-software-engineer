@@ -38,12 +38,46 @@ export interface RunMutationFenceOptions {
 }
 
 export interface RunMutationLease {
+  readonly repositoryPath: string;
+  readonly runId: string;
+  readonly role: RunMutationRole;
   /**
    * Publication linearization point. A target intent queued after the final
    * authority reload but before this scan wins; a target queued later observes
    * the completed publication before it mutates the run.
    */
   assertNoQueuedTargetMutation(): Promise<void>;
+}
+
+interface RunMutationLeaseOwnership {
+  handle: PublishedClaimHandle;
+  publishOptions: PublishClaimOptions;
+  repositoryPath: string;
+  runId: string;
+  role: RunMutationRole;
+}
+
+const leaseOwnership = new WeakMap<RunMutationLease, RunMutationLeaseOwnership>();
+
+export async function assertRunMutationLease(
+  lease: RunMutationLease,
+  repositoryPath: string,
+  runId: string,
+  role: RunMutationRole,
+): Promise<void> {
+  const ownership = leaseOwnership.get(lease);
+  if (
+    !ownership ||
+    ownership.repositoryPath !== repositoryPath ||
+    ownership.runId !== runId ||
+    ownership.role !== role ||
+    lease.repositoryPath !== repositoryPath ||
+    lease.runId !== runId ||
+    lease.role !== role
+  ) {
+    throw new Error(`Invalid ${role} mutation lease for run ${runId}`);
+  }
+  await validateClaimOwnership(ownership.handle, ownership.publishOptions);
 }
 
 export class RunMutationSupersededError extends Error {
@@ -177,23 +211,35 @@ export async function withRunMutationFence<T>(
   let result: T | undefined;
   let primaryError: unknown;
   let releaseError: unknown;
+  const lease: RunMutationLease = {
+    repositoryPath,
+    runId,
+    role,
+    assertNoQueuedTargetMutation: async () => {
+      await validateClaimOwnership(handle, publishOptions);
+      const scan = await scanLockJournal(root, "data");
+      const queuedTarget = scan.claims.some(
+        (claim) =>
+          BigInt(claim.ticket) > handle.ticket &&
+          claim.operation === "run-target-mutation" &&
+          !scan.releases.has(claim.ticket),
+      );
+      if (queuedTarget) throw new RunMutationSupersededError(runId);
+    },
+  };
   try {
-    result = await callback({
-      assertNoQueuedTargetMutation: async () => {
-        await validateClaimOwnership(handle, publishOptions);
-        const scan = await scanLockJournal(root, "data");
-        const queuedTarget = scan.claims.some(
-          (claim) =>
-            BigInt(claim.ticket) > handle.ticket &&
-            claim.operation === "run-target-mutation" &&
-            !scan.releases.has(claim.ticket),
-        );
-        if (queuedTarget) throw new RunMutationSupersededError(runId);
-      },
+    leaseOwnership.set(lease, {
+      handle,
+      publishOptions,
+      repositoryPath,
+      runId,
+      role,
     });
+    result = await callback(lease);
   } catch (error) {
     primaryError = error;
   } finally {
+    leaseOwnership.delete(lease);
     try {
       await publishClaimRelease(handle, publishOptions);
     } catch (error) {
