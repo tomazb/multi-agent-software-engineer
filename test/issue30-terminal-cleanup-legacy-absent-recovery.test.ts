@@ -45,10 +45,6 @@ async function stripTerminalCleanup(store: FileRunStore, runId: string): Promise
   return loaded;
 }
 
-function workflowEventTypes(run: RunRecord): string[] {
-  return run.events.map((event) => event.type);
-}
-
 test("legacy FAILED bootstrap recovery with absent path and registration publishes complete", async (t) => {
   const cwd = await initGitRepo();
   t.after(async () => rm(cwd, { recursive: true, force: true }));
@@ -68,7 +64,7 @@ test("legacy FAILED bootstrap recovery with absent path and registration publish
 
   await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd });
   const legacy = await stripTerminalCleanup(store, failed.id);
-  const beforeEvents = workflowEventTypes(legacy);
+  const beforeEvents = structuredClone(legacy.events);
 
   const cleaned = await orchestrator.cleanupTerminal(failed.id);
 
@@ -77,7 +73,7 @@ test("legacy FAILED bootstrap recovery with absent path and registration publish
   assert.equal(cleaned.terminalCleanup?.preservationReason, undefined);
   assert.equal(cleaned.terminalCleanup?.lastError, undefined);
   await assert.rejects(access(worktreePath), /ENOENT/);
-  assert.deepEqual(workflowEventTypes(cleaned), beforeEvents);
+  assert.deepEqual(cleaned.events, beforeEvents);
 });
 
 test("legacy FAILED revalidation recovery with absent path and registration publishes complete", async (t) => {
@@ -111,7 +107,7 @@ test("legacy FAILED revalidation recovery with absent path and registration publ
   await store.save(run);
   await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd });
   run = await stripTerminalCleanup(store, run.id);
-  const beforeEvents = workflowEventTypes(run);
+  const beforeEvents = structuredClone(run.events);
 
   const cleaned = await orchestrator.cleanupTerminal(run.id);
 
@@ -120,5 +116,5 @@ test("legacy FAILED revalidation recovery with absent path and registration publ
   assert.equal(cleaned.terminalCleanup?.preservationReason, undefined);
   assert.equal(cleaned.terminalCleanup?.lastError, undefined);
   await assert.rejects(access(worktreePath), /ENOENT/);
-  assert.deepEqual(workflowEventTypes(cleaned), beforeEvents);
+  assert.deepEqual(cleaned.events, beforeEvents);
 });
