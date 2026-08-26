@@ -126,6 +126,7 @@ The following were non-goals for the original v0.1 CLI and remain out of scope e
 - Replacing GitHub Actions or a project's existing CI.
 - General-purpose swarm or arbitrary recursive subagent framework.
 - Guaranteeing provider model availability, identity evidence that a provider does not expose, or pricing.
+- Sandboxing untrusted repositories beyond the permissions supplied by Cursor and the local operating system in the current release.
 - Claiming that a harness sandbox alone provides complete operating-system isolation.
 - Allowing an external harness to own authoritative worktrees, MASWE workflow state, retries/fallback, or Git/GitHub publication.
 - Treating transitive Claude Code/Codex/etc. behind another harness as equivalent to MASWE's future direct adapter for that product.
@@ -455,7 +456,7 @@ Required delivery order is governed by the roadmap and MH-00 design:
 - MH-01: harness-neutral domain/configuration/capability/attempt/evidence contracts.
 - MH-02: Cursor-preserving harness registry refactor.
 - MH-03: deterministic global/project/private/invocation configuration hierarchy.
-- Add direct read-only adapters for Claude Code, Codex CLI, Copilot CLI, OpenCode, Hermes, and DeepSeek Harness after the shared gates.
+- Add direct read-only adapters for Claude Code, Codex CLI, Copilot CLI, OpenCode, Hermes Agent, and DeepSeek Harness only after the shared gates and each adapter's own entry gate/owner approval.
 - MH-07: govern external writer authority while MASWE retains deterministic commit/publication authority.
 - MH-08: assurance profiles and differential verification.
 - MH-09 / Issue #4: PostgreSQL/object storage, queue/leases/outbox, API/MCP, and distributed qualified workers only after local attempt/evidence contracts and initial conformance are proven.
