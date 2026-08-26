@@ -84,6 +84,7 @@ Usage:
   maswe cancel <run-id>
   maswe retry <run-id>
   maswe supersede <run-id>
+  maswe cleanup <run-id>
   maswe unlock <run-id> [--force]
   maswe unlock-admin <run-id> [--force]
   maswe github-webhook
@@ -319,6 +320,12 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       const runId = values[0]!;
       const { orchestrator } = await orchestratorForRun(cwd, store, runId);
       console.log(renderRun(await orchestrator.supersede(runId)));
+      return;
+    }
+    case "cleanup": {
+      const runId = values[0]!;
+      const { orchestrator } = await orchestratorForRun(cwd, store, runId);
+      console.log(renderRun(await orchestrator.cleanupTerminal(runId)));
       return;
     }
     case "unlock": {

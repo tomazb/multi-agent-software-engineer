@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { appendFile, lstat, mkdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { RunRecord, RunWorkspace } from "./domain.ts";
+import type { RunRecord, RunWorkspace, TerminalCleanupFailureCode } from "./domain.ts";
 import {
   gitChangedFiles,
   gitCurrentBranch,
@@ -74,6 +74,160 @@ export function externalWorktreePath(repositoryPath: string, runId: string): str
   assertSafeRunId(runId);
   const repoKey = createHash("sha256").update(path.resolve(repositoryPath)).digest("hex").slice(0, 16);
   return path.join(os.tmpdir(), "maswe-worktrees", repoKey, runId);
+}
+
+/**
+ * Exact managed cleanup target derived only from durable run authority.
+ * Checkpointed workspace wins; otherwise an isolated bootstrap intent may
+ * supply a persisted planned path or a uniquely proven historical registration
+ * without fabricating durable `run.workspace` or consulting current TMPDIR.
+ */
+export type ManagedTerminalCleanupTarget = {
+  worktreePath: string;
+  branch: string;
+  headSha: string;
+  source: "checkpointed-workspace" | "bootstrap-uncheckpointed";
+};
+
+export type ManagedTerminalCleanupTargetDerivation =
+  | { status: "none" }
+  | { status: "target"; target: ManagedTerminalCleanupTarget }
+  | { status: "ambiguous" };
+
+function pathsAgree(left: string, right: string): boolean {
+  return path.resolve(left) === path.resolve(right);
+}
+
+/**
+ * Recover an uncheckpointed isolated bootstrap target only from uniquely proven
+ * Git worktree registration identity. This is the historical authority path —
+ * never current process TMPDIR recomputation.
+ */
+export async function recoverHistoricalUncheckpointedBootstrapTarget(
+  run: RunRecord,
+  listRegistrations: (
+    repositoryPath: string,
+  ) => Promise<GitWorktreeRegistration[]>,
+): Promise<ManagedTerminalCleanupTargetDerivation> {
+  const bootstrap = run.workspaceBootstrap;
+  if (!bootstrap || bootstrap.mode !== "isolated-worktree") {
+    return { status: "none" };
+  }
+
+  const expectedBranch = `maswe/${run.id}`;
+  const expectedHead = bootstrap.sourceBaseSha.toLowerCase();
+  let registrations: GitWorktreeRegistration[];
+  try {
+    registrations = await listRegistrations(run.repositoryPath);
+  } catch {
+    return { status: "ambiguous" };
+  }
+
+  const repositoryRoot = path.resolve(run.repositoryPath);
+  const branchMatches = registrations.filter(
+    (registration) => registration.branch === expectedBranch,
+  );
+  if (branchMatches.length > 1) {
+    return { status: "ambiguous" };
+  }
+
+  const ownedMatches = registrations.filter((registration) => {
+    if (registration.prunable) return false;
+    if (registration.branch !== expectedBranch) return false;
+    if (registration.headSha !== expectedHead) return false;
+    if (!path.isAbsolute(registration.worktreePath)) return false;
+    if (path.resolve(registration.worktreePath) === repositoryRoot) return false;
+    return true;
+  });
+
+  if (ownedMatches.length === 1 && branchMatches.length === 1) {
+    return {
+      status: "target",
+      target: {
+        worktreePath: path.resolve(ownedMatches[0]!.worktreePath),
+        branch: expectedBranch,
+        headSha: bootstrap.sourceBaseSha,
+        source: "bootstrap-uncheckpointed",
+      },
+    };
+  }
+
+  // Zero matches or a branch-only conflict: historical absence cannot be proven
+  // from the current process environment.
+  return { status: "ambiguous" };
+}
+
+/**
+ * Historical FAILED→CREATED retry binding: recover a durable planned path only
+ * from uniquely proven registration identity. Distinct from first-time CREATED
+ * bootstrap binding, which may choose current externalWorktreePath before any
+ * side effect.
+ */
+export async function proveUniqueHistoricalIsolatedWorktreePath(
+  run: RunRecord,
+  dependencies?: Pick<Partial<TerminalCleanupDependencies>, "listRegistrations">,
+): Promise<{ status: "proven"; worktreePath: string } | { status: "unproven" }> {
+  const listRegistrations =
+    dependencies?.listRegistrations ?? listGitWorktreeRegistrations;
+  const derivation = await recoverHistoricalUncheckpointedBootstrapTarget(
+    run,
+    listRegistrations,
+  );
+  if (derivation.status === "target") {
+    return { status: "proven", worktreePath: derivation.target.worktreePath };
+  }
+  return { status: "unproven" };
+}
+
+export async function deriveManagedTerminalCleanupTarget(
+  run: RunRecord,
+  dependencies?: Pick<Partial<TerminalCleanupDependencies>, "listRegistrations">,
+): Promise<ManagedTerminalCleanupTargetDerivation> {
+  if (!run.config.policy.useIsolatedWorktree) {
+    return { status: "none" };
+  }
+
+  const listRegistrations =
+    dependencies?.listRegistrations ?? listGitWorktreeRegistrations;
+  const plannedPath = run.workspaceBootstrap?.plannedWorktreePath;
+
+  if (run.workspace?.worktreePath) {
+    const worktreePath = path.resolve(run.workspace.worktreePath);
+    if (plannedPath !== undefined && !pathsAgree(worktreePath, plannedPath)) {
+      return { status: "ambiguous" };
+    }
+    return {
+      status: "target",
+      target: {
+        worktreePath,
+        branch: run.workspace.branch,
+        headSha: run.workspace.headSha,
+        source: "checkpointed-workspace",
+      },
+    };
+  }
+
+  const bootstrap = run.workspaceBootstrap;
+  if (!bootstrap || bootstrap.mode !== "isolated-worktree") {
+    return { status: "none" };
+  }
+
+  if (plannedPath !== undefined) {
+    if (!path.isAbsolute(plannedPath)) {
+      return { status: "ambiguous" };
+    }
+    return {
+      status: "target",
+      target: {
+        worktreePath: path.resolve(plannedPath),
+        branch: `maswe/${run.id}`,
+        headSha: bootstrap.sourceBaseSha,
+        source: "bootstrap-uncheckpointed",
+      },
+    };
+  }
+
+  return recoverHistoricalUncheckpointedBootstrapTarget(run, listRegistrations);
 }
 
 export interface GitWorktreeRegistration {
@@ -177,6 +331,348 @@ export function parseGitWorktreeRegistrationsPorcelain(
     registrations.push({ worktreePath, headSha, ...(branch ? { branch } : {}), prunable });
   }
   return registrations;
+}
+
+export class TerminalCleanupError extends Error {
+  readonly code: TerminalCleanupFailureCode;
+
+  constructor(code: TerminalCleanupFailureCode, message: string) {
+    super(message);
+    this.name = "TerminalCleanupError";
+    this.code = code;
+  }
+}
+
+export type TerminalCleanupPathState = "absent" | "directory" | "unsafe";
+
+export interface TerminalCleanupDependencies {
+  listRegistrations(repositoryPath: string): Promise<GitWorktreeRegistration[]>;
+  inspectPath(candidatePath: string): Promise<TerminalCleanupPathState>;
+  removeWorktree(
+    repositoryPath: string,
+    worktreePath: string,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+}
+
+async function inspectTerminalCleanupPath(
+  candidatePath: string,
+): Promise<TerminalCleanupPathState> {
+  try {
+    const stat = await lstat(candidatePath);
+    return stat.isDirectory() && !stat.isSymbolicLink() ? "directory" : "unsafe";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+    throw error;
+  }
+}
+
+async function defaultRemoveWorktree(
+  repositoryPath: string,
+  worktreePath: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return gitExec("git", ["worktree", "remove", "--force", worktreePath], repositoryPath);
+}
+
+function throwTerminalCleanup(code: TerminalCleanupFailureCode, message: string): never {
+  throw new TerminalCleanupError(code, message);
+}
+
+function resolveRegistrationPath(registration: GitWorktreeRegistration): string {
+  return path.resolve(registration.worktreePath);
+}
+
+function findRegistrationForPath(
+  registrations: GitWorktreeRegistration[],
+  worktreePath: string,
+): GitWorktreeRegistration | undefined {
+  const resolved = path.resolve(worktreePath);
+  return registrations.find((registration) => resolveRegistrationPath(registration) === resolved);
+}
+
+function findRegistrationForBranch(
+  registrations: GitWorktreeRegistration[],
+  branch: string,
+): GitWorktreeRegistration | undefined {
+  return registrations.find((registration) => registration.branch === branch);
+}
+
+type RemoveWorktreeAttempt = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  invocationError?: Error;
+};
+
+function assertExpectedBranchNotRegisteredElsewhere(
+  registrations: GitWorktreeRegistration[],
+  expectedBranch: string,
+  worktreePath: string,
+): void {
+  const branchRegistration = findRegistrationForBranch(registrations, expectedBranch);
+  if (
+    branchRegistration &&
+    resolveRegistrationPath(branchRegistration) !== path.resolve(worktreePath)
+  ) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      `Expected branch ${expectedBranch} is registered at a different worktree path`,
+    );
+  }
+}
+
+function assertTargetRegistrationOwnership(
+  targetRegistration: GitWorktreeRegistration | undefined,
+  expectedBranch: string,
+  workspaceHeadSha: string,
+): void {
+  if (!targetRegistration) return;
+  if (targetRegistration.branch !== expectedBranch) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree registration branch does not match the run workspace branch",
+    );
+  }
+  if (targetRegistration.headSha !== workspaceHeadSha.toLowerCase()) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree registration HEAD does not match the run workspace headSha",
+    );
+  }
+}
+
+function classifyPostRemovalState(
+  postRegistrations: GitWorktreeRegistration[],
+  postPathState: TerminalCleanupPathState,
+  worktreePath: string,
+  expectedBranch: string,
+  workspaceHeadSha: string,
+  removeAttempt: RemoveWorktreeAttempt,
+): void {
+  if (postPathState === "unsafe") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree path is not an ordinary directory after cleanup attempt",
+    );
+  }
+
+  assertExpectedBranchNotRegisteredElsewhere(
+    postRegistrations,
+    expectedBranch,
+    worktreePath,
+  );
+
+  const postTargetRegistration = findRegistrationForPath(postRegistrations, worktreePath);
+  assertTargetRegistrationOwnership(
+    postTargetRegistration,
+    expectedBranch,
+    workspaceHeadSha,
+  );
+
+  if (!postTargetRegistration && postPathState === "absent") {
+    return;
+  }
+
+  if (postTargetRegistration && postPathState === "directory") {
+    const removeFailed =
+      removeAttempt.exitCode !== 0 || removeAttempt.invocationError !== undefined;
+    if (removeFailed) {
+      const diagnostic =
+        removeAttempt.invocationError?.message ??
+        (removeAttempt.stderr ||
+          removeAttempt.stdout ||
+          "git worktree remove failed");
+      throwTerminalCleanup("cleanup-remove-failed", diagnostic);
+    }
+    throwTerminalCleanup(
+      "cleanup-postcondition-failed",
+      "Worktree registration and directory remained after git worktree remove",
+    );
+  }
+
+  if (postTargetRegistration && postPathState === "absent") {
+    throwTerminalCleanup(
+      "cleanup-postcondition-failed",
+      "Worktree registration remained after the target path disappeared",
+    );
+  }
+
+  if (!postTargetRegistration && postPathState === "directory") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Refusing to delete an unregistered worktree directory after cleanup attempt",
+    );
+  }
+
+  throwTerminalCleanup(
+    "cleanup-postcondition-failed",
+    "Worktree cleanup postconditions were not satisfied",
+  );
+}
+
+async function attemptRemoveWorktree(
+  deps: TerminalCleanupDependencies,
+  repositoryPath: string,
+  worktreePath: string,
+): Promise<RemoveWorktreeAttempt> {
+  try {
+    const result = await deps.removeWorktree(repositoryPath, worktreePath);
+    return { ...result };
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+      invocationError: error instanceof Error ? error : new Error(String(error)),
+    };
+  }
+}
+
+export async function reconcileTerminalWorktreeCleanup(
+  run: RunRecord,
+  invocationRepositoryPath: string,
+  dependencies?: Partial<TerminalCleanupDependencies>,
+): Promise<void> {
+  const deps: TerminalCleanupDependencies = {
+    listRegistrations: dependencies?.listRegistrations ?? listGitWorktreeRegistrations,
+    inspectPath: dependencies?.inspectPath ?? inspectTerminalCleanupPath,
+    removeWorktree: dependencies?.removeWorktree ?? defaultRemoveWorktree,
+  };
+
+  const repositoryPath = run.repositoryPath;
+  const derivation = await deriveManagedTerminalCleanupTarget(run, {
+    listRegistrations: deps.listRegistrations,
+  });
+  const expectedBranch = `maswe/${run.id}`;
+
+  if (!["COMPLETED", "FAILED", "CANCELLED"].includes(run.state)) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Terminal worktree cleanup requires a terminal workflow state",
+    );
+  }
+  if (!run.config.policy.useIsolatedWorktree) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Terminal worktree cleanup requires an isolated managed worktree policy",
+    );
+  }
+
+  if (path.resolve(invocationRepositoryPath) !== path.resolve(repositoryPath)) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Cleanup invocation repository root must match the run repositoryPath exactly",
+    );
+  }
+  if (derivation.status === "ambiguous") {
+    throwTerminalCleanup(
+      "cleanup-legacy-state-ambiguous",
+      "Managed cleanup target cannot be established from durable authority without current-TMPDIR recomputation",
+    );
+  }
+  if (derivation.status !== "target") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Terminal worktree cleanup requires a recorded managed worktree path or durable isolated bootstrap target",
+    );
+  }
+  const target = derivation.target;
+  const worktreePath = target.worktreePath;
+  if (path.resolve(worktreePath) === path.resolve(repositoryPath)) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Refusing to delete the operator checkout worktree path",
+    );
+  }
+  if (target.branch !== expectedBranch) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      `Recorded branch ${target.branch} does not match expected ${expectedBranch}`,
+    );
+  }
+
+  let registrations: GitWorktreeRegistration[];
+  try {
+    registrations = await deps.listRegistrations(repositoryPath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to inspect Git worktree registrations",
+    );
+  }
+
+  let pathState: TerminalCleanupPathState;
+  try {
+    pathState = await deps.inspectPath(worktreePath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to inspect worktree path",
+    );
+  }
+
+  if (pathState === "unsafe") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Target worktree path is not an ordinary directory",
+    );
+  }
+
+  const branchRegistration = findRegistrationForBranch(registrations, expectedBranch);
+  if (
+    branchRegistration &&
+    resolveRegistrationPath(branchRegistration) !== path.resolve(worktreePath)
+  ) {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      `Expected branch ${expectedBranch} is registered at a different worktree path`,
+    );
+  }
+
+  const targetRegistration = findRegistrationForPath(registrations, worktreePath);
+  assertTargetRegistrationOwnership(targetRegistration, expectedBranch, target.headSha);
+
+  if (!targetRegistration && pathState === "directory") {
+    throwTerminalCleanup(
+      "cleanup-ownership-mismatch",
+      "Refusing to delete an unregistered worktree directory",
+    );
+  }
+
+  if (!targetRegistration && pathState === "absent") {
+    assertExpectedBranchNotRegisteredElsewhere(registrations, expectedBranch, worktreePath);
+    return;
+  }
+
+  const removeAttempt = await attemptRemoveWorktree(deps, repositoryPath, worktreePath);
+
+  let postRegistrations: GitWorktreeRegistration[];
+  try {
+    postRegistrations = await deps.listRegistrations(repositoryPath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to re-inspect Git worktree registrations",
+    );
+  }
+
+  let postPathState: TerminalCleanupPathState;
+  try {
+    postPathState = await deps.inspectPath(worktreePath);
+  } catch (error) {
+    throwTerminalCleanup(
+      "cleanup-inspection-failed",
+      error instanceof Error ? error.message : "Failed to re-inspect worktree path",
+    );
+  }
+
+  classifyPostRemovalState(
+    postRegistrations,
+    postPathState,
+    worktreePath,
+    expectedBranch,
+    target.headSha,
+    removeAttempt,
+  );
 }
 
 export async function listGitWorktreeRegistrations(

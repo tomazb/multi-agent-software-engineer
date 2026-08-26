@@ -69,7 +69,9 @@ export type ClaimOperation =
   | "github-delivery"
   | "github-publication"
   | "run-target-mutation"
-  | "run-publication";
+  | "run-publication"
+  | "run-terminal-cleanup"
+  | "run-terminal-recovery";
 
 export interface ClaimProcessIdentity {
   startedAt: string;
@@ -218,6 +220,8 @@ const CLAIM_OPERATIONS: ClaimOperation[] = [
   "github-publication",
   "run-target-mutation",
   "run-publication",
+  "run-terminal-cleanup",
+  "run-terminal-recovery",
 ];
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

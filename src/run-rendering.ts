@@ -1,4 +1,5 @@
 import type { RunRecord } from "./domain.ts";
+import { isTerminal } from "./state-machine.ts";
 import {
   normalizeModelDisplay,
   sanitizeDurableRuntimeFailureSummary,
@@ -7,6 +8,31 @@ import {
   FAILURE_AGGREGATE_MAX_CODE_POINTS,
   sanitizeDiagnostic,
 } from "./redaction.ts";
+
+export function renderTerminalCleanup(run: RunRecord): string | undefined {
+  if (!isTerminal(run.state)) return undefined;
+  const cleanup = run.terminalCleanup;
+  if (!cleanup) {
+    return "Terminal cleanup: unknown (legacy record)";
+  }
+  if (cleanup.status === "complete") {
+    return "Terminal cleanup: complete";
+  }
+  if (cleanup.status === "pending") {
+    return "Terminal cleanup: pending";
+  }
+  if (cleanup.status === "preserved") {
+    return `Terminal cleanup: preserved (${cleanup.preservationReason})`;
+  }
+  if (cleanup.status === "failed" && cleanup.lastError) {
+    const message = sanitizeDiagnostic(
+      cleanup.lastError.message,
+      FAILURE_AGGREGATE_MAX_CODE_POINTS,
+    ).text;
+    return `Terminal cleanup: failed (${cleanup.lastError.code}): ${message}`;
+  }
+  return undefined;
+}
 
 function renderRuntimeFailure(run: RunRecord): string[] {
   const runtime = sanitizeDurableRuntimeFailureSummary(
@@ -59,6 +85,7 @@ export function renderRun(run: RunRecord): string {
   const revalidation = run.revalidation
     ? `Revalidation: source=${run.revalidation.source}, target=${renderRecoverySha(run.revalidation.requestedHeadSha)}, generation=${run.revalidation.generation}, return=${run.revalidation.returnState}`
     : undefined;
+  const terminalCleanup = renderTerminalCleanup(run);
   return [
     `Run: ${run.id}`,
     `Title: ${run.title}`,
@@ -81,6 +108,7 @@ export function renderRun(run: RunRecord): string {
           ...renderRuntimeFailure(run),
         ]
       : []),
+    ...(terminalCleanup ? [terminalCleanup] : []),
     ...(run.supersedes ? [`Supersedes: ${run.supersedes}`] : []),
     ...(run.supersededBy ? [`Superseded by: ${run.supersededBy}`] : []),
   ].join("\n");

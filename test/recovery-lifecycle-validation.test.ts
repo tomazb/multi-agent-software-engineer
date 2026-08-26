@@ -183,6 +183,33 @@ test("recovery metadata rejects policy-mode contradictions, simultaneous lifecyc
     ["noncanonical bootstrap timestamp", (run) => {
       run.workspaceBootstrap = { ...bootstrap(), plannedAt: "2026-08-19" };
     }],
+    ["operator planned path", (run) => {
+      run.workspaceBootstrap = {
+        ...bootstrap("operator-checkout"),
+        plannedWorktreePath: "/tmp/maswe-operator-forbidden",
+      };
+      run.config = structuredClone(DEFAULT_CONFIG);
+      run.config.policy.useIsolatedWorktree = false;
+    }],
+    ["relative planned path", (run) => {
+      run.workspaceBootstrap = {
+        ...bootstrap(),
+        plannedWorktreePath: "relative/not/absolute",
+      };
+    }],
+    ["workspace planned path disagreement", (run) => {
+      run.workspaceBootstrap = {
+        ...bootstrap(),
+        plannedWorktreePath: "/tmp/maswe-planned-a",
+      };
+      run.workspace = {
+        baseSha: HEAD_A,
+        headSha: HEAD_A,
+        branch: `maswe/${run.id}`,
+        fingerprint: "d".repeat(64),
+        worktreePath: "/tmp/maswe-planned-b",
+      };
+    }],
     ["noncanonical origin head", (run) => {
       run.state = "CI_RUNNING";
       run.revalidation = { ...revalidation(), originHeadSha: " HEAD " };
@@ -205,7 +232,7 @@ test("recovery metadata rejects policy-mode contradictions, simultaneous lifecyc
     await publish(candidate);
     await assert.rejects(
       store.load(candidate.id),
-      /bootstrap|revalidation|fingerprint|timestamp|mode/i,
+      /bootstrap|revalidation|fingerprint|timestamp|mode|plannedWorktreePath|absolute|disagrees|operator-checkout/i,
       label,
     );
   }

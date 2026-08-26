@@ -88,6 +88,44 @@ function requireBootstrapIntent(run: RunRecord): WorkspaceBootstrapIntent {
   return intent;
 }
 
+/**
+ * Resolve the absolute planned isolated worktree path for first-time binding.
+ * This publishes a concrete path under the current process environment before
+ * any side effect. Historical unique-registration recovery belongs to cleanup
+ * derivation, not to first-time binding, so a pre-existing alternate registration
+ * remains a fail-closed reconcile conflict.
+ */
+export function resolveIsolatedPlannedWorktreePathForBinding(run: RunRecord): string {
+  const intent = requireBootstrapIntent(run);
+  if (intent.mode !== "isolated-worktree") {
+    throw new Error(`Run ${run.id} planned worktree path applies only to isolated-worktree mode`);
+  }
+  if (intent.plannedWorktreePath !== undefined) {
+    if (!path.isAbsolute(intent.plannedWorktreePath)) {
+      throw new Error(`Run ${run.id} plannedWorktreePath must be absolute`);
+    }
+    return path.resolve(intent.plannedWorktreePath);
+  }
+
+  return path.resolve(externalWorktreePath(run.repositoryPath, run.id));
+}
+
+export function requireIsolatedPlannedWorktreePath(run: RunRecord): string {
+  const intent = requireBootstrapIntent(run);
+  if (intent.mode !== "isolated-worktree") {
+    throw new Error(`Run ${run.id} planned worktree path applies only to isolated-worktree mode`);
+  }
+  if (!intent.plannedWorktreePath) {
+    throw new Error(
+      `Run ${run.id} isolated bootstrap requires durable plannedWorktreePath before side effects`,
+    );
+  }
+  if (!path.isAbsolute(intent.plannedWorktreePath)) {
+    throw new Error(`Run ${run.id} plannedWorktreePath must be absolute`);
+  }
+  return path.resolve(intent.plannedWorktreePath);
+}
+
 async function assertBootstrapSourceExact(
   repositoryPath: string,
   run: RunRecord,
@@ -159,7 +197,7 @@ export async function assertBootstrapWorkspaceReady(
     throw new Error("Isolated worktrees require a git repository.");
   }
   const expectedBranch = `maswe/${run.id}`;
-  const expectedPath = path.resolve(externalWorktreePath(repositoryPath, run.id));
+  const expectedPath = requireIsolatedPlannedWorktreePath(run);
   if (
     workspace.baseSha !== intent.sourceBaseSha ||
     workspace.headSha !== intent.sourceBaseSha ||
@@ -224,7 +262,7 @@ export async function reconcileBootstrapWorkspace(
   }
 
   const branch = `maswe/${run.id}`;
-  const worktreePath = path.resolve(externalWorktreePath(repositoryPath, run.id));
+  const worktreePath = requireIsolatedPlannedWorktreePath(run);
   let registrations = await listGitWorktreeRegistrations(repositoryPath);
   let byPath = registrations.find((registration) => registration.worktreePath === worktreePath);
   let byBranch = registrations.find((registration) => registration.branch === branch);
@@ -349,15 +387,18 @@ export async function reconcileRetryWorkspace(
     throw new Error(`Run ${run.id} isolated retry requires the preserved Git repository`);
   }
   const expectedBranch = `maswe/${run.id}`;
-  const expectedPath = path.resolve(externalWorktreePath(repositoryPath, run.id));
   if (
     workspace.baseSha === NON_GIT_WORKSPACE ||
     workspace.headSha === NON_GIT_WORKSPACE ||
     workspace.branch !== expectedBranch ||
-    !workspace.worktreePath ||
-    path.resolve(workspace.worktreePath) !== expectedPath
+    !workspace.worktreePath
   ) {
     throw new Error(`Run ${run.id} isolated retry workspace identity is not exact`);
+  }
+  const expectedPath = path.resolve(workspace.worktreePath);
+  const plannedPath = run.workspaceBootstrap?.plannedWorktreePath;
+  if (plannedPath !== undefined && path.resolve(plannedPath) !== expectedPath) {
+    throw new Error(`Run ${run.id} isolated retry workspace disagrees with plannedWorktreePath`);
   }
 
   let registrations = await listGitWorktreeRegistrations(repositoryPath);

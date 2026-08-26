@@ -132,7 +132,8 @@ before `START`. During that recoverable `CREATED` window the relevant record sha
     "sourceBranch": "main",
     "sourceTreeFingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
     "remote": "https://github.com/example/repo.git",
-    "plannedAt": "2026-08-18T12:00:00.000Z"
+    "plannedAt": "2026-08-18T12:00:00.000Z",
+    "plannedWorktreePath": "/tmp/maswe-worktrees/repository-key/20260722120000-1a2b3c4d"
   },
   "workspace": {
     "remote": "https://github.com/example/repo.git",
@@ -146,7 +147,17 @@ before `START`. During that recoverable `CREATED` window the relevant record sha
 ```
 
 `workspaceBootstrap` remains present through the durable workspace checkpoint and is removed by
-the single `START` publication. Bootstrap source-drift checks exclude the orchestrator-owned
+the single `START` publication. For isolated-worktree mode, `plannedWorktreePath` is the exact
+absolute path published into durable bootstrap authority after the run id exists and before any
+branch or worktree side effect. The published schema accepts portable absolute forms MASWE can
+produce (POSIX `/…`, Windows drive-letter, and UNC paths) and rejects relative, drive-relative,
+and drive-less rooted Windows values (`\foo`); runtime validation uses the same host-independent
+portable absolute-path grammar rather than host `path.isAbsolute()` alone. Later recovery and
+cleanup must use that persisted path (or, for
+historical records that omit it, a uniquely proven Git worktree registration) and must not
+recompute authority from the current process `TMPDIR`/`TMP`/`TEMP`. Operator-checkout bootstrap
+must omit `plannedWorktreePath` (schema and runtime both reject the combination). Bootstrap
+source-drift checks exclude the orchestrator-owned
 `.maswe` namespace; read-only role fingerprints continue to include authoritative `.maswe` state.
 
 An active current-head generation uses this optional shape:
@@ -229,6 +240,42 @@ older record with no runtime object preserves the old shape; loading a record wi
 object reconstructs and sanitizes only the documented fields before status/inspection rendering.
 The existing schema-version-1 `failure.message` field keeps its historical unconstrained schema
 shape; migration and every new write enforce the current 8,192-code-point runtime policy.
+
+### Terminal cleanup record
+
+Optional schema-version-1 object `terminalCleanup` is operational lifecycle metadata, not workflow
+evidence. Terminal workflow state is durable before any worktree deletion. Cleanup retries append
+no workflow events and change no artifacts, approvals, counters, GitHub association, or
+engineering `failure` classification. Production cleanup retains the `maswe/<run-id>` branch.
+Ownership is re-proved from the exact repository, recorded or bootstrap-derived path, Git worktree
+registration, branch, HEAD, and type before deletion. When isolated bootstrap fails after
+`git worktree add` but before the workspace checkpoint, cleanup still derives the managed MASWE
+path/branch from durable `workspaceBootstrap` authority (`plannedWorktreePath` when present, else a
+uniquely proven registration) and must not report `complete` while that exact managed target may
+survive or while historical target identity depends on the current process temp directory.
+
+```json
+{
+  "status": "pending",
+  "updatedAt": "2026-08-24T12:04:00.000Z"
+}
+```
+
+Allowed `status` values:
+
+- `pending` and `complete` permit neither `preservationReason` nor `lastError`.
+- `preserved` requires exactly one `preservationReason`
+  (`bootstrap-recovery`, `revalidation-recovery`, or `publication-outcome-unknown`) and
+  forbids `lastError`.
+- `failed` requires `lastError` (`code` plus `message`) and forbids `preservationReason`.
+  Durable codes are `cleanup-inspection-failed`, `cleanup-ownership-mismatch`,
+  `cleanup-remove-failed`, `cleanup-postcondition-failed`, and
+  `cleanup-legacy-state-ambiguous`.
+
+`pending` and `failed` are retryable through `maswe cleanup`. `preserved` retains governed
+Issue #28 recovery state and rejects cleanup. Legacy terminal records may omit `terminalCleanup`;
+that omission is unknown until reconciled and must not be inferred as `complete` or `preserved`.
+Ambiguous legacy `FAILED` preservation fails closed as `cleanup-legacy-state-ambiguous`.
 
 Cursor CLI runtime error results are not artifacts. Raw stderr, raw error metadata, and stderr
 digests are never part of the run or artifact contract. Safe runtime diagnostics expose a stable

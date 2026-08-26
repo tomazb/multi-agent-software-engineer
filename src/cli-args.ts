@@ -44,6 +44,7 @@ const COMMAND_SPECS = {
   cancel: { minPositionals: 1, maxPositionals: 1, options: [] },
   retry: { minPositionals: 1, maxPositionals: 1, options: [] },
   supersede: { minPositionals: 1, maxPositionals: 1, options: [] },
+  cleanup: { minPositionals: 1, maxPositionals: 1, options: [] },
   unlock: { minPositionals: 1, maxPositionals: 1, options: ["force"] },
   "unlock-admin": { minPositionals: 1, maxPositionals: 1, options: ["force"] },
   "github-webhook": { minPositionals: 0, maxPositionals: 0, options: [] },

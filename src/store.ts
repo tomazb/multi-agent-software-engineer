@@ -192,6 +192,11 @@ function sanitizeRunFailureState(run: RunRecord): RunRecord {
       else delete run.failure.runtime;
     }
   }
+  if (run.terminalCleanup?.lastError) {
+    run.terminalCleanup.lastError.message = sanitizePersistedFailureMessage(
+      run.terminalCleanup.lastError.message,
+    );
+  }
   for (const event of run.events) {
     const safeDetails = sanitizeEventDetails(event.type, event.details);
     if (safeDetails) event.details = safeDetails;
@@ -223,6 +228,7 @@ const RUN_RECORD_FIELDS = new Set([
   "supersedes",
   "supersededBy",
   "failure",
+  "terminalCleanup",
 ]);
 
 export function migrateRunRecord(raw: unknown): RunRecord {

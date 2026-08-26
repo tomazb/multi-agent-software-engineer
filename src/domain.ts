@@ -169,6 +169,12 @@ export interface WorkspaceBootstrapIntent {
   sourceTreeFingerprint: string;
   remote?: string;
   plannedAt: string;
+  /**
+   * Exact absolute path chosen for an isolated worktree before any branch or
+   * worktree side effect. Durable authority for recovery; never recompute from
+   * the current process TMPDIR/TMP/TEMP once published.
+   */
+  plannedWorktreePath?: string;
 }
 
 export interface RunRevalidation {
@@ -234,6 +240,34 @@ export interface RunFailure {
   runtime?: DurableRuntimeFailureSummary;
 }
 
+export type TerminalCleanupStatus =
+  | "pending"
+  | "complete"
+  | "failed"
+  | "preserved";
+
+export type TerminalCleanupPreservationReason =
+  | "bootstrap-recovery"
+  | "revalidation-recovery"
+  | "publication-outcome-unknown";
+
+export type TerminalCleanupFailureCode =
+  | "cleanup-inspection-failed"
+  | "cleanup-ownership-mismatch"
+  | "cleanup-remove-failed"
+  | "cleanup-postcondition-failed"
+  | "cleanup-legacy-state-ambiguous";
+
+export interface RunTerminalCleanup {
+  status: TerminalCleanupStatus;
+  updatedAt: string;
+  preservationReason?: TerminalCleanupPreservationReason;
+  lastError?: {
+    code: TerminalCleanupFailureCode;
+    message: string;
+  };
+}
+
 export interface RunRecord {
   schemaVersion: 1;
   version: number;
@@ -263,6 +297,7 @@ export interface RunRecord {
   supersedes?: string;
   supersededBy?: string;
   failure?: RunFailure;
+  terminalCleanup?: RunTerminalCleanup;
 }
 
 export interface RuntimeRequest {

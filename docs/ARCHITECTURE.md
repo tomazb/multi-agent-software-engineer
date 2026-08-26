@@ -178,6 +178,7 @@ or recoverable failed revalidation generation. Evidence from a superseded genera
 - Parses verifier and scope-classification contracts.
 - Enforces retry ceilings.
 - Stops at human and integration gates.
+- Publishes terminal workflow state before worktree deletion and retries cleanup independently.
 
 Merge-ready and completion share one exact current-head assertion. It requires no active
 revalidation, a known head, the recorded branch in a clean MASWE-managed isolated worktree,
@@ -202,6 +203,29 @@ Once a MASWE-managed authoritative baseline has been captured, any failure in th
 preserves that managed worktree for retry reconciliation instead of force-removing it. Retry must
 re-establish the recorded branch, head, cleanliness, and fingerprint through the normal recovery
 checks; a mismatch requires operator reconciliation.
+
+Terminal workflow publication is durable before any worktree deletion. `COMPLETE`, `CANCEL`, and
+`FAIL` persist first; physical cleanup never authorizes or rewrites that workflow state.
+`terminalCleanup` is separate operational lifecycle metadata on the run record, not a workflow
+event or evidence field. `pending` and `failed` cleanup are retryable through `maswe cleanup`.
+`preserved` retains governed Issue #28 recovery state (`bootstrap-recovery`,
+`revalidation-recovery`, or `publication-outcome-unknown`) and rejects cleanup until that recovery
+is consumed or the run is superseded. Cleanup retries append no workflow events and change no
+workflow evidence, GitHub association evidence, artifacts, approvals, counters, or engineering
+failure classification. Production cleanup retains the `maswe/<run-id>` branch. Every destructive
+attempt re-proves ownership from the exact repository, recorded or bootstrap-derived path, Git
+worktree registration, branch, HEAD, and type before deletion. A CREATED bootstrap failure may
+leave a deterministic managed worktree before `run.workspace` is checkpointed; cleanup derives that
+target from durable `workspaceBootstrap.plannedWorktreePath` when present, otherwise from a
+uniquely proven `maswe/<run-id>` registration matching the bootstrap source HEAD, and must not
+publish `complete` while the exact path or registration may still survive or while historical
+target identity cannot be established without consulting the current process temp directory.
+Governed `retryFromFailed()` for isolated `resumeState === "CREATED"` records that omit
+`plannedWorktreePath` must bind that same uniquely proven registration into durable bootstrap
+authority before retry workspace reconciliation; ambiguity fails closed. A
+legacy terminal record that
+omits `terminalCleanup` is unknown until reconciled; ambiguous legacy `FAILED` preservation fails
+closed.
 
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 

@@ -8,6 +8,11 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
+- Issue #30 terminal worktree cleanup recovery: durable terminal workflow publication before
+  deletion; independent `terminalCleanup` lifecycle (`pending`, `complete`, `failed`,
+  `preserved`); retryable `maswe cleanup <run-id>` for `pending`/`failed`; Issue #28 preserved
+  recovery rejection; exact repository/path/registration/branch/HEAD/type ownership re-proof;
+  production branch retention; no `--force`; and a 20-run bounded-resource regression. Not merged.
 - Issue #29 policy boundaries: enforced fixed role-permission matrix, policy-classified runtime
   identity mismatch, orchestrator-owned read-only fingerprint and exact-HEAD fence around both
   runtime returns and throws, and direct policy propagation outside fallback aggregation.

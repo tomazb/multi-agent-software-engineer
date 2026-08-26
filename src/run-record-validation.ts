@@ -1,10 +1,15 @@
 import { assertSafeRunId } from "./git-workspace.ts";
+import path from "node:path";
 import {
   WORKFLOW_EVENTS,
   WORKFLOW_STATES,
   type ArtifactReference,
   type MasweConfig,
   type RunRecord,
+  type RunTerminalCleanup,
+  type TerminalCleanupFailureCode,
+  type TerminalCleanupPreservationReason,
+  type TerminalCleanupStatus,
   type WorkflowEvent,
   type WorkflowEventType,
   type WorkflowState,
@@ -88,6 +93,7 @@ function validateWorkspaceBootstrap(
       "sourceTreeFingerprint",
       "remote",
       "plannedAt",
+      "plannedWorktreePath",
     ],
     ["mode", "sourceBaseSha", "sourceBranch", "sourceTreeFingerprint", "plannedAt"],
   );
@@ -122,12 +128,41 @@ function validateWorkspaceBootstrap(
       bootstrap.plannedAt,
       "Run record workspaceBootstrap.plannedAt",
     ),
+    ...(bootstrap.plannedWorktreePath !== undefined
+      ? {
+          plannedWorktreePath: canonicalPortableDurableAbsolutePath(
+            bootstrap.plannedWorktreePath,
+            "Run record workspaceBootstrap.plannedWorktreePath",
+          ),
+        }
+      : {}),
   };
 }
 
 function canonicalNonEmptyString(value: unknown, label: string): string {
   const result = requiredRunRecordString(value, label, false);
   if (result !== result.trim()) throw new Error(`${label} must be canonical`);
+  return result;
+}
+
+/**
+ * Host-independent durable absolute-path grammar for plannedWorktreePath.
+ * Kept in lockstep with schemas/run-record.schema.json plannedWorktreePath.pattern:
+ * POSIX absolute, Windows drive-letter absolute, and UNC; rejects drive-less
+ * rooted Windows paths and any complete string ending in canonical whitespace.
+ */
+export const PORTABLE_DURABLE_ABSOLUTE_PATH_PATTERN =
+  /^(?:\/.*|[A-Za-z]:[\\/].*|\\\\[^\\/]+\\[^\\/]+(?:[\\/].*)?)(?<!\s)$/;
+
+export function isPortableDurableAbsolutePath(value: string): boolean {
+  return PORTABLE_DURABLE_ABSOLUTE_PATH_PATTERN.test(value);
+}
+
+function canonicalPortableDurableAbsolutePath(value: unknown, label: string): string {
+  const result = canonicalNonEmptyString(value, label);
+  if (!isPortableDurableAbsolutePath(result)) {
+    throw new Error(`${label} must be an absolute path`);
+  }
   return result;
 }
 
@@ -158,6 +193,14 @@ function canonicalTimestamp(value: unknown, label: string): string {
   const epoch = Date.parse(result);
   if (!Number.isFinite(epoch) || new Date(epoch).toISOString() !== result) {
     throw new Error(`${label} must be a canonical ISO timestamp`);
+  }
+  return result;
+}
+
+function canonicalTerminalCleanupTimestamp(value: unknown, label: string): string {
+  const result = canonicalTimestamp(value, label);
+  if (!/^\d{4}-/.test(result)) {
+    throw new Error(`${label} must use an unsigned four-digit year`);
   }
   return result;
 }
@@ -232,6 +275,24 @@ function validateRecoveryLifecycle(run: RunRecord): void {
     if (run.workspaceBootstrap.mode !== expectedMode) {
       throw new Error(
         `Run record workspaceBootstrap mode conflicts with policy mode ${expectedMode}`,
+      );
+    }
+    if (
+      run.workspaceBootstrap.mode === "operator-checkout" &&
+      run.workspaceBootstrap.plannedWorktreePath !== undefined
+    ) {
+      throw new Error(
+        "Run record operator-checkout workspaceBootstrap cannot include plannedWorktreePath",
+      );
+    }
+    if (
+      run.workspace?.worktreePath !== undefined &&
+      run.workspaceBootstrap.plannedWorktreePath !== undefined &&
+      path.resolve(run.workspace.worktreePath) !==
+        path.resolve(run.workspaceBootstrap.plannedWorktreePath)
+    ) {
+      throw new Error(
+        "Run record workspace.worktreePath disagrees with workspaceBootstrap.plannedWorktreePath",
       );
     }
     const resumeState = run.failure?.resumeState;
@@ -375,6 +436,120 @@ function validateFailure(value: unknown): NonNullable<RunRecord["failure"]> {
   };
 }
 
+const TERMINAL_CLEANUP_STATUSES = [
+  "pending",
+  "complete",
+  "failed",
+  "preserved",
+] as const satisfies readonly TerminalCleanupStatus[];
+
+const TERMINAL_CLEANUP_PRESERVATION_REASONS = [
+  "bootstrap-recovery",
+  "revalidation-recovery",
+  "publication-outcome-unknown",
+] as const satisfies readonly TerminalCleanupPreservationReason[];
+
+const TERMINAL_CLEANUP_FAILURE_CODES = [
+  "cleanup-inspection-failed",
+  "cleanup-ownership-mismatch",
+  "cleanup-remove-failed",
+  "cleanup-postcondition-failed",
+  "cleanup-legacy-state-ambiguous",
+] as const satisfies readonly TerminalCleanupFailureCode[];
+
+function validateTerminalCleanup(value: unknown): NonNullable<RunRecord["terminalCleanup"]> {
+  const cleanup = exactObject(
+    value,
+    "run record terminalCleanup",
+    ["status", "updatedAt", "preservationReason", "lastError"],
+    ["status", "updatedAt"],
+  );
+  if (
+    !TERMINAL_CLEANUP_STATUSES.includes(cleanup.status as TerminalCleanupStatus)
+  ) {
+    throw new Error("Run record terminalCleanup.status is invalid");
+  }
+  const status = cleanup.status as TerminalCleanupStatus;
+  const updatedAt = canonicalTerminalCleanupTimestamp(
+    cleanup.updatedAt,
+    "Run record terminalCleanup.updatedAt",
+  );
+  const hasPreservationReason = cleanup.preservationReason !== undefined;
+  const hasLastError = cleanup.lastError !== undefined;
+
+  if (status === "pending" || status === "complete") {
+    if (hasPreservationReason) {
+      throw new Error(
+        "Run record terminalCleanup must not include preservationReason for pending or complete status",
+      );
+    }
+    if (hasLastError) {
+      throw new Error(
+        "Run record terminalCleanup must not include lastError for pending or complete status",
+      );
+    }
+    return { status, updatedAt };
+  }
+
+  if (status === "preserved") {
+    if (!hasPreservationReason) {
+      throw new Error(
+        "Run record terminalCleanup.preservationReason is required for preserved status",
+      );
+    }
+    if (hasLastError) {
+      throw new Error(
+        "Run record terminalCleanup must not include lastError for preserved status",
+      );
+    }
+    if (
+      !TERMINAL_CLEANUP_PRESERVATION_REASONS.includes(
+        cleanup.preservationReason as TerminalCleanupPreservationReason,
+      )
+    ) {
+      throw new Error("Run record terminalCleanup.preservationReason is invalid");
+    }
+    return {
+      status,
+      updatedAt,
+      preservationReason:
+        cleanup.preservationReason as TerminalCleanupPreservationReason,
+    };
+  }
+
+  if (hasPreservationReason) {
+    throw new Error(
+      "Run record terminalCleanup must not include preservationReason for failed status",
+    );
+  }
+  if (!hasLastError) {
+    throw new Error("Run record terminalCleanup.lastError is required for failed status");
+  }
+  const lastError = exactObject(
+    cleanup.lastError,
+    "run record terminalCleanup.lastError",
+    ["code", "message"],
+  );
+  if (
+    !TERMINAL_CLEANUP_FAILURE_CODES.includes(
+      lastError.code as TerminalCleanupFailureCode,
+    )
+  ) {
+    throw new Error("Run record terminalCleanup.lastError.code is invalid");
+  }
+  return {
+    status,
+    updatedAt,
+    lastError: {
+      code: lastError.code as TerminalCleanupFailureCode,
+      message: requiredRunRecordString(
+        lastError.message,
+        "Run record terminalCleanup.lastError.message",
+      ),
+    },
+  };
+}
+
 export function exactRunRecord(
   candidate: Record<string, unknown>,
   version: number,
@@ -460,7 +635,16 @@ export function exactRunRecord(
     ...(candidate.failure !== undefined
       ? { failure: validateFailure(candidate.failure) }
       : {}),
+    ...(candidate.terminalCleanup !== undefined
+      ? { terminalCleanup: validateTerminalCleanup(candidate.terminalCleanup) }
+      : {}),
   };
   validateRecoveryLifecycle(run);
+  if (
+    run.terminalCleanup &&
+    !["COMPLETED", "FAILED", "CANCELLED"].includes(run.state)
+  ) {
+    throw new Error("Run record terminalCleanup requires a terminal workflow state");
+  }
   return run;
 }

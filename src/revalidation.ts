@@ -9,8 +9,10 @@ import type {
 import { invalidateStaleEvidence } from "./git-workspace.ts";
 import type { RunStore } from "./store.ts";
 import {
+  assertRunMutationLease,
   withRunMutationFence,
   type RunMutationFenceOptions,
+  type RunMutationLease,
 } from "./run-mutation.ts";
 
 export interface RevalidationTargetInput {
@@ -142,48 +144,67 @@ export class RevalidationService {
       location.repositoryPath,
       runId,
       "target",
-      async () => {
-        // The preliminary read is path discovery only. All target decisions use
-        // authority reloaded after durable mutation ownership is entered.
-        const run = await this.store.load(runId);
-        if (run.repositoryPath !== location.repositoryPath) {
-          throw new RevalidationOptimisticConflictError(
-            `Revalidation repository path changed for run ${runId}`,
-          );
-        }
-        if (run.version !== input.expectedRunVersion) {
-          throw new RevalidationOptimisticConflictError(
-            `Revalidation optimistic version conflict for run ${runId}: expected ${input.expectedRunVersion}, authoritative ${run.version}`,
-          );
-        }
-
-        const revalidation = run.revalidation;
-        if (revalidation === undefined) {
-          const authoritativeTarget = run.workspace?.headSha;
-          if (authoritativeTarget !== input.previousHeadSha) {
-            throw new RevalidationOptimisticConflictError(
-              `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${authoritativeTarget ?? "missing"}`,
-            );
-          }
-          if (
-            input.observedWorkspace !== undefined &&
-            input.observedWorkspace.headSha !== input.requestedHeadSha
-          ) {
-            throw new Error(
-              `Revalidation target ${input.requestedHeadSha} does not match observed workspace HEAD ${input.observedWorkspace.headSha}`,
-            );
-          }
-          return this.requestInitial(run, input);
-        }
-        if (revalidation.requestedHeadSha !== input.previousHeadSha) {
-          throw new RevalidationOptimisticConflictError(
-            `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${revalidation.requestedHeadSha}`,
-          );
-        }
-        return this.routeActive(run, revalidation, input);
-      },
+      async () => this.routeAuthoritative(runId, input, location.repositoryPath),
       this.mutationFenceOptions,
     );
+  }
+
+  async routeWithHeldTerminalRecoveryLease(
+    runId: string,
+    input: RevalidationTargetInput,
+    lease: RunMutationLease,
+  ): Promise<RunRecord> {
+    requireTargetInput(input);
+    await assertRunMutationLease(
+      lease,
+      lease.repositoryPath,
+      runId,
+      "terminal-recovery",
+    );
+    return this.routeAuthoritative(runId, input, lease.repositoryPath);
+  }
+
+  private async routeAuthoritative(
+    runId: string,
+    input: RevalidationTargetInput,
+    repositoryPath: string,
+  ): Promise<RunRecord> {
+    const run = await this.store.load(runId);
+    if (run.repositoryPath !== repositoryPath) {
+      throw new RevalidationOptimisticConflictError(
+        `Revalidation repository path changed for run ${runId}`,
+      );
+    }
+    if (run.version !== input.expectedRunVersion) {
+      throw new RevalidationOptimisticConflictError(
+        `Revalidation optimistic version conflict for run ${runId}: expected ${input.expectedRunVersion}, authoritative ${run.version}`,
+      );
+    }
+
+    const revalidation = run.revalidation;
+    if (revalidation === undefined) {
+      const authoritativeTarget = run.workspace?.headSha;
+      if (authoritativeTarget !== input.previousHeadSha) {
+        throw new RevalidationOptimisticConflictError(
+          `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${authoritativeTarget ?? "missing"}`,
+        );
+      }
+      if (
+        input.observedWorkspace !== undefined &&
+        input.observedWorkspace.headSha !== input.requestedHeadSha
+      ) {
+        throw new Error(
+          `Revalidation target ${input.requestedHeadSha} does not match observed workspace HEAD ${input.observedWorkspace.headSha}`,
+        );
+      }
+      return this.requestInitial(run, input);
+    }
+    if (revalidation.requestedHeadSha !== input.previousHeadSha) {
+      throw new RevalidationOptimisticConflictError(
+        `Revalidation optimistic predecessor conflict for run ${runId}: expected ${input.previousHeadSha}, authoritative target ${revalidation.requestedHeadSha}`,
+      );
+    }
+    return this.routeActive(run, revalidation, input);
   }
 
   private async requestInitial(

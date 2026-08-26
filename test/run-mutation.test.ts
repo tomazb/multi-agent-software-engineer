@@ -295,3 +295,36 @@ test("durable run mutation ownership crosses processes and ESRCH-recovers a cras
     ["00000000000000000001", "00000000000000000002", "00000000000000000003"],
   );
 });
+
+test("terminal-cleanup and terminal-recovery roles publish distinct durable claim operations", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-run-mutation-roles-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("mutation roles", "distinct cleanup and recovery claims", DEFAULT_CONFIG);
+
+  let cleanupClaimOperation: string | undefined;
+  await withRunMutationFence(cwd, run.id, "terminal-cleanup", async () => {
+    const scan = await scanLockJournal(runMutationJournalRoot(cwd, run.id), "data");
+    const live = scan.claims.find((claim) => !scan.releases.has(claim.ticket));
+    cleanupClaimOperation = live?.operation;
+  });
+
+  let recoveryClaimOperation: string | undefined;
+  await withRunMutationFence(cwd, run.id, "terminal-recovery", async () => {
+    const scan = await scanLockJournal(runMutationJournalRoot(cwd, run.id), "data");
+    const live = scan.claims.find((claim) => !scan.releases.has(claim.ticket));
+    recoveryClaimOperation = live?.operation;
+  });
+
+  assert.equal(cleanupClaimOperation, "run-terminal-cleanup");
+  assert.equal(recoveryClaimOperation, "run-terminal-recovery");
+
+  const finalScan = await scanLockJournal(runMutationJournalRoot(cwd, run.id), "data");
+  assert.equal(
+    finalScan.claims.some(
+      (claim) =>
+        claim.operation === "run-target-mutation" && !finalScan.releases.has(claim.ticket),
+    ),
+    false,
+  );
+});

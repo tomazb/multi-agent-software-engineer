@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+import assert, { AssertionError } from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
@@ -30,6 +30,7 @@ type JsonSchema = {
   enum?: unknown[];
   additionalProperties?: boolean;
   dependentRequired?: Record<string, string[]>;
+  not?: JsonSchema;
 };
 
 function resolveRef(root: JsonSchema, schema: JsonSchema): JsonSchema {
@@ -57,11 +58,46 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     let conditionMatches = true;
     try {
       assertMatches(root, effective.if, value, `${label}.if`);
-    } catch {
+    } catch (error) {
       conditionMatches = false;
+      if (!(error instanceof AssertionError)) throw error;
     }
     if (conditionMatches) {
       assertMatches(root, effective.then, value, `${label}.then`);
+    }
+  }
+  if (effective.not) {
+    let forbiddenMatches = true;
+    try {
+      assertMatches(root, effective.not, value, `${label}.not`);
+    } catch (error) {
+      forbiddenMatches = false;
+      if (!(error instanceof AssertionError)) throw error;
+    }
+    assert.equal(forbiddenMatches, false, `${label} not`);
+  }
+  if (
+    effective.required &&
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const obj = value as Record<string, unknown>;
+    for (const key of effective.required) {
+      assert.ok(Object.hasOwn(obj, key), `${label}.${key} required`);
+    }
+  }
+  if (
+    effective.properties &&
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const obj = value as Record<string, unknown>;
+    for (const [key, child] of Object.entries(effective.properties)) {
+      if (Object.hasOwn(obj, key)) {
+        assertMatches(root, child, obj[key], `${label}.${key}`);
+      }
     }
   }
   if (effective.const !== undefined) {
@@ -187,6 +223,24 @@ test("schema assertion enforces dependent required object properties", () => {
   assert.throws(
     () => assertMatches(schema, schema, { suspensionReason: "closed" }, "github"),
     /github\.suspended dependentRequired/,
+  );
+});
+
+test("schema evaluator propagates non-assertion errors from if and not", () => {
+  const missingRef = { $ref: "#/$defs/missing" };
+  assert.throws(
+    () =>
+      assertMatches(
+        {},
+        { if: missingRef, then: { type: "string" } },
+        "value",
+        "if",
+      ),
+    /Missing \$ref target/,
+  );
+  assert.throws(
+    () => assertMatches({}, { not: missingRef }, "value", "not"),
+    /Missing \$ref target/,
   );
 });
 
@@ -408,6 +462,267 @@ test("run-record schema and migration accept exact legal recovery metadata", asy
   revalidation.unknown = true;
   assert.throws(() => assertMatches(schema, schema, persisted, "run"), /additionalProperties/);
   assert.throws(() => migrateRunRecord(persisted), /unsupported.*revalidation.*unknown/i);
+});
+
+test("run-record schema plannedWorktreePath portable absolute paths and operator-checkout parity", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const bootstrapSchema = schema.properties!.workspaceBootstrap!;
+
+  const baseIsolated = {
+    mode: "isolated-worktree",
+    sourceBaseSha: "a".repeat(40),
+    sourceBranch: "main",
+    sourceTreeFingerprint: "b".repeat(64),
+    plannedAt: "2026-08-26T00:00:00.000Z",
+  };
+
+  assert.doesNotThrow(() =>
+    assertMatches(schema, bootstrapSchema, baseIsolated, "isolated without planned path"),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      { ...baseIsolated, plannedWorktreePath: "/tmp/maswe-worktrees/repo/run-id" },
+      "posix absolute planned path",
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      {
+        ...baseIsolated,
+        plannedWorktreePath: "C:\\Users\\runner\\AppData\\Local\\Temp\\maswe-worktrees\\repo\\run-id",
+      },
+      "windows drive absolute planned path",
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      {
+        ...baseIsolated,
+        plannedWorktreePath: "D:/maswe-worktrees/repo/run-id",
+      },
+      "windows drive absolute with forward slashes",
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      {
+        ...baseIsolated,
+        plannedWorktreePath: "\\\\fileserver\\share\\maswe-worktrees\\repo\\run-id",
+      },
+      "windows UNC planned path",
+    ),
+  );
+
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "foo/bar" },
+        "relative planned path",
+      ),
+    /pattern/,
+  );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "C:relative" },
+        "drive-relative planned path",
+      ),
+    /pattern/,
+  );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "\\maswe-worktrees\\run" },
+        "drive-less rooted windows planned path",
+      ),
+    /pattern/,
+  );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "/tmp/maswe-worktrees/run " },
+        "trailing whitespace planned path",
+      ),
+    /pattern/,
+    "published schema rejects trailing whitespace in plannedWorktreePath",
+  );
+
+  const operatorBase = {
+    mode: "operator-checkout",
+    sourceBaseSha: "a".repeat(40),
+    sourceBranch: "main",
+    sourceTreeFingerprint: "b".repeat(64),
+    plannedAt: "2026-08-26T00:00:00.000Z",
+  };
+  assert.doesNotThrow(() =>
+    assertMatches(schema, bootstrapSchema, operatorBase, "operator-checkout without planned path"),
+  );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...operatorBase, plannedWorktreePath: "/tmp/should-not-exist-for-operator" },
+        "operator-checkout with planned path",
+      ),
+    /not|plannedWorktreePath|required/i,
+  );
+});
+
+test("run-record schema and migration accept exact legal terminal cleanup metadata", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-terminal-cleanup-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "terminal cleanup contract", DEFAULT_CONFIG);
+  const at = "2026-08-24T12:00:00.000Z";
+  const legalForms = [
+    { status: "pending", updatedAt: at },
+    { status: "complete", updatedAt: at },
+    {
+      status: "preserved",
+      updatedAt: at,
+      preservationReason: "bootstrap-recovery",
+    },
+    {
+      status: "failed",
+      updatedAt: at,
+      lastError: {
+        code: "cleanup-remove-failed",
+        message: "exact worktree remained registered",
+      },
+    },
+  ] as const;
+
+  for (const terminalCleanup of legalForms) {
+    const candidate = structuredClone(await store.load(run.id));
+    candidate.state = "COMPLETED";
+    candidate.terminalCleanup = structuredClone(terminalCleanup);
+    await store.save(candidate);
+    const persisted = await store.load(candidate.id);
+    assert.doesNotThrow(() => assertMatches(schema, schema, persisted, "terminal cleanup run"));
+    assert.doesNotThrow(() => migrateRunRecord(persisted));
+    assert.deepEqual(persisted.terminalCleanup, terminalCleanup);
+  }
+
+  const illegalForms = [
+    { status: "pending", updatedAt: at, preservationReason: "bootstrap-recovery" },
+    {
+      status: "complete",
+      updatedAt: at,
+      lastError: { code: "cleanup-remove-failed", message: "x" },
+    },
+    { status: "preserved", updatedAt: at },
+    {
+      status: "preserved",
+      updatedAt: at,
+      preservationReason: "bootstrap-recovery",
+      lastError: { code: "cleanup-remove-failed", message: "x" },
+    },
+    { status: "failed", updatedAt: at },
+    {
+      status: "failed",
+      updatedAt: at,
+      preservationReason: "revalidation-recovery",
+      lastError: { code: "cleanup-remove-failed", message: "x" },
+    },
+  ] as const;
+
+  for (const terminalCleanup of illegalForms) {
+    const candidate = structuredClone(run);
+    candidate.state = "COMPLETED";
+    candidate.terminalCleanup = structuredClone(terminalCleanup) as NonNullable<
+      typeof run.terminalCleanup
+    >;
+    assert.throws(
+      () => assertMatches(schema, schema, candidate, "illegal terminal cleanup"),
+      /required|not|preservationReason|lastError/i,
+    );
+    assert.throws(
+      () => migrateRunRecord(candidate),
+      /terminalCleanup|preservationReason|lastError/i,
+    );
+  }
+
+  const nonterminal = structuredClone(run);
+  nonterminal.state = "PR_READY";
+  nonterminal.terminalCleanup = { status: "pending", updatedAt: at };
+  assert.throws(
+    () => assertMatches(schema, schema, nonterminal, "nonterminal terminal cleanup"),
+    /terminalCleanup|COMPLETED|FAILED|CANCELLED|state/i,
+  );
+  assert.throws(
+    () => migrateRunRecord(nonterminal),
+    /terminalCleanup requires a terminal workflow state/i,
+  );
+
+  const nonterminalBuilding = structuredClone(run);
+  nonterminalBuilding.state = "BUILDING";
+  nonterminalBuilding.terminalCleanup = { status: "pending", updatedAt: at };
+  assert.throws(
+    () => assertMatches(schema, schema, nonterminalBuilding, "building terminal cleanup"),
+    /terminalCleanup|COMPLETED|FAILED|CANCELLED|state/i,
+  );
+  assert.throws(
+    () => migrateRunRecord(nonterminalBuilding),
+    /terminalCleanup requires a terminal workflow state/i,
+  );
+});
+
+test("run-record schema and runtime enforce canonical terminal cleanup timestamps", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-cleanup-timestamp-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const run = await new FileRunStore(cwd).create(
+    "cleanup timestamp",
+    "reject impossible dates",
+    DEFAULT_CONFIG,
+  );
+  const invalidTimestamps = [
+    "2026-99-99T12:00:00.000Z",
+    "2025-02-29T12:00:00.000Z",
+    "2026-04-31T12:00:00.000Z",
+    "2026-01-01T24:00:00.000Z",
+    "2026-01-01T23:59:60.000Z",
+  ];
+  for (const updatedAt of invalidTimestamps) {
+    const candidate = structuredClone(run);
+    candidate.state = "COMPLETED";
+    candidate.terminalCleanup = { status: "pending", updatedAt };
+    assert.throws(() => assertMatches(schema, schema, candidate, "run"), /pattern/);
+    assert.throws(() => migrateRunRecord(candidate), /terminalCleanup\.updatedAt/i);
+  }
+
+  const valid = structuredClone(run);
+  valid.state = "COMPLETED";
+  valid.terminalCleanup = {
+    status: "pending",
+    updatedAt: "2024-02-29T23:59:59.999Z",
+  };
+  assert.doesNotThrow(() => assertMatches(schema, schema, valid, "run"));
+  assert.doesNotThrow(() => migrateRunRecord(valid));
 });
 
 test("run-record schema workflow enums and exact event records stay synchronized with runtime validation", async (t) => {
