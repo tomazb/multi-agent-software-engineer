@@ -553,6 +553,17 @@ test("run-record schema plannedWorktreePath portable absolute paths and operator
       ),
     /pattern/,
   );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "/tmp/maswe-worktrees/run " },
+        "trailing whitespace planned path",
+      ),
+    /pattern/,
+    "published schema rejects trailing whitespace in plannedWorktreePath",
+  );
 
   const operatorBase = {
     mode: "operator-checkout",

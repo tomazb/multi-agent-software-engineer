@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import { isPortableDurableAbsolutePath, PORTABLE_DURABLE_ABSOLUTE_PATH_PATTERN } from "../src/run-record-validation.ts";
 import { FileRunStore, migrateRunRecord } from "../src/store.ts";
 
 type JsonSchema = {
@@ -99,11 +100,15 @@ const PARITY_CASES = [
   { path: "/", accepted: true, label: "posix root" },
   { path: "C:\\maswe-worktrees\\run", accepted: true, label: "windows drive absolute" },
   { path: "C:/maswe-worktrees/run", accepted: true, label: "windows drive absolute forward slash" },
+  { path: "\\\\server\\share", accepted: true, label: "windows UNC share root" },
   {
     path: "\\\\server\\share\\maswe-worktrees\\run",
     accepted: true,
     label: "windows UNC",
   },
+  { path: "/tmp/maswe worktrees/run", accepted: true, label: "posix with internal space" },
+  { path: "C:\\maswe worktrees\\run", accepted: true, label: "windows drive with internal space" },
+  { path: "\\\\server\\my share\\run", accepted: true, label: "windows UNC with internal space" },
   {
     path: "\\maswe-worktrees\\run",
     accepted: false,
@@ -113,6 +118,16 @@ const PARITY_CASES = [
   { path: "relative/path", accepted: false, label: "relative" },
   { path: "./relative", accepted: false, label: "dot relative" },
   { path: "../relative", accepted: false, label: "dotdot relative" },
+  { path: "/tmp/maswe-worktrees/run ", accepted: false, label: "posix trailing space" },
+  { path: "/tmp/maswe-worktrees/run\t", accepted: false, label: "posix trailing tab" },
+  { path: "/tmp/maswe-worktrees/run\n", accepted: false, label: "posix trailing newline" },
+  { path: "C:\\maswe-worktrees\\run ", accepted: false, label: "windows drive trailing space" },
+  { path: "C:/maswe-worktrees/run\t", accepted: false, label: "windows drive trailing tab" },
+  { path: "\\\\server\\share\\run ", accepted: false, label: "windows UNC trailing space" },
+  { path: "\\\\server\\share\\run\t", accepted: false, label: "windows UNC trailing tab" },
+  { path: "/ ", accepted: false, label: "posix root trailing space" },
+  { path: "C:\\ ", accepted: false, label: "windows drive root trailing space" },
+  { path: "\\\\server\\share ", accepted: false, label: "windows UNC share trailing space" },
 ] as const;
 
 test("plannedWorktreePath schema and runtime share portable absolute-path parity", async (t) => {
@@ -169,6 +184,12 @@ test("plannedWorktreePath schema and runtime share portable absolute-path parity
     })();
     assert.equal(schemaOk, sample.accepted, `schema:${sample.label}`);
 
+    assert.equal(
+      isPortableDurableAbsolutePath(sample.path),
+      sample.accepted,
+      `predicate:${sample.label}`,
+    );
+
     const candidate = structuredClone(raw);
     candidate.workspaceBootstrap = bootstrap;
     if (sample.accepted) {
@@ -189,6 +210,23 @@ test("plannedWorktreePath schema and runtime share portable absolute-path parity
         `runtime must reject ${sample.label}: ${JSON.stringify(sample.path)}`,
       );
     }
+  }
+
+  // Schema pattern and runtime predicate must stay behaviorally locked.
+  const publishedPattern = bootstrapSchema.properties!.plannedWorktreePath!.pattern!;
+  assert.equal(typeof publishedPattern, "string");
+  const publishedRe = new RegExp(publishedPattern);
+  for (const sample of PARITY_CASES) {
+    assert.equal(
+      publishedRe.test(sample.path),
+      PORTABLE_DURABLE_ABSOLUTE_PATH_PATTERN.test(sample.path),
+      `schema/runtime drift:${sample.label}`,
+    );
+    assert.equal(
+      isPortableDurableAbsolutePath(sample.path),
+      PORTABLE_DURABLE_ABSOLUTE_PATH_PATTERN.test(sample.path),
+      `predicate delegates to shared pattern:${sample.label}`,
+    );
   }
 
   // Historical omission remains valid; operator-checkout forbids the field.

@@ -146,13 +146,16 @@ function canonicalNonEmptyString(value: unknown, label: string): string {
 }
 
 /**
- * Host-independent durable absolute-path authority for plannedWorktreePath.
- * Matches the published run-record schema grammar: POSIX absolute, Windows
- * drive-letter absolute, and UNC. Rejects drive-less rooted Windows paths
- * (`\foo`) whose effective drive depends on process context.
+ * Host-independent durable absolute-path grammar for plannedWorktreePath.
+ * Kept in lockstep with schemas/run-record.schema.json plannedWorktreePath.pattern:
+ * POSIX absolute, Windows drive-letter absolute, and UNC; rejects drive-less
+ * rooted Windows paths and any complete string ending in canonical whitespace.
  */
+export const PORTABLE_DURABLE_ABSOLUTE_PATH_PATTERN =
+  /^(?:\/.*|[A-Za-z]:[\\/].*|\\\\[^\\/]+\\[^\\/]+(?:[\\/].*)?)(?<!\s)$/;
+
 export function isPortableDurableAbsolutePath(value: string): boolean {
-  return /^(?:\/.*|[A-Za-z]:[\\/].*|\\\\[^\\/]+\\[^\\/]+(?:[\\/].*)?)$/.test(value);
+  return PORTABLE_DURABLE_ABSOLUTE_PATH_PATTERN.test(value);
 }
 
 function canonicalPortableDurableAbsolutePath(value: unknown, label: string): string {
