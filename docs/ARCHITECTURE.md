@@ -2,30 +2,32 @@
 
 ## 1. Decision summary
 
-MASWE is an **orchestrator-first system with a thin Cursor plugin**.
+MASWE is an **orchestrator-first system with a thin Cursor plugin** today and an approved
+**capability-negotiated multi-harness execution boundary** for future runtime evolution.
 
 - The orchestration core is authoritative for state, stage order, policy, artifacts, retries, and approvals.
-- Cursor CLI and Cursor SDK are execution adapters.
+- Cursor CLI and Cursor SDK are the implemented execution adapters.
+- MH-00 defines a future harness registry, exact attempt identity, capability negotiation, governed outer supervision, raw/normalized execution evidence, and assurance evaluation without transferring workflow authority to a harness.
 - Superpowers defines how each role performs its assigned engineering work.
 - Deterministic project commands decide test/build health.
-- GitHub becomes the remote event and merge-control surface in a later milestone.
+- GitHub Phase A is implemented; Phase B remains governed by Issue #3 and stable repository identity work in #34.
 
-This document describes the currently implemented Cursor-first architecture. The owner-approved
-harness-neutral evolution is tracked by Issues #31 and #32 and becomes normative only through
-MH-00. No external harness adapter is implemented in the current architecture.
+The accepted MH-00 baseline is `23f06f3900598443dc40c65c35336aecda76ea2f`. The normative planned
+multi-harness design is `docs/superpowers/specs/2026-08-26-mh-00-multi-harness-execution-architecture.md`
+and ADR-0008. No external harness adapter is implemented by MH-00.
 
-This prevents a single parent model from becoming an implicit, long-lived workflow engine.
+This prevents a single parent model or external harness from becoming an implicit, long-lived workflow engine.
 
 ## 2. System context
 
 ```mermaid
 flowchart TB
   Dev[Developer] --> Entry[CLI / Cursor skill]
-  GitHub[GitHub PR and reviews] -. future .-> Control[Control plane]
+  GitHub[GitHub PR and reviews] -. Phase B / future .-> Control[Control plane]
   Entry --> Core[MASWE orchestration core]
   Control -. future .-> Core
   Core --> Store[Run and artifact store]
-  Core --> Adapter[Agent runtime interface]
+  Core --> Adapter[Agent runtime interface - implemented]
   Adapter --> CLI[Cursor CLI]
   Adapter --> SDK[Cursor SDK]
   Adapter --> Mock[Mock runtime]
@@ -34,6 +36,8 @@ flowchart TB
   SDK --> Repo
   Quality --> Repo
   Core --> Repo
+  Core -. MH-01/MH-02 planned .-> Registry[Harness registry / attempt planner]
+  Registry -. planned .-> Harnesses[Qualified external harnesses]
 ```
 
 ## 3. Logical components
@@ -91,11 +95,19 @@ Any other configured permission or execution override is rejected before runtime
 present entry must be a non-empty, non-whitespace string. The list is never derived from model or
 review input.
 
+MH-03 will later define deterministic global/project/private/invocation harness configuration.
+Ordinary preference precedence must remain separate from non-overridable security ceilings/floors;
+ambient harness user configuration must not silently become authoritative run policy.
+
 ### 3.3 Domain model
 
 `src/domain.ts` contains role, runtime, configuration, state, event, artifact, run, quality, and adapter contracts.
 
 These types are public architecture boundaries. A future API and database should preserve their semantics even when storage representations change.
+
+MH-01 will extend this boundary with harness-neutral capability, attempt, execution-identity,
+ambient-input, raw/normalized evidence, and assurance-completeness vocabulary while preserving the
+meaning and loadability of current run history.
 
 ### 3.4 State machine
 
@@ -163,6 +175,10 @@ delivery idempotent.
 `CI_RUNNING`; for a recoverable `FAILED` run it updates the retained resume state to `CI_RUNNING`
 without rewriting the historical `FAIL`. A newer authenticated or local head retargets an active
 or recoverable failed revalidation generation. Evidence from a superseded generation is unusable.
+
+External harness events do not add a second transition mechanism. Future adapters return typed
+attempt results/evidence to the orchestrator; only the state machine/public orchestrator operations
+may authorize a workflow event.
 
 ### 3.5 Orchestrator
 
@@ -289,6 +305,11 @@ recheck the namespace, and compare the content digest with the recorded SHA-256.
 accidental pathname escape and fails closed when no-follow support is unavailable. A future store
 can place content in object storage and keep the same reference contract.
 
+Future multi-harness attempt/raw-evidence persistence is a separate planned contract. MH-01 must
+preserve current run/artifact semantics while representing exact harness/transport/profile/model,
+ambient-state, retry/auxiliary-call, isolation, child-lineage, raw-evidence, normalized-evidence,
+and completeness facts without treating them as workflow-authorizing artifacts.
+
 ### 3.7 Prompt builder
 
 `src/prompt-builder.ts` loads versioned templates from `prompts/`, injects the request and previously approved artifacts, and creates a self-contained stage prompt.
@@ -343,6 +364,50 @@ boundary. `runtimeEventIdentityDetails()` creates display-only copies of `reques
 `actualModel` with the model-display policy, and optional `agentId` and `runtimeRunId` with a
 separately named bounded identifier policy. Runtime invocation and exact-model enforcement consume
 the original values before those copies are constructed.
+
+### 3.8A Planned multi-harness execution boundary (MH-00)
+
+The current `AgentRuntime` interface remains the implemented compatibility boundary until MH-01 and
+MH-02. External harness adapters must not be added by extending Cursor-specific assumptions through
+the orchestrator.
+
+The planned execution path is:
+
+```text
+orchestrator
+  -> attempt planner (role + exact workspace/head + policy + assurance)
+  -> harness registry / exact qualification
+  -> governed attempt supervisor
+  -> harness adapter + adapter-specific transport
+  -> raw execution evidence
+  -> normalized evidence + completeness
+  -> assurance/policy verdict
+  -> orchestrator
+```
+
+The attempt identity separates harness, adapter/executable, transport/protocol,
+profile/composition, requested provider/model/effort, runtime-reported identity, identity-evidence
+strength, permissions, sandbox/outer isolation, ambient/hidden state, retries/auxiliary calls,
+child lineage, and raw/normalized evidence completeness.
+
+Routing is deterministic and capability-negotiated. Unknown or unproven required capabilities fail
+closed. Harness names never imply permissions, model/provider, transport, profile, memory,
+delegation, internal retries, workflow support, or publication authority.
+
+MASWE owns the exact workspace/worktree and outer process supervision. Initial external harnesses
+are read-only; inner harness sandboxes are additional evidence/enforcement, not replacements for
+MASWE's HEAD/fingerprint fence. External approvals, jobs, workflows, task boards, retries, and
+subagents are execution evidence or requests, not workflow authority. MASWE remains the only Git
+commit/publication authority until a separately approved MH-07 writer contract.
+
+Direct and transitive product identity remain distinct: `MASWE -> Codex` is not equivalent to
+`MASWE -> DeepSeek Harness -> Codex`. Hermes validates transport/provider/model/memory/delegation
+separation; DeepSeek Harness additionally validates exact Cordis profile/composition, internal
+retry/workflow/plugin/sandbox, hidden-state, and evidence-completeness separation.
+
+The complete planned contract and delivery ordering are defined by the MH-00 design spec and
+ADR-0008. Multi-harness runtime implementation remains blocked until #3 Phase B, MH-01, and MH-02
+entry gates are satisfied.
 
 ### 3.9 Read-only enforcement
 
@@ -445,6 +510,10 @@ intent before branch or worktree side effects and durably checkpoints the establ
 before `START`. A process restart reconciles a partial `CREATED` run from those durable facts; it
 does not infer completed bootstrap from an existing branch or worktree alone.
 
+A future harness-neutral stage execution preserves the same workflow sequence: the runtime box is
+replaced by an exact MASWE attempt plan plus qualified harness execution and evidence evaluation;
+the harness does not own the surrounding state transitions.
+
 ## 5. Model routing
 
 Each role has:
@@ -470,6 +539,11 @@ Model aliases are project configuration for **new runs only**. For runtimes that
 
 `CursorSdkRuntime` has no catalogue capability; doctor/start do not call `agent models`, and empty-catalogue pass-through keeps configured IDs as-is for SDK-only paths.
 
+MH-01 generalizes routing without weakening these exact-selector rules: provider, requested model,
+runtime-resolved/reported identity, effort, harness, transport/protocol, and profile/composition are
+separate attempt facts. Fallback remains MASWE-authorized and produces a new attempt; hidden
+harness-local model/provider substitution is a policy failure.
+
 ## 6. Superpowers integration
 
 MASWE expects Superpowers to be installed in Cursor. Role prompts explicitly request these practices:
@@ -484,6 +558,11 @@ MASWE expects Superpowers to be installed in Cursor. Role prompts explicitly req
 
 MASWE does not fork or embed Superpowers. This keeps methodology upgrades independent from orchestration code.
 
+Under MH-00, governed/immutable MASWE or Superpowers skills remain explicit inputs. Mutable
+harness-created skills/procedural memory are ambient state and do not become authoritative policy.
+High-assurance external verification must disable/freshen them or explicitly declare and digest-bind
+them under the later assurance-profile contract.
+
 ## 7. Deployment modes
 
 ### 7.1 Local CLI — implemented
@@ -496,7 +575,14 @@ The CLI can run in CI against an existing checkout. Approval and GitHub event wi
 
 ### 7.3 Hosted control plane — planned
 
-A service will own durable runs and workers, use PostgreSQL, issue idempotent jobs, launch Cursor cloud or self-hosted agents, receive GitHub webhooks, and expose HTTP/MCP interfaces.
+A future service will own durable runs and qualified harness attempts/workers, use PostgreSQL and
+object storage, issue idempotent jobs, receive GitHub webhooks, and expose HTTP/MCP interfaces.
+Distributed workers must preserve the same harness-neutral attempt/evidence boundary as local
+execution. Worker leases or remote transports do not give a harness workflow, approval, fallback,
+Git, or publication authority.
+
+Do not freeze distributed attempt/worker schemas until MH-01/MH-02 and initial external read-only
+adapter conformance establish the stable identity and evidence-completeness facts.
 
 ## 8. GitHub architecture — Phase A implemented
 
@@ -526,7 +612,11 @@ one listener plus simultaneous manual publishers on one host and one coherent lo
 with atomic no-clobber hard links. Legacy association/check-create/delivery migration requires all
 old processes to stop, retains legacy evidence, and does not support mixed old/new binaries.
 
-Phase B adds push/PR writes, comment replies, and digest-bound GitHub approvals. See `docs/GITHUB_APP.md`.
+Phase B adds authenticated digest-bound approvals, deterministic push/PR publication,
+human-approved review resolution/replies, and Actions/artifact ingestion. Issue #34 must establish
+or explicitly disposition stable repository identity across renames before Phase B obtains GitHub
+write authority. Multi-harness runtime implementation remains blocked until Phase B completes.
+See `docs/GITHUB_APP.md` and Issues #3/#34.
 
 ## 9. Consistency and concurrency
 
@@ -584,12 +674,13 @@ active binaries are unsupported.
 
 The hosted design adds:
 
-- Run version numbers.
+- Run and attempt version numbers.
 - Compare-and-swap updates.
-- Idempotency keys per event and stage attempt.
+- Idempotency keys per event and MASWE attempt/side effect.
 - Leases for workers.
-- Transactional outbox for GitHub side effects.
-- Immutable artifact versions.
+- Transactional outbox for GitHub/MASWE side effects.
+- Immutable artifact and raw-evidence versions.
+- Exact worker/harness/profile qualification identity.
 
 ## 10. Failure and retry model
 
@@ -603,10 +694,15 @@ Failures fall into categories:
 3. **Quality failure:** routes to `BUILDING` while under cycle limit.
 4. **Verification failure:** routes to `BUILDING` while under cycle limit.
 5. **Scope failure:** routes to `WAITING_FOR_HUMAN` without edits.
-6. **Permission violation:** read-only fingerprint mismatch fails the run.
+6. **Permission/policy violation:** read-only mutation/HEAD movement, role-permission mismatch,
+   runtime identity mismatch, or future forbidden harness/profile/capability/evidence behavior
+   fails outside ordinary model fallback.
 7. **Policy exhaustion:** cycle limit produces `FAILED`.
 
-The orchestrator never retries indefinitely.
+The orchestrator never retries indefinitely. Under MH-00, fallback remains a MASWE decision and a
+material identity change becomes a new MASWE-visible attempt. Harness-local retries, auxiliary
+model calls, workflows, or delegation are not MASWE fallback and must be disabled initially or
+explicitly admitted and evidenced by a later contract.
 
 Failure persistence is defense in depth. Runtime adapters must return safe diagnostics;
 `src/failure-diagnostics.ts` re-sanitizes each runtime failure before fallback aggregation;
@@ -652,8 +748,8 @@ not an absolute total-process memory ceiling.
 ## 11. Trust boundaries
 
 ```text
-trusted configuration
-  -> may define shell quality commands and runtime command
+trusted MASWE configuration
+  -> may define shell quality commands, current runtime command, and future allowed harness plans
 
 selected Node runtime
   -> must satisfy the bounded support contract before repository/state actions
@@ -663,13 +759,18 @@ untrusted request / model output / PR comments
   -> may influence prompts and artifacts
   -> may not define shell commands or transitions
 
-runtime process
-  -> can read repository
-  -> write only for builder/resolver roles
+runtime or external harness process
+  -> executes one MASWE-governed attempt in the assigned workspace
+  -> read/write authority is role/policy bounded; initial external adapters are read-only
+  -> harness approvals/workflows/retries/delegation do not authorize MASWE transitions
 
-GitHub input (future)
+harness profile / memory / skills / ambient configuration
+  -> untrusted or non-authoritative unless explicitly admitted, qualified, and digest-bound
+  -> high-assurance verification requires a declared hidden-state disposition
+
+GitHub input
   -> authenticated webhook but still untrusted content
-  -> must pass scope and policy checks
+  -> must pass identity, scope, and policy checks
 ```
 
 ## 12. Known architecture gaps
@@ -681,14 +782,16 @@ GitHub input (future)
   before persistence, but typed SDK-specific metadata requires a separate adapter lifecycle/test
   seam change.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
-- GitHub App Phase A read-only check runs are implemented in `src/github/`; push/PR writes, comment replies, and digest-bound GitHub approvals remain Phase B (issue #3).
+- GitHub App Phase A read-only check runs are implemented in `src/github/`; Phase B remains on #3 and stable repository identity across renames remains #34.
+- MH-00 multi-harness architecture is documentation-only. Harness-neutral domain contracts, registry refactor, external adapters, assurance profiles, governed writers, and distributed execution remain future tranches MH-01 through MH-09.
 
-Closed in v0.2: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, and governed Node runtime enforcement.
+Closed in v0.2/#27: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, governed Node runtime enforcement, durable CREATED/revalidation recovery, non-bypassable role policy, and retryable terminal worktree cleanup.
 
 ## 13. Extension points
 
-- Add a runtime by implementing `AgentRuntime` and extending `RuntimeKind` plus the factory.
-- Add a store by implementing `RunStore` (see `FileRunStore`) before the first database implementation.
+- **Current implemented runtime:** before MH-02, internal runtime changes use `AgentRuntime` and must preserve current Cursor/mock semantics.
+- **Future external harness:** after #3 Phase B and MH-01/MH-02, register a qualified adapter through the harness-neutral registry; do not add harness-name workflow branches or infer capabilities from the harness name.
+- Add a store by implementing `RunStore` (see `FileRunStore`) before the first database implementation; distributed attempt/evidence storage must preserve the MH-00 semantic contract.
 - Add a stage by changing domain constants, transition table, orchestrator behavior, prompts, artifact contracts, tests, and docs together.
-- Add GitHub through an event adapter that calls public orchestrator operations; do not put webhook logic in the core.
-- Add policy through deterministic functions that take configuration and run state; avoid prompt-only policy.
+- Add GitHub behavior through an event adapter that calls public orchestrator operations; do not put webhook logic in the core.
+- Add policy through deterministic functions that take configuration, run/attempt state, qualification, and evidence; avoid prompt-only or harness-local policy.
