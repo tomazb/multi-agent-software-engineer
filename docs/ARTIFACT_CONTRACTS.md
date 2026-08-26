@@ -1,6 +1,6 @@
 # Artifact contracts
 
-Artifacts are the durable handoff protocol between roles. A later API or database may change storage, but these meanings should remain stable.
+Artifacts are the durable handoff protocol between roles. A later API or database may change storage, but these meanings should remain stable. MH-00 additionally defines a **planned** harness-attempt/evidence vocabulary below; that future execution evidence is distinct from role handoff artifacts and does not change the current schema-version-1 persistence contract.
 
 ## General rules
 
@@ -283,6 +283,151 @@ code plus applicable exit code, timeout, duration, requested/configured model, p
 `stderrPresent`, and `truncated`. Individual diagnostics are capped at 2,048 Unicode code points
 before the 8,192-code-point fallback aggregate is built.
 
+## Planned multi-harness attempt and evidence vocabulary (MH-00)
+
+This section is **planned-state architecture only**. MH-00 does not add fields to `run.json`, alter
+schema version 1, create a new evidence directory, or authorize an external harness adapter. MH-01
+owns the exact TypeScript/schema/persistence representation after #3 Phase B and the MH-01/MH-02
+entry gates are satisfied.
+
+Future execution evidence is conceptually distinct from the Markdown handoff artifacts above:
+
+- a **handoff artifact** is durable role content consumed by later workflow stages;
+- an **attempt record** identifies one MASWE-authorized execution against one exact input state;
+- **raw harness evidence** is bounded/redacted transport/session evidence retained when policy
+  requires it; and
+- **normalized attempt evidence** is a versioned MASWE projection of only facts supported by raw
+  evidence or MASWE's own observation.
+
+Neither raw nor normalized harness evidence authorizes a workflow transition by itself. Only the
+existing state machine/public orchestrator operations may do that.
+
+### Planned attempt identity
+
+The future contract must be able to represent at least:
+
+- MASWE run, stage/generation, role, attempt ID/ordinal, and optional parent/sub-attempt identity;
+- repository identity, exact workspace/worktree path and ownership mode, branch, source/base SHA,
+  input HEAD, evaluated/output HEAD, and applicable pre/post fingerprints;
+- harness ID and adapter generation;
+- exact executable/runtime identity, digest, and source/build revision where available;
+- transport plus protocol identity/version;
+- harness profile/composition identity and digest, including plugin/tool-set identity where
+  material;
+- requested provider, requested model, and requested effort;
+- runtime-resolved/reported provider/model/effort without overwriting the requested values;
+- provider/runtime identity evidence plus an explicit evidence-strength classification;
+- requested and effective permissions;
+- required, qualified, and runtime-observed capabilities with their evidence source;
+- harness sandbox policy/backend and enforcement-completeness facts separately from MASWE outer
+  isolation/supervision;
+- approval behavior, retry policy, workflow/delegation policy, and their observed events;
+- ambient-input manifest covering admitted skills, instructions, settings, environment-derived
+  configuration, session/profile state, and memory/persistence state;
+- explicit hidden-state disposition such as disabled/fresh, declared-and-bound, isolated but
+  uninspectable, or unknown;
+- prompt/session correlation and relevant provider/session/request identifiers where safe;
+- provider calls, admitted harness-local retries, auxiliary model calls, token/cost usage, tool
+  chronology, child lineage, cancellation, and process-quiescence outcome; and
+- raw-evidence references/digests, normalized-evidence version, per-dimension completeness, harness
+  terminal result, and MASWE assurance/policy verdict.
+
+Exact field and enum names are deliberately deferred to MH-01. The distinctions are not optional:
+planned/requested facts, runtime-reported facts, and stronger attested facts must not be collapsed.
+
+### MASWE attempt versus harness-local activity
+
+A configured MASWE fallback candidate is a new MASWE-visible attempt. A harness provider retry,
+compaction/title-generation call, auxiliary model request, local workflow step, or similar internal
+activity is not a fallback attempt. Such activity is disabled initially where practical; if a later
+profile admits it, it is bounded and evidenced inside the owning MASWE attempt.
+
+Unexpected retry/workflow/delegation/dynamic-profile/write-tool events under a profile that forbids
+them are policy violations rather than invisible implementation details.
+
+### Direct and transitive product identity
+
+Execution lineage must retain every material controlling layer. For example:
+
+```text
+MASWE -> Codex
+MASWE -> DeepSeek Harness -> Codex
+```
+
+The second path remains a DeepSeek Harness attempt with a nested Codex product execution. It does
+not satisfy the future direct Codex adapter contract. The same rule applies to Claude Code or any
+other product invoked behind Hermes, DeepSeek Harness, or another harness.
+
+### Raw evidence and normalized evidence
+
+Where a structured harness/session protocol provides evidence, the future contract should retain a
+bounded, redacted, immutable raw object/file and digest when the active assurance profile requires
+it. Secrets, credentials, arbitrary environment values, or provider-debug output do not become
+durable merely because the harness emitted them.
+
+Normalized evidence is separately versioned and traceable to its raw source. It may project only
+supported facts such as:
+
+- prompt/session correlation;
+- requested/resolved/reported model/provider route;
+- tool chronology and outcomes;
+- permission/approval requests;
+- retries and auxiliary calls;
+- token/cost accounting;
+- child execution lineage;
+- sandbox/outer-isolation facts;
+- cancellation/quiescence; and
+- terminal result.
+
+Normalization must not promote configured/requested or harness-labelled metadata into independent
+provider attestation without supporting evidence.
+
+### Evidence completeness
+
+The future evidence object records completeness/strength independently for at least:
+
+- prompt correlation;
+- model/provider identity;
+- tool trace;
+- token/accounting data;
+- child lineage;
+- cancellation/quiescence;
+- ambient/hidden-state disposition;
+- sandbox enforcement; and
+- raw-log/evidence capture.
+
+Conceptual states may include `complete`, `partial`, `inferred`, `unavailable`, and
+`not-applicable`; MH-01 owns the exact enum. An assurance profile defines the minimum accepted state
+for a role. Missing or weaker-than-required evidence fails closed even when the harness returns a
+successful exit or plausible final text.
+
+### Assurance and authority
+
+Initial external harness adapters are read-only. MASWE continues to own the exact workspace,
+outer read-only HEAD/fingerprint fence, timeout/cancellation/process supervision, retry/fallback,
+and deterministic Git/publication authority.
+
+Harness approvals/permission prompts, workflow/task-board states, retries, memory, and subagent
+events are attempt evidence or requests. They do not satisfy MASWE brainstorm/design approval,
+authorize a state transition, expand permissions, choose fallback, or authorize publication.
+
+Governed external writer evidence belongs to MH-07 or another explicitly approved writer contract;
+MH-00 does not define a writer persistence schema.
+
+### Hermes and DeepSeek Harness coverage
+
+Hermes requires the planned vocabulary to separate harness from transport (initial ACP direction),
+provider/model, permissions, memory/skills, approvals, and native delegation. Its mutable procedural
+memory and Kanban/task-board state cannot become hidden workflow authority.
+
+DeepSeek Harness additionally requires first-class Cordis profile/composition identity, fresh
+process/session/home/persistence disposition, sandbox versus outer-isolation facts, execution-local
+retry/auxiliary-call accounting, raw session-event evidence, evidence completeness, and direct
+versus transitive Claude Code/Codex identity.
+
+The normative detailed requirements are in
+`docs/superpowers/specs/2026-08-26-mh-00-multi-harness-execution-architecture.md` and ADR-0008.
+
 ## `02-brainstorm.md`
 
 Required content:
@@ -483,6 +628,8 @@ Planned additions:
 - Immutable attempt-specific artifact names.
 - Git base and head SHA on all build, CI, and verification artifacts.
 - Prompt-template version and content hash.
+- Harness-neutral attempt/evidence identity and completeness fields described by MH-00, after MH-01 approves exact persistence/schema semantics.
 - Token usage, cost, latency, and provider request IDs.
+- Bounded/redacted raw harness evidence with digest-bound normalized projections where assurance requires it.
 - Redaction and data-classification labels.
 - Cryptographic signing or provenance attestations for CI and verification.
