@@ -160,7 +160,7 @@ The requested provider/model and any runtime/provider-reported identity remain d
 
 A typed property required or observed for one execution plan, such as read-only filesystem policy, structured event stream, cancellation, model identity reporting, tool chronology, fresh profile, or no delegation.
 
-Capabilities have evidence strength; they are not just booleans asserted by configuration.
+Capabilities have evidence strength; they are not just booleans asserted by configuration. MH-01 must make capability provenance explicit, analogous to model-identity evidence strength: at minimum it must distinguish configuration-declared or adapter-reported claims from MASWE-probed/observed facts and any stronger externally attested or MASWE-enforced facts. An assurance profile may require a minimum provenance class; an adapter's self-report alone cannot satisfy a stronger requirement.
 
 ### Attempt
 
@@ -358,7 +358,7 @@ For each MASWE-authorized candidate in order:
 4. Load or perform qualification bound to that exact executable/profile.
 5. Compare required capabilities against qualified/observed capabilities.
 6. Compare assurance-profile requirements against available evidence strength.
-7. Reject unknown, contradictory, stale, or insufficient facts fail closed.
+7. Reject unknown, contradictory, stale, or insufficient facts and fail closed.
 8. Persist/construct the immutable planned attempt identity.
 9. Execute through the governed supervisor.
 10. Classify the result as success, retryable runtime failure, non-retryable policy failure, or another explicit planned outcome.
@@ -507,7 +507,7 @@ A verifier profile might require complete prompt correlation and raw-log capture
 
 ### 11.1 Initial external adapters
 
-Claude Code, Codex CLI, Copilot CLI, OpenCode, Hermes, and DeepSeek Harness all begin with read-only roles/qualification. Exact initial role enablement may differ per adapter, but no external writer is implied by adding an adapter.
+Claude Code, Codex CLI, Copilot CLI, OpenCode, Hermes Agent, and DeepSeek Harness all begin with read-only roles/qualification. Exact initial role enablement may differ per adapter, but no external writer is implied by adding an adapter.
 
 MASWE's existing outer read-only fingerprint and HEAD fence remains authoritative. An inner harness sandbox is defense in depth/evidence, not a replacement.
 
@@ -845,13 +845,13 @@ The approved order is:
 7. **MH-04** — Claude Code read-only adapter.
 8. **MH-05** — Codex read-only adapter.
 9. **MH-06** — Copilot CLI and OpenCode read-only adapters.
-10. **MH-06H** — Hermes read-only adapter.
+10. **MH-06H** — Hermes Agent read-only adapter.
 11. **MH-06D / #36** — DeepSeek Harness read-only adapter and MASWE conformance profile.
 12. **MH-07** — governed external writers.
 13. **MH-08** — assurance profiles and differential verification.
 14. **MH-09 / #4 alignment** — distributed PostgreSQL/API/MCP execution plane after local contracts are proven.
 
-Independent adapter tranches may be ordered differently among MH-04/MH-05/MH-06/MH-06H/MH-06D once their shared gates are complete, but no adapter may bypass MH-01/MH-02 or #3 Phase B.
+Independent adapter tranches may be ordered differently among MH-04/MH-05/MH-06/MH-06H/MH-06D once their shared gates are complete, but no adapter may bypass MH-01/MH-02 or #3 Phase B. MH-06H and MH-06D/#36 remain planning-only until their complete entry gates and owner approval are satisfied; MH-00 does not authorize either adapter.
 
 ## 26. Reconciliation matrix against final #27 behavior
 
