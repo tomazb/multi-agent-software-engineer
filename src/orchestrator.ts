@@ -28,6 +28,7 @@ import {
   invalidateStaleEvidence,
   listGitWorktreeRegistrations,
   deriveManagedTerminalCleanupTarget,
+  proveUniqueHistoricalIsolatedWorktreePath,
   reconcileTerminalWorktreeCleanup,
   refreshWorkspaceHead,
   workingDirectoryFor,
@@ -2762,6 +2763,59 @@ export class Orchestrator {
     throw new Error(`Run ${prior.id} retry revalidation target did not stabilize`);
   }
 
+  /**
+   * Historical FAILED→CREATED retry path binding.
+   *
+   * When an upgraded schema-v1 isolated run omits plannedWorktreePath but retains
+   * a uniquely proven maswe/<run-id> registration at the bootstrap source HEAD,
+   * publish that proven path into durable bootstrap authority before reconciliation.
+   * Ambiguity fails closed — never guess from current TMPDIR.
+   *
+   * Distinct from first-time CREATED bootstrap binding in bootstrapCreatedRun(),
+   * which may choose current externalWorktreePath before any side effect.
+   */
+  private async bindHistoricalCreatedRetryPlannedPath(run: RunRecord): Promise<RunRecord> {
+    if (run.state !== "FAILED" || run.failure?.resumeState !== "CREATED") {
+      return run;
+    }
+    const bootstrap = run.workspaceBootstrap;
+    if (!bootstrap || bootstrap.mode !== "isolated-worktree") {
+      return run;
+    }
+    if (bootstrap.plannedWorktreePath !== undefined) {
+      return run;
+    }
+
+    const proof = await proveUniqueHistoricalIsolatedWorktreePath(
+      run,
+      this.terminalCleanupDependencies,
+    );
+    if (proof.status !== "proven") {
+      throw new Error(
+        `Run ${run.id} historical CREATED retry cannot uniquely prove an isolated worktree registration to bind plannedWorktreePath`,
+      );
+    }
+
+    const plannedWorktreePath = proof.worktreePath;
+    const bound = structuredClone(run);
+    bound.workspaceBootstrap = {
+      ...bootstrap,
+      plannedWorktreePath,
+    };
+    await this.store.save(bound);
+    const reloaded = await this.store.load(run.id);
+    if (
+      reloaded.workspaceBootstrap?.plannedWorktreePath === undefined ||
+      path.resolve(reloaded.workspaceBootstrap.plannedWorktreePath) !==
+        path.resolve(plannedWorktreePath)
+    ) {
+      throw new Error(
+        `Run ${run.id} historical plannedWorktreePath binding failed to publish before retry reconciliation`,
+      );
+    }
+    return reloaded;
+  }
+
   async retryFromFailed(runId: string): Promise<RunRecord> {
     let resumed = await withRunMutationFence(
       this.cwd,
@@ -2788,6 +2842,8 @@ export class Orchestrator {
           authoritative,
           lease,
         );
+        requireRetryableFailure();
+        authoritative = await this.bindHistoricalCreatedRetryPlannedPath(authoritative);
         requireRetryableFailure();
         const failure = authoritative.failure;
         const resumeState = failure?.resumeState;

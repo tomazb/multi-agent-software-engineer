@@ -219,7 +219,10 @@ leave a deterministic managed worktree before `run.workspace` is checkpointed; c
 target from durable `workspaceBootstrap.plannedWorktreePath` when present, otherwise from a
 uniquely proven `maswe/<run-id>` registration matching the bootstrap source HEAD, and must not
 publish `complete` while the exact path or registration may still survive or while historical
-target identity cannot be established without consulting the current process temp directory. A
+target identity cannot be established without consulting the current process temp directory.
+Governed `retryFromFailed()` for isolated `resumeState === "CREATED"` records that omit
+`plannedWorktreePath` must bind that same uniquely proven registration into durable bootstrap
+authority before retry workspace reconciliation; ambiguity fails closed. A
 legacy terminal record that
 omits `terminalCleanup` is unknown until reconciled; ambiguous legacy `FAILED` preservation fails
 closed.

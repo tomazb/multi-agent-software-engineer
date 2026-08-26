@@ -121,9 +121,20 @@
         "plannedWorktreePath": {
           "type": "string",
           "minLength": 1,
-          "pattern": "^/"
+          "pattern": "^(?:/.*|[A-Za-z]:[\\\\/].*|\\\\\\\\[^\\\\/]+\\\\[^\\\\/]+(?:[\\\\/].*)?)$"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "mode": { "const": "operator-checkout" } },
+            "required": ["mode"]
+          },
+          "then": {
+            "not": { "required": ["plannedWorktreePath"] }
+          }
+        }
+      ]
     },
     "revalidation": {
       "type": "object",

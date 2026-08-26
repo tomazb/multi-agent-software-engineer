@@ -149,10 +149,14 @@ before `START`. During that recoverable `CREATED` window the relevant record sha
 `workspaceBootstrap` remains present through the durable workspace checkpoint and is removed by
 the single `START` publication. For isolated-worktree mode, `plannedWorktreePath` is the exact
 absolute path published into durable bootstrap authority after the run id exists and before any
-branch or worktree side effect. Later recovery and cleanup must use that persisted path (or, for
+branch or worktree side effect. The published schema accepts portable absolute forms MASWE can
+produce (POSIX `/…`, Windows drive-letter, and UNC paths) and rejects relative or drive-relative
+values; host runtime validation remains environment-sensitive via `path.isAbsolute()`. Later
+recovery and cleanup must use that persisted path (or, for
 historical records that omit it, a uniquely proven Git worktree registration) and must not
 recompute authority from the current process `TMPDIR`/`TMP`/`TEMP`. Operator-checkout bootstrap
-must omit `plannedWorktreePath`. Bootstrap source-drift checks exclude the orchestrator-owned
+must omit `plannedWorktreePath` (schema and runtime both reject the combination). Bootstrap
+source-drift checks exclude the orchestrator-owned
 `.maswe` namespace; read-only role fingerprints continue to include authoritative `.maswe` state.
 
 An active current-head generation uses this optional shape:

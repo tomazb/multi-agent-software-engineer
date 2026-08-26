@@ -98,7 +98,12 @@ function pathsAgree(left: string, right: string): boolean {
   return path.resolve(left) === path.resolve(right);
 }
 
-async function recoverHistoricalUncheckpointedBootstrapTarget(
+/**
+ * Recover an uncheckpointed isolated bootstrap target only from uniquely proven
+ * Git worktree registration identity. This is the historical authority path —
+ * never current process TMPDIR recomputation.
+ */
+export async function recoverHistoricalUncheckpointedBootstrapTarget(
   run: RunRecord,
   listRegistrations: (
     repositoryPath: string,
@@ -150,6 +155,28 @@ async function recoverHistoricalUncheckpointedBootstrapTarget(
   // Zero matches or a branch-only conflict: historical absence cannot be proven
   // from the current process environment.
   return { status: "ambiguous" };
+}
+
+/**
+ * Historical FAILED→CREATED retry binding: recover a durable planned path only
+ * from uniquely proven registration identity. Distinct from first-time CREATED
+ * bootstrap binding, which may choose current externalWorktreePath before any
+ * side effect.
+ */
+export async function proveUniqueHistoricalIsolatedWorktreePath(
+  run: RunRecord,
+  dependencies?: Pick<Partial<TerminalCleanupDependencies>, "listRegistrations">,
+): Promise<{ status: "proven"; worktreePath: string } | { status: "unproven" }> {
+  const listRegistrations =
+    dependencies?.listRegistrations ?? listGitWorktreeRegistrations;
+  const derivation = await recoverHistoricalUncheckpointedBootstrapTarget(
+    run,
+    listRegistrations,
+  );
+  if (derivation.status === "target") {
+    return { status: "proven", worktreePath: derivation.target.worktreePath };
+  }
+  return { status: "unproven" };
 }
 
 export async function deriveManagedTerminalCleanupTarget(

@@ -464,6 +464,108 @@ test("run-record schema and migration accept exact legal recovery metadata", asy
   assert.throws(() => migrateRunRecord(persisted), /unsupported.*revalidation.*unknown/i);
 });
 
+test("run-record schema plannedWorktreePath portable absolute paths and operator-checkout parity", async () => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const bootstrapSchema = schema.properties!.workspaceBootstrap!;
+
+  const baseIsolated = {
+    mode: "isolated-worktree",
+    sourceBaseSha: "a".repeat(40),
+    sourceBranch: "main",
+    sourceTreeFingerprint: "b".repeat(64),
+    plannedAt: "2026-08-26T00:00:00.000Z",
+  };
+
+  assert.doesNotThrow(() =>
+    assertMatches(schema, bootstrapSchema, baseIsolated, "isolated without planned path"),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      { ...baseIsolated, plannedWorktreePath: "/tmp/maswe-worktrees/repo/run-id" },
+      "posix absolute planned path",
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      {
+        ...baseIsolated,
+        plannedWorktreePath: "C:\\Users\\runner\\AppData\\Local\\Temp\\maswe-worktrees\\repo\\run-id",
+      },
+      "windows drive absolute planned path",
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      {
+        ...baseIsolated,
+        plannedWorktreePath: "D:/maswe-worktrees/repo/run-id",
+      },
+      "windows drive absolute with forward slashes",
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertMatches(
+      schema,
+      bootstrapSchema,
+      {
+        ...baseIsolated,
+        plannedWorktreePath: "\\\\fileserver\\share\\maswe-worktrees\\repo\\run-id",
+      },
+      "windows UNC planned path",
+    ),
+  );
+
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "foo/bar" },
+        "relative planned path",
+      ),
+    /pattern/,
+  );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "C:relative" },
+        "drive-relative planned path",
+      ),
+    /pattern/,
+  );
+
+  const operatorBase = {
+    mode: "operator-checkout",
+    sourceBaseSha: "a".repeat(40),
+    sourceBranch: "main",
+    sourceTreeFingerprint: "b".repeat(64),
+    plannedAt: "2026-08-26T00:00:00.000Z",
+  };
+  assert.doesNotThrow(() =>
+    assertMatches(schema, bootstrapSchema, operatorBase, "operator-checkout without planned path"),
+  );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...operatorBase, plannedWorktreePath: "/tmp/should-not-exist-for-operator" },
+        "operator-checkout with planned path",
+      ),
+    /not|plannedWorktreePath|required/i,
+  );
+});
+
 test("run-record schema and migration accept exact legal terminal cleanup metadata", async (t) => {
   const schema = JSON.parse(
     await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),

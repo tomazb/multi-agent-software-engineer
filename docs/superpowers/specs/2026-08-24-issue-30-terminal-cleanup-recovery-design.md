@@ -173,6 +173,16 @@ must use that persisted path. Historical schema-v1 records that omit the field m
 from unique Git registration identity; otherwise they fail closed rather than treating current
 temp-directory absence as proof of cleanup completion.
 
+Governed `retryFromFailed()` for `failure.resumeState === "CREATED"` must perform the same
+historical unique-registration binding before `reconcileRetryWorkspace()` / bootstrap
+reconciliation when `plannedWorktreePath` is absent. That binding reuses the cleanup registration
+proof (exact `maswe/<run-id>` branch, HEAD equals `sourceBaseSha`, non-prunable, unique absolute
+path, not the operator checkout), publishes the proven path through ordinary optimistic store
+semantics inside the already-held terminal-recovery fence, reloads and proves publication, then
+reconciles. Ambiguity fails closed with no `RETRY_FROM_FAILED` event and no current-TMPDIR path
+creation. This is intentionally distinct from first-time CREATED bootstrap binding, which may
+choose current `externalWorktreePath()` before any side effect.
+
 This closes the crash window where a terminal state exists durably but MASWE has no durable statement that cleanup is outstanding.
 
 `COMPLETE`, `CANCEL`, and `FAIL` retain their existing workflow semantics. No `CLEANUP_*` workflow events are introduced.
