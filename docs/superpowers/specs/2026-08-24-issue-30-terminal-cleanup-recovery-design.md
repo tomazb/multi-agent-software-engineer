@@ -359,6 +359,7 @@ Required ordering properties:
 - cleanup wins first -> it may remove an eligible failed worktree; a later retry sees `complete` and reconstructs through the existing retry reconciliation path;
 - retry wins first -> it returns the run to nonterminal state and clears terminal cleanup metadata; a later cleanup reload rejects the nonterminal run;
 - supersede wins first -> it explicitly abandons the predecessor's recoverability before predecessor cleanup;
+- `bootstrapCreatedRun()` acquires the existing per-run `target` mutation fence before `plannedWorktreePath` binding and holds it through Git target creation, workspace checkpoint publication, and START, so terminal-recovery/terminal-cleanup cannot observe an absent managed target while bootstrap still owns the right to create it;
 - cleanup never runs concurrently with a publication mutation for the same run.
 
 The existing mutation journal remains immutable and is not compacted or deleted by #30.

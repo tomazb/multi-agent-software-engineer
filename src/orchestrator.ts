@@ -415,14 +415,37 @@ export class Orchestrator {
     return this.recordsEqual(candidate, expected);
   }
 
-  /** Establish and publish the durable CREATED workspace checkpoint before START. */
+  /**
+   * Establish and publish the durable CREATED workspace checkpoint before START.
+   * The per-run target mutation fence serializes planned-path binding, Git target
+   * creation, checkpoint publication, and START against terminal-recovery and
+   * terminal-cleanup so supersede/cancel cannot observe an absent target while
+   * bootstrap still owns the right to create it.
+   */
   async bootstrapCreatedRun(runId: string): Promise<RunRecord> {
+    return withRunMutationFence(this.cwd, runId, "target", async () =>
+      this.bootstrapCreatedRunAuthoritative(runId),
+    );
+  }
+
+  private async bootstrapCreatedRunAuthoritative(runId: string): Promise<RunRecord> {
     let prior = await this.store.load(runId);
     if (prior.state !== "CREATED") {
       throw new Error(`Run ${runId} bootstrap requires CREATED state, found ${prior.state}`);
     }
+    if (path.resolve(prior.repositoryPath) !== path.resolve(this.cwd)) {
+      throw new Error(
+        `Run ${runId} bootstrap requires repositoryPath to match the orchestrator checkout`,
+      );
+    }
+    if (prior.supersededBy) {
+      throw new Error(`Run ${runId} was already superseded by ${prior.supersededBy}`);
+    }
+    if (!prior.workspaceBootstrap) {
+      throw new Error(`Run ${runId} bootstrap requires durable workspaceBootstrap intent`);
+    }
     if (
-      prior.workspaceBootstrap?.mode === "isolated-worktree" &&
+      prior.workspaceBootstrap.mode === "isolated-worktree" &&
       prior.workspaceBootstrap.plannedWorktreePath === undefined
     ) {
       const plannedWorktreePath = resolveIsolatedPlannedWorktreePathForBinding(prior);
@@ -433,6 +456,11 @@ export class Orchestrator {
       };
       await this.store.save(bound);
       prior = await this.store.load(runId);
+      if (prior.state !== "CREATED" || prior.supersededBy) {
+        throw new Error(
+          `Run ${runId} bootstrap lost CREATED authority during plannedWorktreePath binding`,
+        );
+      }
       if (
         prior.workspaceBootstrap?.plannedWorktreePath === undefined ||
         path.resolve(prior.workspaceBootstrap.plannedWorktreePath) !==
@@ -444,7 +472,6 @@ export class Orchestrator {
       }
     }
     let checkpointExpected: RunRecord | undefined;
-    let startExpected: RunRecord | undefined;
     try {
       if (prior.workspace) {
         checkpointExpected = structuredClone(prior);
@@ -471,7 +498,7 @@ export class Orchestrator {
       }
       await assertBootstrapWorkspaceReady(this.cwd, reloaded);
 
-      startExpected = structuredClone(reloaded);
+      const startExpected = structuredClone(reloaded);
       delete startExpected.workspaceBootstrap;
       const details = startExpected.supersedes
         ? { supersedes: startExpected.supersedes }
