@@ -216,8 +216,11 @@ failure classification. Production cleanup retains the `maswe/<run-id>` branch. 
 attempt re-proves ownership from the exact repository, recorded or bootstrap-derived path, Git
 worktree registration, branch, HEAD, and type before deletion. A CREATED bootstrap failure may
 leave a deterministic managed worktree before `run.workspace` is checkpointed; cleanup derives that
-target from `repositoryPath`, run id, and durable `workspaceBootstrap` and must not publish
-`complete` while the exact path or registration may still survive. A legacy terminal record that
+target from durable `workspaceBootstrap.plannedWorktreePath` when present, otherwise from a
+uniquely proven `maswe/<run-id>` registration matching the bootstrap source HEAD, and must not
+publish `complete` while the exact path or registration may still survive or while historical
+target identity cannot be established without consulting the current process temp directory. A
+legacy terminal record that
 omits `terminalCleanup` is unknown until reconciled; ambiguous legacy `FAILED` preservation fails
 closed.
 

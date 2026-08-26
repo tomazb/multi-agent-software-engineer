@@ -132,7 +132,8 @@ before `START`. During that recoverable `CREATED` window the relevant record sha
     "sourceBranch": "main",
     "sourceTreeFingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
     "remote": "https://github.com/example/repo.git",
-    "plannedAt": "2026-08-18T12:00:00.000Z"
+    "plannedAt": "2026-08-18T12:00:00.000Z",
+    "plannedWorktreePath": "/tmp/maswe-worktrees/repository-key/20260722120000-1a2b3c4d"
   },
   "workspace": {
     "remote": "https://github.com/example/repo.git",
@@ -146,7 +147,12 @@ before `START`. During that recoverable `CREATED` window the relevant record sha
 ```
 
 `workspaceBootstrap` remains present through the durable workspace checkpoint and is removed by
-the single `START` publication. Bootstrap source-drift checks exclude the orchestrator-owned
+the single `START` publication. For isolated-worktree mode, `plannedWorktreePath` is the exact
+absolute path published into durable bootstrap authority after the run id exists and before any
+branch or worktree side effect. Later recovery and cleanup must use that persisted path (or, for
+historical records that omit it, a uniquely proven Git worktree registration) and must not
+recompute authority from the current process `TMPDIR`/`TMP`/`TEMP`. Operator-checkout bootstrap
+must omit `plannedWorktreePath`. Bootstrap source-drift checks exclude the orchestrator-owned
 `.maswe` namespace; read-only role fingerprints continue to include authoritative `.maswe` state.
 
 An active current-head generation uses this optional shape:
@@ -238,9 +244,10 @@ no workflow events and change no artifacts, approvals, counters, GitHub associat
 engineering `failure` classification. Production cleanup retains the `maswe/<run-id>` branch.
 Ownership is re-proved from the exact repository, recorded or bootstrap-derived path, Git worktree
 registration, branch, HEAD, and type before deletion. When isolated bootstrap fails after
-`git worktree add` but before the workspace checkpoint, cleanup still derives the deterministic
-MASWE path/branch from durable `workspaceBootstrap` authority and must not report `complete` while
-that exact managed target may survive.
+`git worktree add` but before the workspace checkpoint, cleanup still derives the managed MASWE
+path/branch from durable `workspaceBootstrap` authority (`plannedWorktreePath` when present, else a
+uniquely proven registration) and must not report `complete` while that exact managed target may
+survive or while historical target identity depends on the current process temp directory.
 
 ```json
 {

@@ -1,4 +1,5 @@
 import { assertSafeRunId } from "./git-workspace.ts";
+import path from "node:path";
 import {
   WORKFLOW_EVENTS,
   WORKFLOW_STATES,
@@ -92,6 +93,7 @@ function validateWorkspaceBootstrap(
       "sourceTreeFingerprint",
       "remote",
       "plannedAt",
+      "plannedWorktreePath",
     ],
     ["mode", "sourceBaseSha", "sourceBranch", "sourceTreeFingerprint", "plannedAt"],
   );
@@ -126,12 +128,28 @@ function validateWorkspaceBootstrap(
       bootstrap.plannedAt,
       "Run record workspaceBootstrap.plannedAt",
     ),
+    ...(bootstrap.plannedWorktreePath !== undefined
+      ? {
+          plannedWorktreePath: canonicalAbsolutePath(
+            bootstrap.plannedWorktreePath,
+            "Run record workspaceBootstrap.plannedWorktreePath",
+          ),
+        }
+      : {}),
   };
 }
 
 function canonicalNonEmptyString(value: unknown, label: string): string {
   const result = requiredRunRecordString(value, label, false);
   if (result !== result.trim()) throw new Error(`${label} must be canonical`);
+  return result;
+}
+
+function canonicalAbsolutePath(value: unknown, label: string): string {
+  const result = canonicalNonEmptyString(value, label);
+  if (!path.isAbsolute(result)) {
+    throw new Error(`${label} must be an absolute path`);
+  }
   return result;
 }
 
@@ -244,6 +262,24 @@ function validateRecoveryLifecycle(run: RunRecord): void {
     if (run.workspaceBootstrap.mode !== expectedMode) {
       throw new Error(
         `Run record workspaceBootstrap mode conflicts with policy mode ${expectedMode}`,
+      );
+    }
+    if (
+      run.workspaceBootstrap.mode === "operator-checkout" &&
+      run.workspaceBootstrap.plannedWorktreePath !== undefined
+    ) {
+      throw new Error(
+        "Run record operator-checkout workspaceBootstrap cannot include plannedWorktreePath",
+      );
+    }
+    if (
+      run.workspace?.worktreePath !== undefined &&
+      run.workspaceBootstrap.plannedWorktreePath !== undefined &&
+      path.resolve(run.workspace.worktreePath) !==
+        path.resolve(run.workspaceBootstrap.plannedWorktreePath)
+    ) {
+      throw new Error(
+        "Run record workspace.worktreePath disagrees with workspaceBootstrap.plannedWorktreePath",
       );
     }
     const resumeState = run.failure?.resumeState;

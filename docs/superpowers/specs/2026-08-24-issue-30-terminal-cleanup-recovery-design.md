@@ -156,9 +156,22 @@ The orchestrator prepares the terminal candidate before `applyEvent()`:
 
 "No managed isolated worktree" means the exact deterministic target is positively absent. A CREATED
 bootstrap failure can create the deterministic worktree before `run.workspace` is checkpointed;
-cleanup must derive that target from durable bootstrap authority (`repositoryPath`, run id,
-`workspaceBootstrap.sourceBaseSha`) and inspect path/registration before publishing `complete`.
-Absence of checkpointed `run.workspace` alone is not proof of absence.
+cleanup must derive that target from durable bootstrap authority — preferentially
+`workspaceBootstrap.plannedWorktreePath` published before the first branch/worktree side effect,
+otherwise a uniquely proven `maswe/<run-id>` registration whose HEAD matches
+`workspaceBootstrap.sourceBaseSha` — and inspect path/registration before publishing `complete`.
+Absence of checkpointed `run.workspace` alone is not proof of absence. Current process
+`TMPDIR`/`TMP`/`TEMP` recomputation is never durable recovery authority for a historical
+uncheckpointed side effect.
+
+### Erratum: durable planned concrete worktree path
+
+The planned concrete worktree path is durable authority before creation. After the CREATED run id
+exists and before `git branch` / `mkdir` / `git worktree add`, isolated bootstrap publishes
+`workspaceBootstrap.plannedWorktreePath` as an absolute path. Reconciliation and terminal cleanup
+must use that persisted path. Historical schema-v1 records that omit the field may recover only
+from unique Git registration identity; otherwise they fail closed rather than treating current
+temp-directory absence as proof of cleanup completion.
 
 This closes the crash window where a terminal state exists durably but MASWE has no durable statement that cleanup is outstanding.
 

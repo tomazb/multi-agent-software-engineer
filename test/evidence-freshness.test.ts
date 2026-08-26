@@ -387,16 +387,19 @@ const currentHeadGateCases: Array<{
   },
   {
     name: "alternate registered checkout path",
-    expected: /canonical.*worktree|worktree.*canonical/i,
+    expected: /registered path and branch|same worktree|canonical.*worktree|worktree.*canonical/i,
     arrange: async ({ cwd, run, trackWorktreePath }) => {
       assert.ok(run.workspace?.worktreePath);
       const canonicalPath = run.workspace.worktreePath;
       const alternatePath = await mkdtemp(path.join(os.tmpdir(), "maswe-alternate-worktree-"));
       await rm(alternatePath, { recursive: true, force: true });
       trackWorktreePath(alternatePath);
-      await execFileAsync("git", ["worktree", "remove", "--force", canonicalPath], { cwd });
-      await execFileAsync("git", ["worktree", "add", alternatePath, run.workspace.branch], { cwd });
+      // Keep the managed registration at the durable recorded path, but rewrite the
+      // run record to an alternate location. Ownership must fail closed because the
+      // durable path and registration no longer identify the same worktree.
+      await execFileAsync("git", ["worktree", "add", "--detach", alternatePath, "HEAD"], { cwd });
       run.workspace.worktreePath = alternatePath;
+      void canonicalPath;
     },
   },
   {

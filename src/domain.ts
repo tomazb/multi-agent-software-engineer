@@ -169,6 +169,12 @@ export interface WorkspaceBootstrapIntent {
   sourceTreeFingerprint: string;
   remote?: string;
   plannedAt: string;
+  /**
+   * Exact absolute path chosen for an isolated worktree before any branch or
+   * worktree side effect. Durable authority for recovery; never recompute from
+   * the current process TMPDIR/TMP/TEMP once published.
+   */
+  plannedWorktreePath?: string;
 }
 
 export interface RunRevalidation {

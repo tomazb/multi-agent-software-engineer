@@ -25,7 +25,6 @@ import {
   assertExpectedBranch,
   assertWorkingTreeScope,
   createDeterministicCommit,
-  externalWorktreePath,
   invalidateStaleEvidence,
   listGitWorktreeRegistrations,
   deriveManagedTerminalCleanupTarget,
@@ -59,6 +58,7 @@ import {
   captureWorkspaceBootstrapIntent,
   reconcileBootstrapWorkspace,
   reconcileRetryWorkspace,
+  resolveIsolatedPlannedWorktreePathForBinding,
   type WorkspaceBootstrapHooks,
 } from "./workspace-bootstrap.ts";
 import type { MasweConfig } from "./domain.ts";
@@ -416,9 +416,31 @@ export class Orchestrator {
 
   /** Establish and publish the durable CREATED workspace checkpoint before START. */
   async bootstrapCreatedRun(runId: string): Promise<RunRecord> {
-    const prior = await this.store.load(runId);
+    let prior = await this.store.load(runId);
     if (prior.state !== "CREATED") {
       throw new Error(`Run ${runId} bootstrap requires CREATED state, found ${prior.state}`);
+    }
+    if (
+      prior.workspaceBootstrap?.mode === "isolated-worktree" &&
+      prior.workspaceBootstrap.plannedWorktreePath === undefined
+    ) {
+      const plannedWorktreePath = resolveIsolatedPlannedWorktreePathForBinding(prior);
+      const bound = structuredClone(prior);
+      bound.workspaceBootstrap = {
+        ...bound.workspaceBootstrap!,
+        plannedWorktreePath,
+      };
+      await this.store.save(bound);
+      prior = await this.store.load(runId);
+      if (
+        prior.workspaceBootstrap?.plannedWorktreePath === undefined ||
+        path.resolve(prior.workspaceBootstrap.plannedWorktreePath) !==
+          path.resolve(plannedWorktreePath)
+      ) {
+        throw new Error(
+          `Run ${runId} durable plannedWorktreePath binding failed to publish before bootstrap side effects`,
+        );
+      }
     }
     let checkpointExpected: RunRecord | undefined;
     let startExpected: RunRecord | undefined;
@@ -518,8 +540,10 @@ export class Orchestrator {
 
   /**
    * Resolve terminal cleanup intent from durable authority only.
-   * Uncheckpointed isolated bootstrap targets are derived from repositoryPath,
-   * run id, and workspaceBootstrap — never fabricated into run.workspace.
+   * Uncheckpointed isolated bootstrap targets come from persisted
+   * plannedWorktreePath or uniquely proven historical registration —
+   * never from current process TMPDIR recomputation, and never fabricated
+   * into durable `run.workspace`.
    */
   private async resolveTerminalCleanupIntent(
     run: RunRecord,
@@ -530,10 +554,22 @@ export class Orchestrator {
       return { status: "complete", updatedAt };
     }
 
-    const target = deriveManagedTerminalCleanupTarget(run);
-    if (!target) {
+    const derivation = await deriveManagedTerminalCleanupTarget(
+      run,
+      this.terminalCleanupDependencies?.listRegistrations
+        ? { listRegistrations: this.terminalCleanupDependencies.listRegistrations }
+        : undefined,
+    );
+    if (derivation.status === "none") {
       return { status: "complete", updatedAt };
     }
+    if (derivation.status === "ambiguous") {
+      if (preservationReason) {
+        return { status: "preserved", updatedAt, preservationReason };
+      }
+      return { status: "pending", updatedAt };
+    }
+    const target = derivation.target;
 
     if (preservationReason) {
       let presence: "absent" | "present" | "uncertain";
@@ -569,10 +605,14 @@ export class Orchestrator {
         "Cleanup invocation repository root must match the run repositoryPath exactly",
       );
     }
-    if (path.resolve(target.worktreePath) !== path.resolve(externalWorktreePath(run.repositoryPath, run.id))) {
+    if (target.branch !== `maswe/${run.id}`) {
       return "uncertain";
     }
-    if (target.branch !== `maswe/${run.id}`) {
+    const plannedPath = run.workspaceBootstrap?.plannedWorktreePath;
+    if (
+      plannedPath !== undefined &&
+      path.resolve(plannedPath) !== path.resolve(target.worktreePath)
+    ) {
       return "uncertain";
     }
 
@@ -628,9 +668,20 @@ export class Orchestrator {
   }
 
   private async legacyManagedTargetPresent(run: RunRecord): Promise<boolean> {
-    const target = deriveManagedTerminalCleanupTarget(run);
-    if (!target) return false;
-    const presence = await this.managedCleanupTargetPresence(run, target);
+    const derivation = await deriveManagedTerminalCleanupTarget(
+      run,
+      this.terminalCleanupDependencies?.listRegistrations
+        ? { listRegistrations: this.terminalCleanupDependencies.listRegistrations }
+        : undefined,
+    );
+    if (derivation.status === "ambiguous") {
+      throw new TerminalCleanupError(
+        "cleanup-legacy-state-ambiguous",
+        "Managed cleanup target ownership could not be established safely",
+      );
+    }
+    if (derivation.status !== "target") return false;
+    const presence = await this.managedCleanupTargetPresence(run, derivation.target);
     if (presence === "uncertain") {
       throw new TerminalCleanupError(
         "cleanup-ownership-mismatch",
@@ -654,9 +705,17 @@ export class Orchestrator {
       }
     | { kind: "ambiguous" }
   > {
-    const target = deriveManagedTerminalCleanupTarget(run);
-    if (!target) {
+    const derivation = await deriveManagedTerminalCleanupTarget(
+      run,
+      this.terminalCleanupDependencies?.listRegistrations
+        ? { listRegistrations: this.terminalCleanupDependencies.listRegistrations }
+        : undefined,
+    );
+    if (derivation.status === "none") {
       return { kind: "complete" };
+    }
+    if (derivation.status === "ambiguous") {
+      return { kind: "ambiguous" };
     }
     if (run.state !== "FAILED") {
       return { kind: "reconcile" };
@@ -2504,7 +2563,11 @@ export class Orchestrator {
       throw new Error(`${label} requires an isolated MASWE-managed worktree.`);
     }
 
-    const canonicalWorktreePath = path.resolve(externalWorktreePath(run.repositoryPath, run.id));
+    const canonicalWorktreePath = path.resolve(run.workspace.worktreePath);
+    const plannedPath = run.workspaceBootstrap?.plannedWorktreePath;
+    if (plannedPath !== undefined && path.resolve(plannedPath) !== canonicalWorktreePath) {
+      throw new Error(`${label} requires workspace path to match durable plannedWorktreePath.`);
+    }
     if (run.workspace.worktreePath !== canonicalWorktreePath) {
       throw new Error(`${label} requires the canonical MASWE-managed worktree path.`);
     }
