@@ -2,34 +2,38 @@
 
 ## Security objective
 
-MASWE must prevent untrusted requests, model output, repository content, and PR comments from crossing approval, permission, model, shell, or merge boundaries without deterministic authorization.
+MASWE must prevent untrusted requests, model output, repository content, PR comments, runtime/harness output, and ambient execution state from crossing approval, permission, identity, shell, workspace, evidence, or publication boundaries without deterministic authorization.
+
+The current implemented controls remain Cursor-first. MH-00 adds a planned security contract for future external harnesses; those controls are architecture requirements, not implemented adapter claims.
 
 ## Assets
 
 - Source code and repository history.
-- Credentials for Cursor, GitHub, package registries, cloud providers, and CI.
+- Credentials for Cursor, GitHub, package registries, cloud providers, CI, and future harness/provider integrations.
 - Approved product requirements and architecture.
-- Model configuration and team policy.
+- Model, harness, profile/composition, and team policy configuration.
 - Run artifacts and reviewer comments.
 - Verification and merge-readiness evidence.
-- Cost and quota associated with model usage.
+- Future raw/normalized harness-attempt evidence, qualification identity, and assurance metadata.
+- Cost and quota associated with model/harness usage.
 
 ## Trust assumptions
 
 - Project configuration and quality commands are controlled by trusted maintainers.
 - The local operating system and current user account are trusted.
 - Cursor CLI/SDK and model providers are external trusted dependencies, but their output is untrusted.
+- Future external harness executables, transports, profiles, plugins, model providers, and their reported metadata are external dependencies and remain untrusted inputs to MASWE policy.
 - Feature requests, repository text, dependency code, and PR comments may be malicious.
-- A model may misunderstand policy, hallucinate evidence, or follow prompt injection.
+- A model or harness may misunderstand policy, hallucinate evidence, follow prompt injection, expose undeclared ambient state, or report incomplete identity/capability facts.
 
 MASWE assumes a trusted local user and operating system. It does not claim to close every
 same-user ancestor replacement race between filesystem checks; bounded no-follow reads and
 post-read identity checks are the local fail-closed boundary, not a sandbox against a malicious
 local peer.
 
-The current execution dependencies are Cursor CLI and optional Cursor SDK. Future harnesses remain
-external dependencies whose output and metadata are untrusted, but their exact capability,
-permission, and identity contracts are governed by MH-00/#32 and are not implemented yet.
+The current execution dependencies are Cursor CLI and optional Cursor SDK. MH-00 defines future
+harness capability, permission, identity, hidden-state, isolation, and evidence requirements, but
+no external harness adapter is implemented by the architecture publication.
 
 ## Threats and controls
 
@@ -73,6 +77,10 @@ Non-Git directories do not fingerprint ordinary files outside `.maswe` (there is
 plane); workspace identity fields still use the `not-a-git-repository` sentinel separately from
 the digest fingerprint.
 
+**Planned MH-00 rule:** Future read-only external harness attempts remain enclosed by the MASWE
+outer exact-workspace/HEAD/fingerprint policy even if the harness reports an inner sandbox or
+read-only mode. Inner enforcement is additional evidence, not authority to weaken the outer fence.
+
 ### T3 — Builder or resolver exceeds scope
 
 **Threat:** A write role refactors unrelated code, changes APIs, or follows a reviewer request that broadens requirements.
@@ -89,6 +97,10 @@ the digest fingerprint.
 
 **Gap:** v0.2 isolates builders in a dedicated worktree and rejects commits outside `policy.allowedPathGlobs`. Fine-grained path policy derived from design artifacts remains future work.
 
+**Planned MH-00 rule:** External harnesses start read-only. Any future external writer belongs to
+MH-07 or another explicitly approved contract; MASWE keeps exact workspace ownership, deterministic
+commit authority, scope checks, and Git/GitHub publication authority.
+
 ### T4 — Self-verification
 
 **Threat:** The builder asserts success and the system accepts it.
@@ -100,11 +112,15 @@ the digest fingerprint.
 - Resolver edits trigger a fresh verifier.
 - Verifier is read-only and must emit a strict verdict.
 
-### T5 — Model substitution or fallback
+**Planned MH-00 rule:** A successful harness exit or final-text verdict is insufficient when the
+active assurance profile requires stronger exact-head, identity, hidden-state, or evidence-
+completeness proof.
 
-**Threat:** Runtime silently uses a cheaper, blocked, or less capable model.
+### T5 — Model, provider, transport, or profile substitution
 
-**Controls:**
+**Threat:** A runtime or future harness silently uses a cheaper, blocked, less capable, or materially different model/provider/transport/profile than the governed request.
+
+**Current controls:**
 
 - The persisted model spelling is resolved to the trusted catalogue entry's canonical identity
   before execution. That value drives the request and comparison; runtime metadata cannot replace
@@ -118,7 +134,22 @@ the digest fingerprint.
   resolve only a case-insensitive exact selector to the canonical catalogue entry, without
   family/provider/effort substitution.
 
-**Gap:** Not every runtime reports actual model identity. Provider-side substitution may remain opaque.
+**Planned MH-00 controls:**
+
+- Harness, adapter/executable, transport/protocol, profile/composition, provider, requested model,
+  runtime-resolved/reported identity, identity-evidence strength, effort, and permissions remain
+  separate attempt facts.
+- Qualification is bound to the exact executable/runtime and material profile/composition it
+  observed; replacing either invalidates that qualification.
+- Unknown, stale, contradictory, or insufficient required capability/identity facts fail closed.
+- A material provider/model/profile/transport change is not silently absorbed inside one governed
+  attempt; MASWE fallback creates a new MASWE-visible attempt.
+- Harness-local model/provider retries or auxiliary calls do not become MASWE fallback merely
+  because the harness labels them as retries.
+
+**Gap:** Not every runtime or provider exposes strong actual-model identity. MH-00 therefore
+requires explicit evidence-strength classification rather than treating requested/runtime-labelled
+metadata as provider attestation.
 
 ### T6 — Shell injection
 
@@ -132,9 +163,13 @@ the digest fingerprint.
 
 **Risk:** Quality commands execute with `shell: true`; malicious configuration is equivalent to local code execution. Protect config review and branch permissions.
 
+**Planned MH-00 rule:** An external harness's model output, workflow text, skill/memory content,
+tool proposal, or approval request does not become trusted shell/tool policy without deterministic
+MASWE authorization.
+
 ### T7 — Secret leakage
 
-**Threat:** Agents read `.env`, credentials, or CI secrets and include them in prompts, artifacts, or logs.
+**Threat:** Agents read `.env`, credentials, or CI secrets and include them in prompts, artifacts, logs, future raw harness evidence, or profile material.
 
 **Controls:**
 
@@ -222,6 +257,12 @@ the digest fingerprint.
   documented.
 - Default Cursor CLI prompt transport is stdin; argv remains available via `policy.promptTransport`.
 - No provider-specific privacy controls beyond local redaction.
+- Future raw harness/session evidence needs a separately approved bounded/redacted retention
+  contract. Secrets, credentials, profile secrets, and arbitrary environment values must not be
+  persisted merely because a structured harness event contains them.
+- Future conformance profiles must explicitly disposition telemetry, persistent anonymous identity,
+  provider/model-hidden headers, credential resolution, environment inheritance, persistence
+  roots, and network egress where those surfaces exist.
 
 Authentication-like stderr prose remains visible only after sanitization under the structured
 non-zero classification. It does not drive control flow because Cursor CLI does not expose a typed
@@ -245,6 +286,10 @@ authentication field.
 Same-user ancestor replacement races remain outside the trusted-local-user boundary. Future
 versions should bind approvals to artifact digests with signatures where needed.
 
+**Planned MH-00 rule:** Raw harness evidence and normalized projections remain distinguishable and
+traceable by digest/version. A normalized projection cannot invent a stronger fact than its raw or
+MASWE-observed source supports.
+
 ### T9 — Verification on stale code
 
 **Threat:** New commits are added after verifier pass, but old evidence is treated as current.
@@ -256,6 +301,10 @@ versions should bind approvals to artifact digests with signatures where needed.
 - Head-SHA movement after a successful stage invalidates stale evidence before merge-ready.
 
 **Gap:** Digests and evidence are not yet cryptographically signed. Phase A mirrors SHA-bound evidence into GitHub Checks; Phase B still owns push/PR writes and comment replies.
+
+**Planned MH-00 rule:** Future harness evidence is bound to the exact MASWE attempt and exact
+workspace/head it evaluated. Harness success on another head/profile/generation is stale or foreign
+evidence and cannot satisfy the current assurance gate.
 
 ### T10 — Webhook replay or forged GitHub event
 
@@ -289,7 +338,9 @@ versions should bind approvals to artifact digests with signatures where needed.
 cooperative same-host locking on one coherent local filesystem with atomic no-clobber hard links.
 Quiescent retained-path migration is required from legacy state; multiple listeners, mixed old/new
 binaries, and network/distributed filesystems are unsupported. Digest-bound GitHub approval
-authorization by repository role/team remains Phase B.
+authorization by repository role/team remains Phase B. Issue #34 must establish or explicitly
+disposition stable repository identity across owner/name renames before Phase B obtains write
+authority.
 
 ### T11 — Resource and cost exhaustion
 
@@ -301,7 +352,7 @@ authorization by repository role/team remains Phase B.
 - Automatic loop has a hard transition limit.
 - Fallback models are disabled by default.
 
-**Future controls:** per-run token, time, and monetary budgets; concurrency quotas; organization-level kill switch.
+**Future controls:** per-run token, time, and monetary budgets; concurrency quotas; organization-level kill switch. MH-00 additionally requires harness-local retries and auxiliary model calls to be disabled initially or bounded/accounted explicitly rather than hiding them from MASWE attempt accounting.
 
 ### T12 — Lock recovery releases a replacement owner
 
@@ -331,6 +382,91 @@ the current threat model. NFS, SMB, distributed FUSE, object-store mounts, cross
 filesystems without coherent no-clobber hard links are unsupported. General Windows support is not
 claimed without exact-head native NTFS validation.
 
+### T13 — Harness-name capability confusion (planned MH-00)
+
+**Threat:** MASWE or an operator assumes that a harness name implies a safe transport, provider,
+model, profile, permission mode, sandbox, memory mode, retry policy, workflow surface, or delegation
+behavior. Two materially different runtime compositions could then be treated as equivalent.
+
+**Planned controls:**
+
+- Route against an exact qualified execution plan and required capability/assurance facts, not a
+  harness-name condition.
+- Bind qualification to exact adapter/executable/runtime and material profile/composition identity,
+  including protocol generation where available.
+- Treat unknown/unproven required capabilities as a failure rather than a permissive default.
+- Keep requested permissions and effective/observed permissions separate.
+- Treat unexpected write-tool, workflow, retry, delegation, dynamic-profile/plugin, or equivalent
+  events as policy violations when the active conformance profile forbids them.
+
+**Status/gap:** Architecture requirement only. MH-01/MH-02 and each adapter tranche must implement
+and test the exact type, qualification, invalidation, and policy semantics before an external
+harness is supported.
+
+### T14 — Hidden ambient state or nested authority (planned MH-00)
+
+**Threat:** Persistent harness memory, user/project skills, mutable settings, workspace instructions,
+sessions, task boards, jobs/goals, native workflows, provider retries, or subagents influence a
+high-assurance result without appearing in MASWE's authoritative inputs. A harness could become a
+second scheduler/approval/retry plane.
+
+**Planned controls:**
+
+- Record an ambient-input manifest and explicit hidden-state disposition where required by the
+  assurance profile.
+- Prefer fresh process/session/home/profile/persistence roots or memory-disabled semantics for
+  reproducible and independent-verification attempts.
+- Treat governed MASWE/Superpowers skills as immutable/digest-bound inputs; mutable harness-created
+  skills/procedural memory are not authoritative policy.
+- Disable native delegation, workflows/schedulers, internal retries, and dynamic policy/plugin
+  modification initially where possible.
+- Admit future child execution only through a MASWE-visible bounded delegation contract with exact
+  parent/child identity, permissions, workspace scope, evidence, cancellation, cost, and failure
+  semantics.
+- Harness approvals/permission prompts are execution safety evidence or requests; they cannot
+  satisfy MASWE brainstorm/design approval or authorize fallback/publication/privilege expansion.
+
+**Status/gap:** Architecture requirement only. The exact assurance-profile and ambient-input schema
+belongs to MH-01/MH-08 and harness-specific conformance work.
+
+### T15 — Incomplete or overstated harness evidence; orphan execution (planned MH-00)
+
+**Threat:** A harness returns plausible final text while prompt correlation, model identity, tool
+trace, child lineage, cancellation, sandbox facts, or raw evidence is missing/inferred. A timeout or
+cancel may also leave descendant processes running after MASWE has treated the attempt as over.
+
+**Planned controls:**
+
+- Preserve bounded/redacted raw structured session evidence where the assurance profile requires it
+  and digest-bind normalized projections to the raw source.
+- Record per-dimension evidence completeness/strength; never promote configured/requested/runtime-
+  labelled metadata to stronger provider attestation without supporting evidence.
+- A successful harness exit still fails the governed assurance contract when required evidence is
+  missing or too weak.
+- MASWE owns outer timeout/cancellation and process-tree quiescence even when the inner transport
+  offers cancellation/sandboxing.
+- Prompt-level cancellation support is an explicit capability; absent support does not remove the
+  outer quiescence requirement.
+
+**Status/gap:** Architecture requirement only. Exact persistence, retention bounds, process
+supervision, and completeness enums must be approved/tested in later implementation tranches.
+
+### T16 — Transitive product identity collapse (planned MH-00)
+
+**Threat:** `MASWE -> DeepSeek Harness -> Codex` or `MASWE -> Hermes -> Claude` is recorded as if it
+were a direct MASWE Codex/Claude adapter. That can overstate independence, permissions, transport,
+and profile provenance.
+
+**Planned controls:**
+
+- Preserve every material harness/product layer and parent/child relationship in attempt evidence.
+- A nested leaf product does not satisfy a direct-adapter assurance contract for that product.
+- Differential verification treats harness and provider/model dimensions independently and
+  preserves disagreement instead of converting multiple outputs into implicit consensus.
+
+**Status/gap:** Architecture requirement only; child/transitive identity fields belong to MH-01 and
+future governed delegation/adapters.
+
 ## Deterministic role authority
 
 The enforced role-permission matrix is the authorization decision, independent of a model prompt:
@@ -346,6 +482,10 @@ The enforced role-permission matrix is the authorization decision, independent o
 Project configuration, persisted run snapshots, and execution overrides that violate this table
 fail closed with `policy-role-permission-mismatch`.
 
+Future harness adapters may narrow execution capabilities but must not broaden this MASWE authority
+matrix. The initial external adapter direction is read-only; external writer behavior requires a
+separately approved MH-07 contract.
+
 ## Least-privilege target design
 
 | Role | Configured permission | Repository read | Repository write | Shell | Network/integrations |
@@ -359,6 +499,10 @@ fail closed with `policy-role-permission-mismatch`.
 Adapter flags and prompts supplement this deterministic matrix; the local read-only check remains
 post-run detection rather than a preventive operating-system sandbox.
 
+For future harnesses, least privilege is an exact-plan property: requested/effective harness tools,
+sandbox policy, network/process capabilities, memory/skills, delegation, retries, and publication
+surface are independently qualified/evidenced rather than inferred from the harness name.
+
 ## Dependency and supply-chain policy
 
 - Pin released dependencies with a lock file when registry access is available.
@@ -366,13 +510,18 @@ post-run detection rather than a preventive operating-system sandbox.
 - Use Dependabot and CI.
 - Review all GitHub Actions by commit SHA for high-assurance deployments; starter workflow uses major tags for maintainability and should be hardened before production.
 - Do not execute code downloaded by an agent without review.
+- Future external harness qualification must bind the executable/runtime build and material
+  profile/composition generation it approved; replacement or protocol/profile drift invalidates
+  qualification rather than inheriting trust from a stable harness name.
+- A MASWE-owned conformance profile is preferred where a composable harness exposes broad stock
+  profiles/plugins/tools; profile bytes/identity are digest-bound where reproducibility requires it.
 
 ## Incident response
 
-1. Stop active runs and revoke affected tokens.
-2. Preserve `run.json`, artifacts, command logs, git reflog, and provider request IDs.
-3. Determine whether workspace or remote side effects occurred.
-4. Rotate exposed credentials.
-5. Revert unauthorized code and invalidate verification/check results.
-6. Patch policy or runtime controls and add a regression test.
+1. Stop active runs/attempts and revoke affected GitHub, provider, and harness tokens or credentials.
+2. Preserve `run.json`, artifacts, command logs, git reflog, provider request IDs, and—when later implemented—bounded raw harness evidence, normalized evidence, executable/profile qualification identities, and process/cancellation facts.
+3. Determine whether workspace, process, network, child-agent, or remote side effects occurred.
+4. Rotate exposed credentials and invalidate affected harness/profile qualification where applicable.
+5. Revert unauthorized code and invalidate verification/check/assurance results bound to affected heads or attempts.
+6. Patch policy or runtime/harness controls and add deterministic replay/regression coverage.
 7. Document impact and notify affected users according to organizational policy.
