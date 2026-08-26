@@ -240,7 +240,12 @@ For a run with a recorded managed worktree, derive and validate all of the follo
 2. `run.config.policy.useIsolatedWorktree` is true.
 3. `run.workspace.worktreePath` exists in the record.
 4. The orchestrator/store repository root used for the cleanup invocation resolves exactly to `run.repositoryPath`; #30 does not migrate a run across local repository paths.
-5. The recorded worktree path resolves exactly to `externalWorktreePath(run.repositoryPath, run.id)`.
+5. The recorded or recovered worktree path comes from durable authority only:
+   checkpointed `run.workspace.worktreePath`, else
+   `workspaceBootstrap.plannedWorktreePath`, else a uniquely proven
+   `maswe/<run-id>` registration matching the bootstrap source HEAD. Current
+   process `TMPDIR`/`TMP`/`TEMP` recomputation is never historical cleanup
+   authority.
 6. The target path is not the operator checkout (`path.resolve(run.repositoryPath)`).
 7. The recorded branch is exactly the MASWE-owned branch expected for this run (`maswe/<run-id>`).
 8. Git worktree registrations for `run.repositoryPath` can be parsed completely and unambiguously.
