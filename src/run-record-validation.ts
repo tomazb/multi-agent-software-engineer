@@ -130,7 +130,7 @@ function validateWorkspaceBootstrap(
     ),
     ...(bootstrap.plannedWorktreePath !== undefined
       ? {
-          plannedWorktreePath: canonicalAbsolutePath(
+          plannedWorktreePath: canonicalPortableDurableAbsolutePath(
             bootstrap.plannedWorktreePath,
             "Run record workspaceBootstrap.plannedWorktreePath",
           ),
@@ -145,9 +145,19 @@ function canonicalNonEmptyString(value: unknown, label: string): string {
   return result;
 }
 
-function canonicalAbsolutePath(value: unknown, label: string): string {
+/**
+ * Host-independent durable absolute-path authority for plannedWorktreePath.
+ * Matches the published run-record schema grammar: POSIX absolute, Windows
+ * drive-letter absolute, and UNC. Rejects drive-less rooted Windows paths
+ * (`\foo`) whose effective drive depends on process context.
+ */
+export function isPortableDurableAbsolutePath(value: string): boolean {
+  return /^(?:\/.*|[A-Za-z]:[\\/].*|\\\\[^\\/]+\\[^\\/]+(?:[\\/].*)?)$/.test(value);
+}
+
+function canonicalPortableDurableAbsolutePath(value: unknown, label: string): string {
   const result = canonicalNonEmptyString(value, label);
-  if (!path.isAbsolute(result)) {
+  if (!isPortableDurableAbsolutePath(result)) {
     throw new Error(`${label} must be an absolute path`);
   }
   return result;

@@ -543,6 +543,16 @@ test("run-record schema plannedWorktreePath portable absolute paths and operator
       ),
     /pattern/,
   );
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        bootstrapSchema,
+        { ...baseIsolated, plannedWorktreePath: "\\maswe-worktrees\\run" },
+        "drive-less rooted windows planned path",
+      ),
+    /pattern/,
+  );
 
   const operatorBase = {
     mode: "operator-checkout",

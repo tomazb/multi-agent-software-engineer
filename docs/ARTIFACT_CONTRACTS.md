@@ -150,9 +150,10 @@ before `START`. During that recoverable `CREATED` window the relevant record sha
 the single `START` publication. For isolated-worktree mode, `plannedWorktreePath` is the exact
 absolute path published into durable bootstrap authority after the run id exists and before any
 branch or worktree side effect. The published schema accepts portable absolute forms MASWE can
-produce (POSIX `/…`, Windows drive-letter, and UNC paths) and rejects relative or drive-relative
-values; host runtime validation remains environment-sensitive via `path.isAbsolute()`. Later
-recovery and cleanup must use that persisted path (or, for
+produce (POSIX `/…`, Windows drive-letter, and UNC paths) and rejects relative, drive-relative,
+and drive-less rooted Windows values (`\foo`); runtime validation uses the same host-independent
+portable absolute-path grammar rather than host `path.isAbsolute()` alone. Later recovery and
+cleanup must use that persisted path (or, for
 historical records that omit it, a uniquely proven Git worktree registration) and must not
 recompute authority from the current process `TMPDIR`/`TMP`/`TEMP`. Operator-checkout bootstrap
 must omit `plannedWorktreePath` (schema and runtime both reject the combination). Bootstrap
