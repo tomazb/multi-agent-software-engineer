@@ -28,10 +28,12 @@ import {
   externalWorktreePath,
   invalidateStaleEvidence,
   listGitWorktreeRegistrations,
+  deriveManagedTerminalCleanupTarget,
   reconcileTerminalWorktreeCleanup,
   refreshWorkspaceHead,
   workingDirectoryFor,
   TerminalCleanupError,
+  type ManagedTerminalCleanupTarget,
   type TerminalCleanupDependencies,
   type TerminalCleanupPathState,
 } from "./git-workspace.ts";
@@ -173,27 +175,6 @@ function requiresWorkspacePreservation(error: unknown): boolean {
     }
   }
   return false;
-}
-
-function terminalCleanupIntent(
-  run: RunRecord,
-  preservationReason?: TerminalCleanupPreservationReason,
-): RunTerminalCleanup {
-  const updatedAt = new Date().toISOString();
-  if (!run.config.policy.useIsolatedWorktree || !run.workspace?.worktreePath) {
-    return { status: "complete", updatedAt };
-  }
-  if (preservationReason) {
-    return { status: "preserved", updatedAt, preservationReason };
-  }
-  return { status: "pending", updatedAt };
-}
-
-function attachTerminalCleanupIntent(
-  run: RunRecord,
-  preservationReason?: TerminalCleanupPreservationReason,
-): void {
-  run.terminalCleanup = terminalCleanupIntent(run, preservationReason);
 }
 
 function failRunPreservationReason(
@@ -535,43 +516,128 @@ export class Orchestrator {
     }
   }
 
-  private async legacyManagedTargetPresent(run: RunRecord): Promise<boolean> {
-    const worktreePath = run.workspace?.worktreePath;
-    if (!worktreePath) return false;
+  /**
+   * Resolve terminal cleanup intent from durable authority only.
+   * Uncheckpointed isolated bootstrap targets are derived from repositoryPath,
+   * run id, and workspaceBootstrap — never fabricated into run.workspace.
+   */
+  private async resolveTerminalCleanupIntent(
+    run: RunRecord,
+    preservationReason?: TerminalCleanupPreservationReason,
+  ): Promise<RunTerminalCleanup> {
+    const updatedAt = new Date().toISOString();
+    if (!run.config.policy.useIsolatedWorktree) {
+      return { status: "complete", updatedAt };
+    }
+
+    const target = deriveManagedTerminalCleanupTarget(run);
+    if (!target) {
+      return { status: "complete", updatedAt };
+    }
+
+    if (preservationReason) {
+      let presence: "absent" | "present" | "uncertain";
+      try {
+        presence = await this.managedCleanupTargetPresence(run, target);
+      } catch {
+        // Fail closed: never publish complete when inspection is uncertain.
+        presence = "uncertain";
+      }
+      if (presence === "absent") {
+        return { status: "complete", updatedAt };
+      }
+      return { status: "preserved", updatedAt, preservationReason };
+    }
+
+    return { status: "pending", updatedAt };
+  }
+
+  private async attachTerminalCleanupIntent(
+    run: RunRecord,
+    preservationReason?: TerminalCleanupPreservationReason,
+  ): Promise<void> {
+    run.terminalCleanup = await this.resolveTerminalCleanupIntent(run, preservationReason);
+  }
+
+  private async managedCleanupTargetPresence(
+    run: RunRecord,
+    target: ManagedTerminalCleanupTarget,
+  ): Promise<"absent" | "present" | "uncertain"> {
     if (path.resolve(this.cwd) !== path.resolve(run.repositoryPath)) {
       throw new TerminalCleanupError(
         "cleanup-ownership-mismatch",
         "Cleanup invocation repository root must match the run repositoryPath exactly",
       );
     }
+    if (path.resolve(target.worktreePath) !== path.resolve(externalWorktreePath(run.repositoryPath, run.id))) {
+      return "uncertain";
+    }
+    if (target.branch !== `maswe/${run.id}`) {
+      return "uncertain";
+    }
+
     const listRegistrations =
       this.terminalCleanupDependencies?.listRegistrations ?? listGitWorktreeRegistrations;
     const inspectPath =
       this.terminalCleanupDependencies?.inspectPath ??
       ((candidatePath: string) => this.inspectTerminalCleanupPath(candidatePath));
+
     let registrations;
     let pathState: TerminalCleanupPathState;
     try {
       registrations = await listRegistrations(run.repositoryPath);
-      pathState = await inspectPath(worktreePath);
+      pathState = await inspectPath(target.worktreePath);
     } catch (error) {
       throw error instanceof TerminalCleanupError
         ? error
         : new TerminalCleanupError(
             "cleanup-inspection-failed",
-            error instanceof Error ? error.message : "Failed to inspect legacy worktree state",
+            error instanceof Error ? error.message : "Failed to inspect managed worktree state",
           );
     }
-    const expectedBranch = `maswe/${run.id}`;
-    const resolved = path.resolve(worktreePath);
-    return (
-      pathState !== "absent" ||
-      registrations.some(
-        (registration) =>
-          path.resolve(registration.worktreePath) === resolved ||
-          registration.branch === expectedBranch,
-      )
+
+    if (pathState === "unsafe") {
+      return "uncertain";
+    }
+
+    const resolved = path.resolve(target.worktreePath);
+    const pathRegistration = registrations.find(
+      (registration) => path.resolve(registration.worktreePath) === resolved,
     );
+    const branchRegistration = registrations.find(
+      (registration) => registration.branch === target.branch,
+    );
+
+    if (
+      branchRegistration &&
+      path.resolve(branchRegistration.worktreePath) !== resolved
+    ) {
+      return "uncertain";
+    }
+    if (pathRegistration && pathRegistration.branch !== target.branch) {
+      return "uncertain";
+    }
+    if (pathRegistration && pathRegistration.headSha !== target.headSha.toLowerCase()) {
+      return "uncertain";
+    }
+
+    if (pathState === "directory" || pathRegistration || branchRegistration) {
+      return "present";
+    }
+    return "absent";
+  }
+
+  private async legacyManagedTargetPresent(run: RunRecord): Promise<boolean> {
+    const target = deriveManagedTerminalCleanupTarget(run);
+    if (!target) return false;
+    const presence = await this.managedCleanupTargetPresence(run, target);
+    if (presence === "uncertain") {
+      throw new TerminalCleanupError(
+        "cleanup-ownership-mismatch",
+        "Managed cleanup target ownership could not be established safely",
+      );
+    }
+    return presence === "present";
   }
 
   private async classifyLegacyTerminalCleanup(
@@ -588,7 +654,8 @@ export class Orchestrator {
       }
     | { kind: "ambiguous" }
   > {
-    if (!run.workspace?.worktreePath) {
+    const target = deriveManagedTerminalCleanupTarget(run);
+    if (!target) {
       return { kind: "complete" };
     }
     if (run.state !== "FAILED") {
@@ -2210,7 +2277,7 @@ export class Orchestrator {
       ...(resumeState ? { resumeState } : {}),
       ...(runtime ? { runtime } : {}),
     };
-    attachTerminalCleanupIntent(candidate, options.preservationReason);
+    await this.attachTerminalCleanupIntent(candidate, options.preservationReason);
     if (isTerminal(candidate.state)) {
       await this.store.save(candidate);
       return finishFailure(candidate);
@@ -2553,7 +2620,7 @@ export class Orchestrator {
       runId,
       "complete",
       async (run, headSha) => {
-        attachTerminalCleanupIntent(run);
+        await this.attachTerminalCleanupIntent(run);
         return this.store.applyEvent(run, "COMPLETE", "user", {
           headSha,
           mergeReadySha: headSha,
@@ -2565,7 +2632,7 @@ export class Orchestrator {
 
   async cancel(runId: string): Promise<RunRecord> {
     const run = await this.store.load(runId);
-    attachTerminalCleanupIntent(run);
+    await this.attachTerminalCleanupIntent(run);
     const cancelled = await this.store.applyEvent(run, "CANCEL", "user");
     return this.finalizeTerminal(cancelled);
   }
@@ -2779,7 +2846,7 @@ export class Orchestrator {
             at: new Date().toISOString(),
             resumeState: authoritative.state as WorkflowState,
           };
-          attachTerminalCleanupIntent(authoritative);
+          await this.attachTerminalCleanupIntent(authoritative);
           return this.store.applyEvent(authoritative, "CANCEL", "user", {
             reason: "superseded",
             supersededBy: replacement.id,
@@ -2790,7 +2857,7 @@ export class Orchestrator {
           authoritative.terminalCleanup.status === "preserved" ||
           authoritative.terminalCleanup.lastError?.code === "cleanup-legacy-state-ambiguous"
         ) {
-          attachTerminalCleanupIntent(authoritative);
+          await this.attachTerminalCleanupIntent(authoritative);
         }
         await this.store.save(authoritative);
         return this.store.load(runId);

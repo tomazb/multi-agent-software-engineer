@@ -154,6 +154,12 @@ The orchestrator prepares the terminal candidate before `applyEvent()`:
 - ordinary managed terminal worktree -> `terminalCleanup.status = "pending"`;
 - Issue #28 governed preservation -> `terminalCleanup.status = "preserved"` with an exact preservation reason.
 
+"No managed isolated worktree" means the exact deterministic target is positively absent. A CREATED
+bootstrap failure can create the deterministic worktree before `run.workspace` is checkpointed;
+cleanup must derive that target from durable bootstrap authority (`repositoryPath`, run id,
+`workspaceBootstrap.sourceBaseSha`) and inspect path/registration before publishing `complete`.
+Absence of checkpointed `run.workspace` alone is not proof of absence.
+
 This closes the crash window where a terminal state exists durably but MASWE has no durable statement that cleanup is outstanding.
 
 `COMPLETE`, `CANCEL`, and `FAIL` retain their existing workflow semantics. No `CLEANUP_*` workflow events are introduced.

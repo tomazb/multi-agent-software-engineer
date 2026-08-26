@@ -236,8 +236,11 @@ Optional schema-version-1 object `terminalCleanup` is operational lifecycle meta
 evidence. Terminal workflow state is durable before any worktree deletion. Cleanup retries append
 no workflow events and change no artifacts, approvals, counters, GitHub association, or
 engineering `failure` classification. Production cleanup retains the `maswe/<run-id>` branch.
-Ownership is re-proved from the exact repository, recorded path, Git worktree registration,
-branch, HEAD, and type before deletion.
+Ownership is re-proved from the exact repository, recorded or bootstrap-derived path, Git worktree
+registration, branch, HEAD, and type before deletion. When isolated bootstrap fails after
+`git worktree add` but before the workspace checkpoint, cleanup still derives the deterministic
+MASWE path/branch from durable `workspaceBootstrap` authority and must not report `complete` while
+that exact managed target may survive.
 
 ```json
 {

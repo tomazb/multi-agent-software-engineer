@@ -213,9 +213,13 @@ event or evidence field. `pending` and `failed` cleanup are retryable through `m
 is consumed or the run is superseded. Cleanup retries append no workflow events and change no
 workflow evidence, GitHub association evidence, artifacts, approvals, counters, or engineering
 failure classification. Production cleanup retains the `maswe/<run-id>` branch. Every destructive
-attempt re-proves ownership from the exact repository, recorded path, Git worktree registration,
-branch, HEAD, and type before deletion. A legacy terminal record that omits `terminalCleanup` is
-unknown until reconciled; ambiguous legacy `FAILED` preservation fails closed.
+attempt re-proves ownership from the exact repository, recorded or bootstrap-derived path, Git
+worktree registration, branch, HEAD, and type before deletion. A CREATED bootstrap failure may
+leave a deterministic managed worktree before `run.workspace` is checkpointed; cleanup derives that
+target from `repositoryPath`, run id, and durable `workspaceBootstrap` and must not publish
+`complete` while the exact path or registration may still survive. A legacy terminal record that
+omits `terminalCleanup` is unknown until reconciled; ambiguous legacy `FAILED` preservation fails
+closed.
 
 It does not contain Cursor SDK implementation details, shell output parsing, or persistence internals.
 
