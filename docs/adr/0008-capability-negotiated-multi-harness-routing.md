@@ -50,6 +50,8 @@ No silent provider/model switching, transport fallback, profile drift, permissio
 
 A role produces required capabilities and an assurance profile. MASWE evaluates an exact qualified harness/transport/profile/provider/model candidate against those requirements. Unknown, stale, contradictory, or insufficient required facts fail closed.
 
+Capability claims also carry provenance/strength: configuration or adapter self-report is weaker than MASWE-probed/observed or externally attested/enforced facts. A stronger assurance requirement cannot be satisfied solely by a weaker self-declared capability claim.
+
 Product-specific protocol handling belongs inside adapters. The orchestrator must not accumulate harness-name conditionals that imply capability or authority.
 
 ### 4. MASWE owns workspaces and publication
@@ -157,15 +159,19 @@ Rejected. Initial read-only adapters give MASWE a smaller qualification/evidence
 
 ## Implementation ordering
 
-This ADR does not authorize runtime implementation. The approved order is:
+This ADR does not authorize runtime implementation. The detailed normative ordering is in §25 of the MH-00 design specification; the synchronized summary is:
 
 1. publish/approve MH-00 (#32);
 2. complete #34 as required before GitHub Phase-B write authority;
 3. complete remaining #3 Phase B;
 4. implement MH-01 harness-neutral contracts;
 5. implement MH-02 Cursor-preserving registry refactor;
-6. add external read-only adapters;
-7. add governed writers only under MH-07; and
-8. freeze distributed #4/MH-09 schemas only after local contract/conformance evidence exists.
+6. implement MH-03 deterministic configuration hierarchy;
+7. add external read-only adapters only after the shared and adapter-specific entry gates;
+8. add governed writers only under MH-07;
+9. implement MH-08 assurance profiles and differential verification; and
+10. freeze distributed #4/MH-09 schemas only after local contract/conformance evidence exists.
+
+Hermes Agent (MH-06H) and DeepSeek Harness (#36 / MH-06D) remain planning-only until their complete entry gates and owner approval are satisfied. MH-00 does not authorize either adapter.
 
 The detailed normative design is `docs/superpowers/specs/2026-08-26-mh-00-multi-harness-execution-architecture.md`.
