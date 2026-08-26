@@ -88,10 +88,12 @@ Required order:
 4. MH-01: prove harness-neutral domain/configuration/capability/attempt/evidence contracts.
 5. MH-02: refactor current Cursor/mock runtimes behind the harness registry without semantic drift.
 6. MH-03: define deterministic global/project/private/invocation configuration hierarchy.
-7. Add direct external harnesses as read-only workers: Claude Code (MH-04), Codex CLI (MH-05), Copilot CLI/OpenCode (MH-06), Hermes (MH-06H), and DeepSeek Harness (#36 / MH-06D).
+7. Add planned direct external harnesses as read-only workers after their individual entry gates and owner approval: Claude Code (MH-04), Codex CLI (MH-05), Copilot CLI/OpenCode (MH-06), Hermes Agent (MH-06H), and DeepSeek Harness (#36 / MH-06D).
 8. MH-07: separately govern external writer authority; MASWE retains deterministic commit/publication authority.
 9. MH-08: assurance profiles and differential verification.
 10. MH-09 / #4: freeze distributed worker schemas only after local contracts and initial adapter conformance evidence exist.
+
+Hermes Agent and DeepSeek Harness remain planning-only until their complete entry gates and owner approval are satisfied. MH-00 validates their architecture requirements but does not authorize either adapter or runtime implementation.
 
 Routing is capability-negotiated: harness, transport/protocol, profile/composition, provider/model, permissions, ambient/hidden state, retry/delegation behavior, isolation, and evidence completeness remain separate facts. Unknown required capabilities fail closed.
 
