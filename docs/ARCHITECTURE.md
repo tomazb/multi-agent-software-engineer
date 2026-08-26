@@ -322,11 +322,12 @@ An unknown placeholder fails deterministically before runtime invocation.
 
 ### 3.8 Runtime adapter interface
 
-`AgentRuntime` defines two operations:
+`AgentRuntime` defines three operations:
 
 ```ts
 execute(request): Promise<RuntimeResult>
 doctor(): Promise<RuntimeDoctorResult>
+listModels(): Promise<string[]>
 ```
 
 Implemented adapters:
