@@ -8,7 +8,7 @@
 - **Date:** 2026-08-27
 - **Exact baseline:** `main@4565d1c0661ff6cf20185f718b59c40d9c837c77`
 - **Branch:** `issue-34-stable-repository-identity-design`
-- **Design status:** owner-approved architecture; committed specification awaiting owner review
+- **Design status:** owner-approved architecture; external validation revisions applied; awaiting owner re-review
 - **Implementation authority:** none yet. This branch contains design only. Runtime, schema, CLI, migration, test, documentation, and issue implementation require a separately approved implementation plan.
 
 This is a design specification. Proposed behavior remains unverified until implemented and tested.
@@ -26,11 +26,13 @@ Required invariants:
 3. Future Phase B writes may target only explicitly allowlisted repository IDs.
 4. HTTP redirects are never repository-identity evidence.
 5. Installation, PR target, PR number, exact head SHA, and check-resource ownership remain independently proven.
-6. Legacy schema-v1 state remains readable but cannot authorize repository-scoped operations until reconciled.
+6. Legacy schema-v1 state remains readable by the #34 binary but cannot authorize repository-scoped operations until reconciled.
 7. Migration is explicit, authenticated, idempotent, restartable, and never hand-edits authoritative state or immutable journals.
 8. Unknown/conflicting identity fails closed.
 9. Correctness does not depend on receiving a dedicated rename webhook.
 10. #34 adds no Phase B write authority; current `readOnlyChecks` restrictions remain.
+11. Mixed pre-#34/#34 binaries are unsupported during the identity cutover; old processes must be quiescent before migration.
+12. Authority-reducing legacy signals may reduce unresolved legacy authority, but a name-only signal may never grant, restore, migrate, or redirect authority.
 
 ## 2. Selected architecture
 
@@ -53,7 +55,7 @@ Rejected alternatives:
 
 `repository` remains lowercase canonical `owner/repo` and may be updated only after authenticated live reconciliation for the already-authorized ID.
 
-## 3. Configuration and authorization
+## 3. Configuration, authorization, and compatibility
 
 Normalized GitHub App configuration becomes conceptually:
 
@@ -73,13 +75,50 @@ interface GitHubAppConfig {
 
 Raw historical/project config may omit either allowlist. Config migration normalizes missing arrays to `[]` in memory without rewriting historical persisted run snapshots.
 
-`allowedRepositoryIds` entries must be unique positive safe integers. Any repository-scoped association, reconciliation, credential mint, mutation, or publication requires a non-empty stable-ID allowlist and the target ID must be present.
+### 3.1 Enabled-time validation rule
 
-`allowedRepositories` remains accepted only to load historical config, select/diagnose legacy local records during explicit migration, and display operator context. It cannot authorize webhook-driven run mutation, check publication, rename reconciliation, credential scope, future Phase B writes, or old/new-name equivalence.
+The current baseline requires a non-empty `allowedRepositories` whenever `githubApp.enabled` is true. #34 deliberately replaces that rule.
 
-A GitHub-enabled name-only project config remains parseable. Signed webhook ingress may still be durably accepted so deliveries are not lost, while repository-scoped dispatch/publication fails closed until IDs are configured. `installation.deleted` may still reduce authority by persisted `installationId`, including for unresolved legacy associations; it never establishes repository identity.
+After #34, an enabled GitHub App configuration is valid only when **at least one** of these arrays is non-empty:
 
-Keep `config.version: 1` and `RunRecord.schemaVersion: 1`. `allowedRepositoryIds` and run-association `repositoryId` are additive schema-v1 fields. Historical records may omit them; operational accessors reject unresolved legacy associations.
+```text
+allowedRepositoryIds.length > 0
+OR
+allowedRepositories.length > 0
+```
+
+This preserves loadability of existing name-only configurations and permits the target ID-only configuration. An enabled config with both arrays empty is invalid.
+
+`allowedRepositoryIds` entries must be unique positive safe integers. `allowedRepositories` entries retain canonical owner/repo validation and are normalized to lowercase.
+
+This is only a configuration-load rule. Operational authorization is stricter.
+
+### 3.2 Operational authorization rule
+
+Any repository-scoped association, reconciliation, credential mint, workflow mutation, check publication, or future Phase B write requires:
+
+1. a non-empty live `allowedRepositoryIds`;
+2. the exact target `repositoryId` in that list.
+
+`allowedRepositories` remains accepted only to:
+
+- load historical/project configuration during migration;
+- select/diagnose unresolved legacy local records;
+- display operator context.
+
+It cannot authorize webhook-driven run mutation, check publication, rename reconciliation, credential scope, future Phase B writes, or old/new-name equivalence.
+
+A GitHub-enabled name-only project config therefore remains loadable but is migration-only for repository-scoped authority. Signed ingress may still be durably accepted, but repository-scoped dispatch is a no-op/permanent unauthorized disposition until stable IDs are configured. Correctness must not depend on replaying deliveries received during this maintenance window: migration and later manual publication re-read authoritative live PR/repository state.
+
+`installation.deleted` may still reduce authority by persisted `installationId`, including for unresolved legacy associations; it never establishes repository identity.
+
+### 3.3 Schema and downgrade posture
+
+Keep `config.version: 1` and `RunRecord.schemaVersion: 1`. `allowedRepositoryIds` and run-association `repositoryId` are additive schema-v1 fields for the #34 binary.
+
+This is **forward migration compatibility, not backward-binary compatibility**. Once #34 writes the new fields/stable association form, downgrade to a pre-#34 binary is unsupported. Existing exact-object/association validation should cause old binaries to fail closed rather than silently ignore stable identity and resume name-authoritative behavior.
+
+All pre-#34 GitHub listeners/manual publishers must therefore be stopped before migration/cutover and must not be restarted against migrated state.
 
 ## 4. Installation-token identity and least privilege
 
@@ -100,9 +139,39 @@ type GitHubInstallationTokenPurpose =
 
 Future Phase B token purposes require separate #3 authorization; #34 must not broaden these purposes implicitly.
 
-Authenticated canonical lookup uses `GET /installation/repositories` with the ID-scoped metadata token and requires exactly the requested numeric ID plus a valid current `full_name`. The old repository URL is never queried to infer redirect equivalence.
+## 5. Authenticated canonical repository lookup
 
-## 5. Webhook normalization and durable inbox compatibility
+MASWE uses the documented `GET /installation/repositories` endpoint with the ID-scoped `metadata-reconcile` installation token and requires an object with exactly the requested numeric ID and a valid current `full_name`.
+
+The old repository URL is never queried to infer redirect equivalence.
+
+### 5.1 Bounded pagination is part of correctness
+
+GitHub documents this endpoint as paginated, defaulting to 30 results per page with a maximum `per_page` of 100. #34 must not assume the target appears on page 1.
+
+Use `per_page=100` and bounded pagination with an explicit maximum of 100 pages. Pagination handling must:
+
+- pin origin to the configured GitHub API origin used by this adapter (currently `https://api.github.com`);
+- pin path to `/installation/repositories`;
+- allow only the expected `per_page` and `page` query keys;
+- reject user-info, fragments, unexpected query parameters, malformed/duplicate `rel` values, multiple `next` links, loops, and unsafe origins/paths;
+- deduplicate repository IDs across pages and reject the same ID with conflicting names;
+- stop immediately when the exact requested ID is found and validate its canonical name;
+- distinguish successful terminal exhaustion from incomplete/ambiguous traversal.
+
+A fully successful traversal that reaches the terminal page without the requested ID is positive evidence that the scoped installation token cannot currently see that repository and may feed authorization-revoked handling.
+
+Page-limit exhaustion, malformed pagination, an unsafe next link, loop detection, rate limiting, transport failure, or GitHub 5xx is **not** proof of revocation. It is a retryable/operationally blocked reconciliation failure and performs no authorization suspension.
+
+The implementation may exploit the fact that the token itself is requested with `repository_ids: [repositoryId]`, but must not make correctness depend on an undocumented assumption that the listing will always contain at most one row.
+
+### 5.2 Direct numeric repository lookup alternative
+
+Current official REST documentation used for #34 documents the installation repository listing and owner/name repository lookup, but does not expose a qualified singular `GET /repositories/{repository_id}` contract for this installation-token flow. #34 therefore uses the documented listing with bounded pagination.
+
+If GitHub later documents and qualifies a direct numeric-ID lookup for installation access tokens, it may replace the listing implementation without changing MASWE's stable-identity contract.
+
+## 6. Webhook normalization and durable inbox compatibility
 
 Every currently supported repository-scoped event normalized by the new binary requires and persists:
 
@@ -124,9 +193,35 @@ interface GitHubRepositoryIdentity {
 
 Identical duplicate pairs deduplicate deterministically. Duplicate numeric ID with conflicting names is malformed.
 
-Historical durable normalized repository events may lack `repositoryId` because old binaries discarded it before enqueue. Transitional readers may load those records, but dispatch must never upgrade them from name. They receive a typed permanent `legacy-repository-identity-missing` disposition, mutate nothing, and are consumed rather than retried forever.
+### 6.1 Historical ID-less durable events
 
-## 6. Local Git remote semantics
+Historical durable normalized repository events may lack `repositoryId` because old binaries discarded it before enqueue. Transitional readers may load those records, but they must never upgrade identity from name.
+
+For ordinary repository events and authority-granting signals, an ID-less legacy event receives permanent `legacy-repository-identity-missing`, mutates nothing, and is consumed rather than retried forever.
+
+### 6.2 Legacy authority-reducing removal
+
+`installation_repositories.removed` is the one name-only repository event allowed to reduce unresolved legacy authority.
+
+For a historical ID-less removal event, MASWE may select **only unresolved legacy associations** that:
+
+- have no `repositoryId`;
+- have the same `installationId`;
+- have the exact normalized legacy repository name carried by the historical event.
+
+Those unresolved associations may be marked/synchronized as `authorization-revoked`. The event must not:
+
+- assign a repository ID;
+- refresh a canonical name;
+- suspend a stable-ID association by name;
+- authorize a replacement repository with the same name;
+- clear an existing suspension.
+
+A historical ID-less `installation_repositories.added` event cannot grant or restore authority and is consumed with zero authority increase. New ID-bearing add/remove events operate by stable repository ID.
+
+This preserves the fail-closed revocation signal without allowing name-only events to establish continuity.
+
+## 7. Local Git remote semantics
 
 The local remote remains workspace provenance/candidate metadata, never repository authorization.
 
@@ -140,11 +235,11 @@ For a run with no GitHub association, existing exact current-remote + branch mat
 
 If rename happened before first association and the local remote still contains the old slug, MASWE does not infer equivalence from redirect behavior. The operator must update the remote before candidate matching.
 
-## 7. Association/index model
+## 8. Association/index model
 
 Add `repositoryId` to `RunGitHubAssociation` and `AssociationRecord`. Every newly bound association requires it. Historical persisted associations may omit it only at deserialization/migration boundaries.
 
-Operational code uses a helper equivalent to `requireStableGitHubAssociation()` and rejects unresolved legacy state.
+Operational code uses a helper equivalent to `requireStableGitHubAssociation()` and rejects unresolved legacy state before any stable repository/PR publication fence is acquired.
 
 New association key:
 
@@ -161,9 +256,17 @@ The transitional parser must reject malformed keys, key/record mismatch, duplica
 
 Normal lookup, branch lookup, and repository suspension become stable-ID based. Migration gets an explicit exact-name legacy enumeration path.
 
-## 8. Stable fences and lock order
+## 9. Stable fences, cutover, and lock order
 
-Add a repository-identity journal/fence keyed by `repositoryId`. It serializes legacy migration, canonical-name reconciliation, repository authorization suspension/recovery, and repository-scoped publication entry.
+Add a new `repository-identity` GitHub journal/fence kind keyed by `repositoryId`. The implementation must add it explicitly to:
+
+- `GitHubJournalKind`;
+- `JOURNAL_KINDS`;
+- operation/validation mappings;
+- journal initialization/recovery coverage;
+- focused journal tests and operations documentation.
+
+It serializes legacy migration, canonical-name reconciliation, repository authorization suspension/recovery, and repository-scoped publication entry.
 
 PR publication/association fences use `<repositoryId>#<pr>`.
 
@@ -176,9 +279,26 @@ repository-identity(repositoryId)
       -> association transaction / check-create lock
 ```
 
-Helpers operating under an already-held identity context must not reacquire the same journal. Concurrency tests must prove no recursive same-key acquisition/deadlock.
+Helpers operating under an already-held identity context must not reacquire the same journal.
 
-## 9. Live canonical-name reconciliation
+### 9.1 Name-key/ID-key transition window
+
+A pre-#34 name-keyed lock and a #34 ID-keyed lock are different lock identities and do not mutually exclude. Stable fences alone therefore cannot make mixed old/new binaries safe.
+
+The cutover contract is explicit:
+
+1. stop every pre-#34 `github-webhook` listener and manual GitHub publisher;
+2. start only the #34 binary;
+3. migration preflight checks affected legacy name-keyed publication/association-identity journal state and refuses while a live legacy owner is observed;
+4. the #34 binary removes name-keyed publication/association fence acquisition from operational paths in the same change that introduces stable fences;
+5. unresolved legacy associations fail before stable-ID repository-scoped operations;
+6. after migrated state/new fields are written, old binaries are unsupported and expected to fail closed on exact validation.
+
+The live-lock preflight is defense in depth; it cannot prove that an idle old process will never acquire a legacy lock later. **Operator/process quiescence of all old binaries is a hard migration precondition**, not a recommendation.
+
+Concurrency tests must include the transition case: a live legacy name-keyed publication/association lock blocks migration/new publication, and no repository mutation occurs until it is gone/recovered under the documented old-process shutdown rule.
+
+## 10. Live canonical-name reconciliation
 
 Correctness does not depend on a dedicated rename webhook. Reconciliation runs when a repository-bearing event has the correct ID but a different name, manual publication begins, migration verifies legacy state, or another repository-scoped operation requires a possibly stale route.
 
@@ -187,14 +307,14 @@ Under repository identity fence:
 1. require stable ID live-allowlisted;
 2. require expected installation;
 3. mint ID-scoped metadata token;
-4. query installation repositories;
+4. perform bounded authenticated canonical lookup from §5;
 5. require the exact requested ID and current valid `full_name`;
 6. synchronize run/index canonical name recoverably if changed;
 7. reload and re-prove stable identity before using the route.
 
 An old-name replay with the same ID can locate the same association but cannot roll the canonical name backward; live ID reconciliation decides the current name. Same text with a different ID is a permanent conflict.
 
-## 10. Pull request ownership proof
+## 11. Pull request ownership proof
 
 Any live PR read used for association, migration, or publication must prove the PR target. The helper validates state, head SHA, target/base repository ID (`base.repo.id`), base canonical name where available, and base/head refs/SHAs where callers depend on them.
 
@@ -202,7 +322,7 @@ Any live PR read used for association, migration, or publication must prove the 
 
 Migration/association proof uses the ID-scoped `pull-request-read` token. Check publication may use its already-required ID-scoped `checks` token for the same live PR read.
 
-## 11. Explicit legacy migration
+## 12. Explicit legacy migration
 
 Concrete flat CLI command:
 
@@ -212,17 +332,27 @@ maswe github-migrate-repository \
   --repository-id <positive-safe-integer>
 ```
 
-Optional `--json` may provide deterministic operator output; global `--cwd` and `--config` keep current semantics. `--from` is only a local selector for unresolved persisted records and never identity proof.
+Optional `--json` may provide deterministic operator output; global `--cwd` and `--config` keep current semantics.
 
-Migration requires GitHub App enabled, supplied ID live-allowlisted, valid legacy selector, credentials available, no Phase B writer authority, repository identity fence held, and affected installation IDs derived from persisted associations.
+`--from` is only a local selector and never identity proof. It is parsed with the same owner/repo grammar as repository metadata, normalized to lowercase before exact legacy selection, and its normalized form is used in checkpoint identity/output.
+
+Migration requires:
+
+- GitHub App enabled;
+- supplied ID live-allowlisted;
+- valid normalized legacy selector;
+- credentials available;
+- no Phase B writer authority;
+- mandatory pre-#34 process quiescence from §9.1;
+- repository identity fence held;
+- affected installation IDs derived from authoritative migration candidates rather than guessed from name.
 
 For each affected installation:
 
 1. mint metadata token scoped to supplied ID;
-2. query installation repositories;
-3. require the same ID;
-4. obtain current canonical name;
-5. require consistent stable identity across successful proofs.
+2. perform bounded canonical lookup;
+3. require the same ID/current canonical name;
+4. require consistent stable identity across successful proofs.
 
 For each selected legacy association:
 
@@ -234,9 +364,7 @@ For each selected legacy association:
 
 Stale/missing/conflicting run/index state stops migration. MASWE never chooses one persisted copy as probably correct.
 
-Operations should recommend stopping the listener for operational quiescence, but correctness is enforced by stable fences rather than operator timing alone.
-
-## 12. Migration checkpoint and crash recovery
+## 13. Migration checkpoint, candidate universe, and crash recovery
 
 Persist a bounded restart-intent/status record under GitHub authoritative state, protected by repository identity journal:
 
@@ -254,17 +382,37 @@ interface RepositoryIdentityMigrationRecord {
 
 The checkpoint is observability/restart intent, not authorization. Every invocation revalidates live config and GitHub access.
 
-No per-run completed list is required. Restart rescans authoritative run/index state and classifies each candidate as legacy, already migrated to same ID, same-ID name-refresh-needed, or conflict.
+### 13.1 Restart candidate universe
+
+No per-run completed list is required, but restart must not derive candidates only from still-legacy records because a partially migrated run would disappear from that set.
+
+On every pass, candidate universe is the union of:
+
+1. unresolved legacy run/index associations whose normalized repository equals `legacyRepository`;
+2. stable run/index associations whose `repositoryId` equals the checkpoint/supplied `repositoryId`.
+
+The distinct installation-ID proof set is re-derived from that union on every pass. Therefore a run that changes from legacy to stable during a partial migration remains in the next restart scan. The repository identity fence prevents concurrent same-repository association creation/mutation from changing this universe while one migration pass owns it.
+
+Each candidate is classified as legacy, already migrated to same ID, same-ID canonical-refresh-needed, suspended, or conflict. A stable record with the same ID but unrelated current canonical name is still part of the stable-ID proof set and must reconcile by ID, not by migration history guesswork.
+
+### 13.2 Durable write uncertainty
 
 Migration/live rename synchronization reuses current association transactions and optimistic run persistence. Known failures may use existing rollback where safe; outcome-unknown writes require re-read/reconciliation rather than blind rollback.
 
-On any atomic-write outcome unknown, re-read the run, index, checkpoint, and affected side-effect alias; continue only when the exact intended stable identity is provably on disk. Final success requires a full rescan showing no selected unresolved legacy association and run/index agreement.
+On any atomic-write outcome unknown, re-read run, index, checkpoint, and affected side-effect alias; continue only when the exact intended stable identity is provably on disk.
 
-Re-running the same completed migration is a no-op after live proof. Same selector with a different ID conflicts and mutates nothing.
+Final success requires a full candidate-universe rescan showing:
+
+- no selected unresolved legacy association remains;
+- all same-ID run/index records agree on stable identity/current canonical metadata;
+- required installation proofs succeeded;
+- any required stale-head revalidation/cancellation intent is durably represented.
+
+Re-running the same completed migration is a no-op after live proof. Same normalized selector with a different ID conflicts and mutates nothing.
 
 Immutable workflow events and immutable GitHub journals are never rewritten.
 
-## 13. SHA evidence and PR lifecycle
+## 14. SHA evidence and PR lifecycle
 
 If live head is unchanged, migration may preserve existing SHA-bound evidence because only routing metadata changed.
 
@@ -272,7 +420,7 @@ If live head differs, stable identity migration may complete but old success bec
 
 If the live PR is closed, apply existing pull-request-closed suspension under stable identity.
 
-## 14. Check idempotency and existing check ownership
+## 15. Check idempotency and existing check ownership
 
 Replace mutable key:
 
@@ -288,15 +436,25 @@ check-run:<repositoryId>/<pr>/<head>/<check>/<attempt>
 
 The derived external ID then remains stable across future renames.
 
-Baseline production publication uses attempt `1`, so #34 migrates attempt `1` for the operationally relevant heads:
+### 15.1 Legacy production attempt scope
+
+On the validated baseline, production `GitHubAppAdapter` constructs `CheckPublisher` without an attempt override and `CheckPublisher` defaults to attempt `1`. Existing non-1 values (for example the concurrency fixture using attempt `7`) are explicit test/internal seams, not a production publication path.
+
+Therefore #34 migrates only legacy production attempt `1` for operationally relevant heads:
 
 ```text
 { association.headSha } U association.pendingCancellationHeadShas
 ```
 
-For each MASWE check name:
+Before implementation is considered complete, code search/tests must prove that no production caller supplies `attempt != 1`. If a production non-1 path is introduced before #34 merges, the migration contract must be expanded and re-reviewed rather than silently leaving duplicate-check risk.
 
-1. compute legacy name-derived key/external ID and stable-ID key;
+Historical test/internal non-1 side-effect keys are intentionally not migration authority and may remain untouched. The stable key format itself retains `<attempt>` for future explicitly governed production evolution.
+
+### 15.2 Alias existing production checks
+
+For each operational head and MASWE check name:
+
+1. compute legacy name-derived attempt-1 key/external ID and stable-ID key;
 2. inspect exact legacy side-effect record if present;
 3. authenticate under stable ID/current canonical route;
 4. verify referenced GitHub check matches expected name/head/legacy external ID before mapping the same resource ID to stable local key;
@@ -306,33 +464,51 @@ For each MASWE check name:
 
 Old side-effect records remain historical recovery evidence. A second rename needs no side-effect-key migration.
 
-## 15. Permanent versus retryable dispatch failures
+## 16. Permanent versus retryable dispatch failures
 
 The current worker retries thrown dispatch failures. #34 introduces typed disposition so permanent identity/policy rejection cannot become a poison delivery.
 
-Permanent examples: missing/malformed ID, ID not live-allowlisted, same name/conflicting ID, historical event missing stable ID, run/index identity conflict, authenticated live result proving different identity.
+Permanent examples:
+
+- missing/malformed stable ID in a new normalized event;
+- ID not live-allowlisted;
+- same name/conflicting ID;
+- ordinary historical event missing stable ID;
+- run/index stable identity conflict;
+- authenticated live result positively proving different identity;
+- fully and safely exhausted installation-repository listing with target ID absent.
 
 Permanent disposition:
 
-- zero run/index/check/workflow mutation;
+- zero authority-increasing run/index/check/workflow mutation;
 - bounded safe diagnostic;
 - durable delivery consumed rather than retried;
-- no fallback to name lookup.
+- no fallback to name-based authorization.
+
+The special §6.2 legacy removal path may only reduce unresolved legacy authority.
 
 Background worker and synchronous deterministic dispatch seam use the same classification.
 
-Retryable examples remain rate limit, transient GitHub/network errors, temporary token/API failure without proven authorization loss, lock contention, and recoverable durable I/O.
+Retryable/operationally blocked examples:
 
-When authenticated GitHub state positively proves repository access was revoked, apply existing authorization-revoked suspension under stable ID. Ambiguous API failure is not proof of revocation.
+- rate limit;
+- transient GitHub/network errors;
+- temporary token/API failure without proven authorization loss;
+- pagination page-limit exhaustion;
+- malformed/unsafe pagination response;
+- lock contention;
+- recoverable durable I/O.
 
-## 16. Manual publication after rename
+When authenticated, completely traversed GitHub state positively proves repository access was revoked, apply existing authorization-revoked suspension under stable ID. Ambiguous API/pagination failure is not proof of revocation.
+
+## 17. Manual publication after rename
 
 `github-publish-checks` becomes:
 
 1. load run and require stable association;
 2. require stable ID live-allowlisted;
 3. acquire stable repository/PR fences;
-4. reconcile canonical name with metadata token;
+4. reconcile canonical name through bounded metadata lookup;
 5. reload/re-prove run/index identity;
 6. mint checks token scoped by repository ID;
 7. read live PR and require `base.repo.id === repositoryId`;
@@ -341,7 +517,7 @@ When authenticated GitHub state positively proves repository access was revoked,
 
 Redirect behavior is never accepted as identity proof.
 
-## 17. Security properties
+## 18. Security properties
 
 #34 must prove that:
 
@@ -351,37 +527,54 @@ Redirect behavior is never accepted as identity proof.
 - credential scope is numeric-ID based;
 - future GitHub writes have a stable repository authority anchor;
 - stale SHA evidence remains independent from repository identity migration;
-- installation removal remains fail-closed;
+- installation/removal signals remain fail-closed without allowing name-based grants;
 - local Git remote remains candidate/provenance metadata only;
-- immutable history cannot be edited to manufacture continuity.
+- immutable history cannot be edited to manufacture continuity;
+- mixed pre-#34/#34 writers are excluded by hard quiescent cutover plus exact-validation downgrade failure.
 
 A signed webhook authenticates transport. It never overrides stable allowlist, association, installation, PR target repository ID, PR number, or SHA evidence.
 
-## 18. Required regression matrix
+## 19. Required regression matrix
 
-Extend existing normalization, remote-match, association, suspension, authoritative-state, concurrency, adapter-integration, check, and #28 reconciliation suites.
+Extend existing normalization, remote-match, association, suspension, authoritative-state, concurrency, adapter-integration, check, journal, config, and #28 reconciliation suites.
 
-### Normalization/inbox
+### 19.1 Normalization/inbox
 
 - every new repository event persists positive ID + name;
 - installation repository changes preserve ID/name pairs;
 - malformed IDs fail;
 - identical pairs dedupe; same ID/conflicting name fails;
-- historical event missing ID permanently rejects with zero mutation;
+- ordinary historical event missing ID permanently rejects with zero mutation;
+- legacy removal may suspend only unresolved same-installation/name legacy associations;
+- legacy removal cannot touch stable-ID associations;
+- legacy add cannot grant/restore authority;
 - delivery replay semantics remain unchanged.
 
-### Config/authorization
+### 19.2 Config/authorization
 
+- current baseline name-only enabled config remains loadable;
+- ID-only enabled config becomes valid;
+- enabled config with both allowlists empty is invalid;
 - stable allowlist accepts only unique positive safe integers;
 - malformed/duplicate IDs fail;
-- legacy name-only config remains loadable;
-- signed ingress can remain durable while repository-scoped dispatch is blocked;
-- name-only config cannot authorize mutation/publication;
+- name-only config cannot authorize repository mutation/publication/token scope;
 - allowed old name + unauthorized ID fails;
 - authorized ID + changed name succeeds after live reconciliation;
-- Phase A `readOnlyChecks` stays intact.
+- Phase A `readOnlyChecks` stays intact;
+- pre-#34 binary downgrade against migrated config/association state fails closed.
 
-### Token scope
+### 19.3 Canonical lookup/pagination
+
+- repository on page 1 succeeds;
+- repository on page 2+ succeeds;
+- `per_page=100` is used;
+- valid terminal exhaustion without target is positive no-access;
+- page-limit exhaustion is retryable/not revocation;
+- malformed/unsafe next URL, duplicate next rel, loop, wrong origin/path/query are rejected without suspension;
+- transient API/rate-limit failure is not revocation;
+- duplicate ID/conflicting full names across pages fail closed.
+
+### 19.4 Token scope
 
 - all restricted token requests use `repository_ids`, never repository names;
 - metadata token has only metadata read;
@@ -389,14 +582,14 @@ Extend existing normalization, remote-match, association, suspension, authoritat
 - checks token retains only current Phase A permissions;
 - no name fallback occurs.
 
-### Remote/first association
+### 19.5 Remote/first association
 
 - stable-associated run survives rename with stale `workspace.remote`;
 - unassociated current-remote + branch binds only after allowlist/live PR base-ID proof;
 - stale old remote does not auto-associate through redirect;
 - same text remote cannot authorize another repository ID.
 
-### Association/index
+### 19.6 Association/index
 
 - key is `<repositoryId>#<pr>`;
 - same ID/new name resolves same run;
@@ -406,35 +599,46 @@ Extend existing normalization, remote-match, association, suspension, authoritat
 - duplicate stable PR/run identity rejected;
 - branch lookup/repository suspension by ID.
 
-### PR ownership
+### 19.7 PR ownership
 
 - matching `base.repo.id` succeeds;
 - different/missing base repo ID fails;
 - fork PR with different `head.repo.id` remains valid when base matches.
 
-### Migration/crash recovery
+### 19.8 Migration/crash recovery
 
 Inject failure before checkpoint; after checkpoint; after run mutation before index; after index before checkpoint refresh; during stable check alias; after all associations stable before completion; and outcome-unknown for run/index/checkpoint/side-effect alias. Restart must finish idempotently or fail closed on a concrete conflict.
 
-Also prove completed rerun no-op, selector/different-ID conflict, stale/missing run/index failure, authorization loss, and another same-ID rename during restart.
+Also prove:
 
-### SHA/PR lifecycle
+- completed rerun no-op;
+- `--from Owner/Repo` normalizes to lowercase selector;
+- normalized selector/different-ID conflict;
+- stale/missing run/index failure;
+- authorization loss;
+- another same-ID rename during restart;
+- candidate universe includes already-migrated same-ID records after partial progress;
+- affected installation proof set remains complete after partial mutation.
+
+### 19.9 SHA/PR lifecycle
 
 - unchanged head preserves valid evidence;
 - changed head enters #28 revalidation;
 - closed PR receives closure suspension;
 - PR base repository mismatch fails migration.
 
-### Check ownership
+### 19.10 Check ownership/attempt scope
 
-- pre-rename check maps to same resource under stable key;
+- production adapter constructs attempt-1 publication only;
+- pre-rename production check maps to same resource under stable key;
 - no duplicate on first post-rename publication;
 - wrong head/name/external ownership rejected;
 - multiple legacy external-ID matches conflict;
 - current + pending-cancellation heads reconciled;
-- second rename needs no side-effect migration.
+- second rename needs no side-effect migration;
+- explicit non-1 test/internal keys are not treated as production migration authority.
 
-### Concurrency
+### 19.11 Concurrency/cutover
 
 - webhook reconciliation vs migration;
 - manual publication vs migration;
@@ -442,79 +646,92 @@ Also prove completed rerun no-op, selector/different-ID conflict, stale/missing 
 - canonical reconciliation vs publication;
 - same-ID migrations serialize;
 - conflicting migrations fail deterministically;
-- no recursive same-key lock/deadlock.
+- no recursive same-key lock/deadlock;
+- live pre-#34 name-keyed publication/association lock blocks cutover/migration;
+- new binary does not acquire name-keyed operational fences;
+- unresolved legacy state cannot enter stable publication while migration owns the repository ID fence.
 
-### Worker disposition
+### 19.12 Worker disposition
 
-- permanent identity error consumes delivery with zero mutation/no retry loop;
-- transient GitHub failure retries;
+- permanent identity error consumes delivery with zero authority-increasing mutation/no retry loop;
+- transient GitHub/pagination failure retries;
 - synchronous path uses same classification;
 - diagnostic callback cannot alter durable disposition;
 - completion failure after permanent reject follows existing completion recovery;
 - poison legacy event cannot starve unrelated queue items.
 
-## 19. Contract/document synchronization
+## 20. Contract/document synchronization
 
 Implementation must synchronize at minimum:
 
-- domain/config and config validation;
-- CLI grammar/dispatch/help;
-- config and run-record schemas;
+- `src/domain.ts` and `src/config.ts`;
+- `src/cli-args.ts` plus CLI dispatch/help;
+- `schemas/config.schema.json` and `schemas/run-record.schema.json`;
 - GitHub types/normalization/durable inbox compatibility;
-- token creation;
+- token creation and token-purpose permissions;
+- authenticated repository-list pagination helper;
 - adapter identity helpers;
 - association/index;
 - adapter routing/publication;
 - checks/side-effect ownership;
-- GitHub journals/worker diagnostics;
+- `src/github/journal.ts`, including `GitHubJournalKind`, `JOURNAL_KINDS`, operation mappings, initialization, and recovery;
+- worker diagnostics/disposition;
 - migration/checkpoint modules;
-- affected focused/integration tests including remote-match;
+- affected focused/integration tests including remote-match and journal cutover;
 - `docs/GITHUB_APP.md`, `docs/OPERATIONS.md`, `docs/SECURITY.md`, `docs/ARCHITECTURE.md`, and `CHANGELOG.md`.
 
 Historical Superpowers specs/plans remain historical evidence. Issue #3 must be updated so #34 completion is an explicit Phase B entry gate before write authority is enabled.
 
-## 20. Non-goals
+## 21. Non-goals
 
 #34 does not implement Phase B approvals/pushes/PR writes/replies/Actions artifacts, automatic merge, workflow redesign, MH-01/MH-02, PostgreSQL, general owner/account migration, local Git remote rewriting, or #33 identity wording cleanup.
 
 Repository URLs, redirects, remotes, branch names, PR SHAs, and check resources are never substitutes for repository ID. Immutable workflow events/GitHub journals and historical run config snapshots are not rewritten to manufacture identity history.
 
-## 21. Implementation sequencing constraints
+#34 also does not promise backward compatibility with a pre-#34 binary after stable-ID state has been written.
+
+## 22. Implementation sequencing constraints
 
 A future plan should preserve this order:
 
-1. failing normalization/config/token/PR-ownership tests;
-2. stable domain/config/schema primitives preserving legacy reads;
-3. ID-scoped least-privilege token purposes;
+1. failing config compatibility/normalization/token/PR-ownership/pagination tests;
+2. stable domain/config/schema primitives preserving legacy reads while adding the explicit at-least-one-allowlist enabled rule;
+3. ID-scoped least-privilege token purposes plus bounded installation-repository pagination;
 4. stable association/index APIs and transitional parser;
-5. stable fences plus permanent/retryable dispatch classification;
+5. stable journal kinds/fences plus hard mixed-binary cutover preflight and permanent/retryable dispatch classification;
 6. canonical reconciliation plus PR base-ID proof;
-7. stable check idempotency plus legacy attempt-1 ownership aliasing;
-8. explicit restartable migration command/checkpoint;
-9. #28 stale-head plus installation-suspension integration;
-10. documentation plus #3 Phase B gate synchronization;
-11. exact supported-baseline validation and independent review.
+7. authority-reducing legacy repository-removal handling;
+8. stable check idempotency plus legacy production-attempt-1 ownership aliasing;
+9. explicit restartable migration command/checkpoint with union candidate-universe scanning;
+10. #28 stale-head plus installation-suspension integration;
+11. documentation plus #3 Phase B gate synchronization;
+12. exact supported-baseline validation and independent review.
 
 Work test-first. Never temporarily authorize by name to make migration tests pass.
 
-## 22. Completion gate
+## 23. Completion gate
 
 Issue #34 is complete only when:
 
 - [ ] stable numeric repository ID is authoritative in normalized events, associations, index, authorization, token scope, locks, and side-effect ownership;
 - [ ] canonical name can change without breaking an existing stable association;
 - [ ] `allowedRepositoryIds` is the operational authorization source;
-- [ ] name-only config cannot authorize repository-scoped operations or Phase B writes;
+- [ ] current name-only config and target ID-only config both load under the explicit enabled validation rule, while name-only config cannot authorize repository-scoped operations or Phase B writes;
 - [ ] legacy associations migrate explicitly without manual state editing;
+- [ ] authenticated canonical lookup handles pagination safely and distinguishes complete absence from ambiguous/incomplete traversal;
 - [ ] stale unassociated remotes never become redirect-based identity proof;
 - [ ] live PR target ownership is base-repository-ID bound and fork PRs remain valid;
 - [ ] migration is idempotent/crash-recoverable under injected durable uncertainty;
-- [ ] old-name replay, new-name delivery, conflicting ID, missing-ID legacy delivery, stale association, installation removal, and check ownership are covered;
-- [ ] unknown/conflicting identity causes zero workflow/GitHub mutation;
+- [ ] restart candidate-universe/installation proofs remain complete after partial migration;
+- [ ] old-name replay, new-name delivery, conflicting ID, missing-ID legacy delivery, legacy repository removal, stale association, installation removal, and check ownership are covered;
+- [ ] unknown/conflicting identity causes zero authority-increasing workflow/GitHub mutation;
 - [ ] permanent identity failures do not poison the durable retry queue;
+- [ ] ambiguous pagination/API failure never becomes authorization-revoked evidence;
+- [ ] mixed pre-#34/#34 GitHub writers are excluded by hard quiescent cutover and live legacy-lock preflight;
+- [ ] downgrade below #34 is documented unsupported and fails closed after new state is written;
 - [ ] unchanged head preserves valid SHA evidence and changed head enters #28 revalidation;
-- [ ] existing checks reconcile without duplicate post-rename creation;
-- [ ] active contracts/docs/changelog are synchronized;
+- [ ] existing production attempt-1 checks reconcile without duplicate post-rename creation and no production non-1 legacy attempt path exists;
+- [ ] active contracts/docs/changelog are synchronized, including explicit `repository-identity` journal-kind registration;
 - [ ] #3 lists #34 as explicit Phase B entry gate;
 - [ ] `npm run check` passes on exact Node `24.18.0` and `22.22.2`;
 - [ ] `npm run pack:dry` passes on both supported baselines as required by repository policy;
@@ -524,13 +741,12 @@ Issue #34 is complete only when:
 - [ ] substantive review threads are resolved or owner-dispositioned;
 - [ ] post-merge `main` CI is revalidated before #3 Phase B begins.
 
-## 23. External GitHub references
+## 24. External GitHub references
 
 Official GitHub documentation used to validate external assumptions:
 
-- **Generating an installation access token for a GitHub App** — tokens may be restricted by `repository_ids` and permissions may be reduced.
-- **Create an installation access token for an app** — documents `repository_ids`, metadata, and pull-request permissions.
-- **List repositories accessible to the app installation** — `GET /installation/repositories` supports GitHub App installation tokens.
+- **Generating/Create an installation access token for a GitHub App** — tokens may be restricted by `repository_ids` and permissions may be reduced.
+- **List repositories accessible to the app installation** — `GET /installation/repositories` supports GitHub App installation tokens and is paginated (`per_page` max 100, default 30).
 - **Get a pull request** — installation tokens can read PRs with suitable read permission and PR objects expose base/head repository information.
 - **Webhook events and payloads** — repository-scoped payloads contain repository objects; #34 requires their stable numeric IDs during normalization.
 
