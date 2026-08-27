@@ -488,16 +488,19 @@ Old side-effect records remain historical recovery evidence. A second rename nee
 
 The current worker retries thrown dispatch failures. #34 introduces typed disposition so permanent identity/policy rejection cannot become a poison delivery.
 
-Permanent examples:
+Permanent dispatch examples:
 
-- missing/malformed stable ID in a new normalized event;
 - ID not live-allowlisted;
 - stable authorization not configured because the operator violated §9.1 cutover ordering;
 - same name/conflicting ID;
 - ordinary historical event missing stable ID;
 - run/index stable identity conflict;
 - authenticated live result positively proving different identity;
-- fully and safely exhausted installation-repository listing with target ID absent.
+- fully and safely exhausted installation-repository listing with target ID absent **when no existing association can be authority-reduced**; this uses permanent reason `repository-access-revoked`.
+
+Missing/malformed `repository.id` in a **new** webhook payload is rejected during normalization before durable enqueue (HTTP 400 through the existing request-preparation path). It is not a worker permanent disposition and does not increment `permanentRepositoryDropsSinceStart`.
+
+A fully and safely exhausted installation-repository listing with the target ID absent is positive authorization-loss evidence. If an existing association is successfully suspended/reconciled as `authorization-revoked`, dispatch returns `applied`: an allowed authority-reducing mutation occurred, the delivery completes normally, and the permanent-drop counter does **not** increment. If no existing association can be acted on, dispatch returns permanent `repository-access-revoked`; that delivery is consumed and counted only after durable completion.
 
 Permanent disposition:
 
@@ -522,7 +525,7 @@ Retryable/operationally blocked examples:
 - lock contention;
 - recoverable durable I/O.
 
-When authenticated, completely traversed GitHub state positively proves repository access was revoked, apply existing authorization-revoked suspension under stable ID. Ambiguous API/pagination failure is not proof of revocation.
+When authenticated, completely traversed GitHub state positively proves repository access was revoked, apply existing authorization-revoked suspension under stable ID when an affected association exists. Ambiguous API/pagination failure is not proof of revocation.
 
 ## 17. Manual publication after rename
 
@@ -566,7 +569,7 @@ Extend existing normalization, remote-match, association, suspension, authoritat
 
 - every new repository event persists positive ID + name;
 - installation repository changes preserve ID/name pairs;
-- malformed IDs fail;
+- malformed IDs fail before durable enqueue;
 - identical pairs dedupe; same ID/conflicting name fails;
 - ordinary historical event missing ID permanently rejects with zero mutation;
 - legacy removal may suspend only unresolved same-installation/name legacy associations;
@@ -682,7 +685,10 @@ Also prove:
 
 ### 19.12 Worker disposition and maintenance observability
 
+- malformed/missing stable ID in a new payload is rejected before durable enqueue and does not increment the permanent-drop counter;
 - permanent identity error consumes delivery with zero authority-increasing mutation/no retry loop;
+- fully traversed authenticated absence with an existing affected association applies `authorization-revoked`, returns `applied`, and does not increment the permanent-drop counter;
+- fully traversed authenticated absence with no association to reduce consumes a permanent `repository-access-revoked` delivery and increments the counter only after durable completion;
 - transient GitHub/pagination failure retries;
 - synchronous path uses same classification;
 - diagnostic callback cannot alter durable disposition;
@@ -761,6 +767,8 @@ Issue #34 is complete only when:
 - [ ] §6.2 legacy authority reduction is serialized only by `run target fence -> global association transaction` and never acquires a name-keyed repository fence;
 - [ ] unknown/conflicting identity causes zero authority-increasing workflow/GitHub mutation;
 - [ ] permanent identity failures do not poison the durable retry queue and emit bounded reason-coded drop observability;
+- [ ] clean authenticated access loss reduces an existing association as an applied `authorization-revoked` mutation, while unassociated proven loss is permanently consumed as `repository-access-revoked`;
+- [ ] malformed/missing stable IDs in new payloads are rejected before durable enqueue and never counted as permanent worker drops;
 - [ ] ambiguous pagination/API failure never becomes authorization-revoked evidence;
 - [ ] mixed pre-#34/#34 GitHub writers are excluded by hard quiescent cutover plus read-only live legacy-lock preflight;
 - [ ] downgrade below #34 is documented unsupported and frozen pre-#34 validators reject migrated golden fixtures;
