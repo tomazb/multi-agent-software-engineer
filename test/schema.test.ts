@@ -162,6 +162,12 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
         `${label} maxItems`,
       );
     }
+    if (effective.uniqueItems) {
+      const items = value as unknown[];
+      // Structural identity, matching JSON Schema equality for the JSON values these schemas hold.
+      const distinct = new Set(items.map((item) => JSON.stringify(item) ?? "undefined"));
+      assert.equal(distinct.size, items.length, `${label} uniqueItems`);
+    }
     if (effective.items) {
       for (const [index, item] of (value as unknown[]).entries()) {
         assertMatches(root, effective.items, item, `${label}[${index}]`);
@@ -240,6 +246,25 @@ test("schema assertion enforces dependent required object properties", () => {
     () => assertMatches(schema, schema, { suspensionReason: "closed" }, "github"),
     /github\.suspended dependentRequired/,
   );
+});
+
+test("schema assertion enforces uniqueItems", () => {
+  const schema: JsonSchema = {
+    type: "array",
+    uniqueItems: true,
+    items: { type: "integer" },
+  };
+
+  assert.doesNotThrow(() => assertMatches(schema, schema, [1, 2], "ids"));
+  assert.doesNotThrow(() => assertMatches(schema, schema, [], "ids"));
+  assert.throws(() => assertMatches(schema, schema, [1, 1], "ids"), /ids uniqueItems/);
+
+  const objects: JsonSchema = { type: "array", uniqueItems: true };
+  assert.throws(
+    () => assertMatches(objects, objects, [{ a: 1 }, { a: 1 }], "records"),
+    /records uniqueItems/,
+  );
+  assert.doesNotThrow(() => assertMatches(objects, objects, [{ a: 1 }, { a: 2 }], "records"));
 });
 
 test("schema evaluator propagates non-assertion errors from if and not", () => {
@@ -348,6 +373,17 @@ test("config schema constrains the stable repository allowlist to unique positiv
   assert.equal(ids?.items?.type, "integer");
   assert.equal(ids?.items?.minimum, 1);
   assert.equal(ids?.items?.maximum, Number.MAX_SAFE_INTEGER);
+
+  assert.throws(
+    () =>
+      assertMatches(
+        schema,
+        schema,
+        configWithGitHubApp({ allowedRepositoryIds: [1308655205, 1308655205] }),
+        "config.githubApp.duplicate-ids",
+      ),
+    /allowedRepositoryIds uniqueItems/,
+  );
 
   for (const invalid of [[0], [-1], [1.5], [Number.MAX_SAFE_INTEGER + 2]]) {
     assert.throws(

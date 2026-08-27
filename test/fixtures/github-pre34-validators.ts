@@ -13,7 +13,12 @@
  * - NEVER edit these to track new behaviour. If #34 changes production validation, this file
  *   must stay exactly as the old binary behaved; otherwise the downgrade evidence is worthless.
  * - NEVER import this file from production code. It must never become a parsing path.
- * - Rejected input returns `false` rather than throwing, so callers assert on a boolean.
+ * - Rejected input returns `false` (or, for `pre34GitHubConfigRejection`, the frozen validator's
+ *   own error message) rather than throwing, so callers assert on a plain value.
+ *
+ * In particular: do NOT add `allowedRepositoryIds` to `PRE34_GITHUB_APP_FIELDS`. That single edit
+ * makes a pre-#34 binary silently ACCEPT migrated stable-identity config. The downgrade tests pin
+ * the rejection reason precisely so that such an edit fails loudly instead of passing vacuously.
  */
 
 /** Frozen pre-#34 shape of the normalized GitHub App config. */
@@ -124,16 +129,28 @@ function pre34AssertGitHubAppConfig(githubApp: Pre34GitHubAppConfig | undefined)
 }
 
 /**
- * Would a pre-#34 binary accept this normalized `githubApp` configuration object?
+ * Why would a pre-#34 binary reject this normalized `githubApp` configuration object?
+ * Returns the frozen validator's own error message, or `undefined` when it would accept.
+ *
+ * This only *observes* the frozen rules: it catches the error they already throw and never alters
+ * their control flow or ordering. Downgrade tests use it to pin WHICH pre-#34 rule fired, so that a
+ * future "sync" of the frozen field list cannot silently hollow out the evidence.
  */
-export function pre34AcceptsGitHubConfig(raw: Record<string, unknown>): boolean {
+export function pre34GitHubConfigRejection(raw: Record<string, unknown>): string | undefined {
   try {
     pre34ExactObject(raw, "githubApp", PRE34_GITHUB_APP_FIELDS);
     pre34AssertGitHubAppConfig(raw as unknown as Pre34GitHubAppConfig);
-    return true;
-  } catch {
-    return false;
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
   }
+}
+
+/**
+ * Would a pre-#34 binary accept this normalized `githubApp` configuration object?
+ */
+export function pre34AcceptsGitHubConfig(raw: Record<string, unknown>): boolean {
+  return pre34GitHubConfigRejection(raw) === undefined;
 }
 
 /** Frozen copy of the pre-#34 name-based association key. */
