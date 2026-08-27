@@ -26,7 +26,9 @@ export interface GitHubAppConfig {
   webhookSecretEnv: string;
   appIdEnv: string;
   privateKeyEnv: string;
-  /** Empty deny-all when enabled; must contain at least one owner/repo. */
+  /** Authoritative stable repository allowlist; unique positive safe integers. */
+  allowedRepositoryIds: number[];
+  /** Legacy selector/display only; an enabled config needs at least one non-empty allowlist. */
   allowedRepositories: string[];
   webhookHost?: string;
   webhookPort?: number;
@@ -34,6 +36,7 @@ export interface GitHubAppConfig {
 
 export interface RunGitHubAssociation {
   installationId: number;
+  repositoryId?: number; // legacy-read boundary only
   repository: string;
   pullRequestNumber: number;
   baseSha: string;
@@ -44,6 +47,9 @@ export interface RunGitHubAssociation {
   /** Old heads whose published checks must be cancelled before this publication is complete. */
   pendingCancellationHeadShas?: string[];
 }
+
+/** A run association whose stable repository identity is already resolved. */
+export type StableRunGitHubAssociation = RunGitHubAssociation & { repositoryId: number };
 
 export interface MasweConfig {
   version: 1;

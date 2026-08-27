@@ -13,6 +13,7 @@ type JsonSchema = {
   $ref?: string;
   $defs?: Record<string, JsonSchema>;
   allOf?: JsonSchema[];
+  anyOf?: JsonSchema[];
   if?: JsonSchema;
   then?: JsonSchema;
   required?: string[];
@@ -25,6 +26,7 @@ type JsonSchema = {
   minLength?: number;
   maxLength?: number;
   minItems?: number;
+  uniqueItems?: boolean;
   maxItems?: number;
   pattern?: string;
   enum?: unknown[];
@@ -65,6 +67,19 @@ function assertMatches(root: JsonSchema, schema: JsonSchema, value: unknown, lab
     if (conditionMatches) {
       assertMatches(root, effective.then, value, `${label}.then`);
     }
+  }
+  if (effective.anyOf) {
+    let branchMatches = false;
+    for (const branch of effective.anyOf) {
+      try {
+        assertMatches(root, branch, value, `${label}.anyOf`);
+        branchMatches = true;
+        break;
+      } catch (error) {
+        if (!(error instanceof AssertionError)) throw error;
+      }
+    }
+    assert.ok(branchMatches, `${label} anyOf`);
   }
   if (effective.not) {
     let forbiddenMatches = true;
@@ -193,6 +208,7 @@ function configWithGitHubApp(
     webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
     appIdEnv: "MASWE_GITHUB_APP_ID",
     privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+    allowedRepositoryIds: [],
     allowedRepositories: ["owner/repo"],
     ...overrides,
   };
@@ -296,14 +312,56 @@ test("config schema rejects enabled GitHub App write mode", async () => {
   );
 });
 
-test("config schema rejects an enabled GitHub App with an empty allowlist", async () => {
+test("config schema rejects an enabled GitHub App with both allowlists empty", async () => {
   const schema = await loadConfigSchema();
-  const config = configWithGitHubApp({ allowedRepositories: [] });
+  const config = configWithGitHubApp({ allowedRepositoryIds: [], allowedRepositories: [] });
 
   assert.throws(
     () => assertMatches(schema, schema, config, "config.githubApp.empty-allowlist"),
-    /minItems/,
+    /anyOf/,
   );
+});
+
+test("config schema accepts an enabled GitHub App allowlisted only by stable id", async () => {
+  const schema = await loadConfigSchema();
+  const config = configWithGitHubApp({
+    allowedRepositoryIds: [1308655205],
+    allowedRepositories: [],
+  });
+
+  assert.doesNotThrow(() =>
+    assertMatches(schema, schema, config, "config.githubApp.stable-id-only"),
+  );
+});
+
+test("config schema constrains the stable repository allowlist to unique positive safe integers", async () => {
+  const schema = await loadConfigSchema();
+  const githubApp = schema.properties?.githubApp;
+
+  assert.ok(
+    githubApp?.required?.includes("allowedRepositoryIds"),
+    "normalized config must require githubApp.allowedRepositoryIds",
+  );
+  const ids = githubApp?.properties?.allowedRepositoryIds;
+  assert.equal(ids?.type, "array");
+  assert.equal(ids?.uniqueItems, true);
+  assert.equal(ids?.items?.type, "integer");
+  assert.equal(ids?.items?.minimum, 1);
+  assert.equal(ids?.items?.maximum, Number.MAX_SAFE_INTEGER);
+
+  for (const invalid of [[0], [-1], [1.5], [Number.MAX_SAFE_INTEGER + 2]]) {
+    assert.throws(
+      () =>
+        assertMatches(
+          schema,
+          schema,
+          configWithGitHubApp({ allowedRepositoryIds: invalid }),
+          "config.githubApp.allowedRepositoryIds",
+        ),
+      /allowedRepositoryIds/,
+      JSON.stringify(invalid),
+    );
+  }
 });
 
 test("config schema accepts an enabled read-only GitHub App with an allowed repository", async () => {
@@ -931,6 +989,62 @@ test("run migration rejects unsupported and malformed GitHub association fields"
   delete (run.github as unknown as Record<string, unknown>).token;
   (run.github as unknown as Record<string, unknown>).repository = "not-a-repository";
   assert.throws(() => migrateRunRecord(run), /github\.repository/i);
+});
+
+test("run records carry an optional stable GitHub repository id", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  assert.equal(schema.properties?.github?.required?.includes("repositoryId"), false);
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-repository-id-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const store = new FileRunStore(cwd);
+  const run = await store.create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+
+  // Legacy associations persisted before stable identity must still load.
+  assert.doesNotThrow(() => assertMatches(schema, schema, run, "run"));
+  assert.equal(migrateRunRecord(run).github?.repositoryId, undefined);
+
+  run.github.repositoryId = 1308655205;
+  assert.doesNotThrow(() => assertMatches(schema, schema, run, "run"));
+  await store.save(run);
+  const reloaded = await store.load(run.id);
+  assert.equal(reloaded.github?.repositoryId, 1308655205);
+});
+
+test("run migration and schema reject malformed stable GitHub repository ids", async (t) => {
+  const schema = JSON.parse(
+    await readFile(path.join(process.cwd(), "schemas/run-record.schema.json"), "utf8"),
+  ) as JsonSchema;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-schema-github-repository-id-invalid-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const run = await new FileRunStore(cwd).create("schema", "check", DEFAULT_CONFIG);
+  run.github = {
+    installationId: 1,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+
+  for (const repositoryId of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 2, "1308655205"]) {
+    (run.github as unknown as Record<string, unknown>).repositoryId = repositoryId;
+    assert.throws(
+      () => assertMatches(schema, schema, run, "run"),
+      /repositoryId/,
+      JSON.stringify(repositoryId),
+    );
+    assert.throws(() => migrateRunRecord(run), /repositoryId/, JSON.stringify(repositoryId));
+  }
 });
 
 test("run migration and schema reject whitespace-only GitHub identity fields", async (t) => {
