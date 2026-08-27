@@ -364,7 +364,7 @@ git commit -m "feat: add repository-id scoped GitHub credentials"
 
 - [ ] **Step 2: Write failing mixed-parser tests.** Accept exact legacy `<owner/repo>#<pr>` without ID and exact stable `<id>#<pr>` with ID in one file. Reject malformed key/record pairs, duplicate stable PR identity, duplicate active run ID, inconsistent stable/legacy claims, unknown fields, malformed IDs/timestamps.
 
-- [ ] **Step 3: Add concrete stable/legacy transaction types alongside the current generic methods.**
+- [ ] **Step 3: Add concrete stable/legacy transaction types alongside the current generic methods.** `AssociationBindInput` is the existing module-private baseline alias in `association.ts`; retain that exact name and shape for the transitional generic `bind()` through Task 10 rather than introducing a new alias.
 
 ```ts
 export type SuspensionReason = "pull-request-closed" | "authorization-revoked";
@@ -380,7 +380,7 @@ export type StableAssociationBindInput = Omit<
 export interface GitHubAssociationTransaction {
   // Transitional baseline methods retained through Task 10:
   find(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
-  bind(input: LegacyAssociationBindInput): AssociationRecord;
+  bind(input: AssociationBindInput): AssociationRecord;
   suspend(repository: string, pullRequestNumber: number, reason: SuspensionReason): AssociationRecord | undefined;
 
   // New explicit APIs:
@@ -743,10 +743,10 @@ All stable repository operations in the adapter require/use `repositoryTokenProv
 - [ ] **Step 11: Assert no adapter use of ambiguous association APIs.** Run:
 
 ```bash
-git grep -n "associations\.find(\|associations\.bind(\|associations\.suspend(\|findAllByRepositoryBranch" -- src/github/adapter.ts
+git grep -n -E "(associations|transaction)\.(find|bind|suspend)\(|findAllByRepositoryBranch" -- src/github/adapter.ts
 ```
 
-Expected: no generic name-primary operational calls; stable/legacy methods are explicit.
+Expected: no generic name-primary operational calls on either the index or in-transaction surface; stable/legacy methods are explicit.
 
 - [ ] **Step 12: Run GREEN/typecheck.**
 
@@ -1232,6 +1232,8 @@ Expected: all pass.
 - [ ] Round-4 C3 is explicit: `GitHubPermanentRepositoryDropDiagnostic` plus `onPermanentRejectCompleted` names the diagnostic/counter mechanism.
 - [ ] Round-4 C4 is explicit: shared pagination preserves existing check error substrings and passes `check_name` as a required string query, with only `page` as optional positive integer.
 - [ ] Round-4 C5 is explicit: migration inspects pre-#34 lock keys built from normalized legacy selector + PR number, never the reconciled canonical name.
+- [ ] Round-5 D1 is explicit: the Task 8 boundary grep checks generic calls on both `associations.*` and `transaction.*` surfaces.
+- [ ] Round-5 D2 is explicit: the transitional generic `bind()` uses the existing baseline `AssociationBindInput` alias; no undefined plan-only alias exists.
 - [ ] Shared run/index mutation is a dedicated module; migration does not call private adapter helpers or duplicate rollback rules.
 - [ ] Stable token provider is explicitly `(installationId, repositoryId, purpose)`; the old name-scoped helper/constructor form is deleted in Task 11.
 - [ ] Stable association input/reason types are named; ambiguous generic name-primary methods are deleted in Task 11.
