@@ -6,37 +6,42 @@
 
 ## Status
 
-- Version: 0.2 local hardening
-- Date: 2026-07-22
+- Current implementation: v0.2 local hardening plus GitHub App Phase A
+- Planned architecture: MH-00 capability-negotiated multi-harness execution
+- MH-00 BASE_SHA: `23f06f3900598443dc40c65c35336aecda76ea2f`
+- Date: 2026-08-26
 - Owner: repository maintainer
 - Intended first users: individual software engineers and small teams using Cursor and GitHub
 
 ## Executive summary
 
-MASWE is a durable orchestration layer for software development performed by multiple specialized coding models. It assigns discovery, specification, implementation, verification, and pull-request resolution to separate roles while deterministic software owns state transitions, approvals, quality commands, permissions, retry limits, and audit records.
+MASWE is a durable orchestration layer for software development performed by multiple specialized coding models. It assigns discovery, specification, implementation, verification, and pull-request resolution to separate roles while deterministic software owns state transitions, approvals, quality commands, permissions, retry limits, workspace/Git authority, and audit records.
 
-The first usable release is a local TypeScript CLI with Cursor CLI and Cursor SDK runtime adapters. The long-term product adds a GitHub App, remote control plane, durable database, and team policy administration without changing the role or artifact contracts.
+The current usable release is a local TypeScript CLI with Cursor CLI and Cursor SDK runtime adapters plus a read-only GitHub App pilot. The long-term product adds authenticated GitHub workflow integration, capability-negotiated external harnesses, a remote control plane, durable database, and team policy administration without transferring workflow authority to models or harnesses.
 
-The current implementation is Cursor-first and supports only the `mock`, `cursor-cli`, and
-`cursor-sdk` runtime kinds. Multi-harness execution is an approved future direction under Issues
-`#31` and `#32`. External harness adapters are not implemented.
+The current implementation supports only the `mock`, `cursor-cli`, and `cursor-sdk` runtime kinds.
+MH-00 / Issue #32 makes the owner-approved multi-harness direction normative planned architecture:
+future execution is routed by exact capabilities and assurance evidence, not by harness-name
+assumptions. External harness adapters are not implemented by MH-00.
 
 ## Problem statement
 
-Coding agents are effective at isolated tasks but production software delivery has failure modes that a single conversation does not reliably control:
+Coding agents are effective at isolated tasks but production software delivery has failure modes that a single conversation or opaque harness does not reliably control:
 
 1. The model starts implementing before the problem and acceptance criteria are clear.
 2. Long conversations accumulate assumptions, stale context, and self-confirming reasoning.
 3. The same model that built a change verifies its own claims.
-4. A provider or editor can silently use a different model than the one selected.
+4. A provider, editor, or harness can silently use a different model, profile, or transport than the one selected.
 5. PR comments can expand scope, change requirements, or cause unrelated edits.
 6. Test, build, and merge readiness can be asserted without reproducible evidence.
-7. A multi-day workflow cannot depend on one editor tab remaining alive.
-8. Teams lack a durable record of who approved what, which model acted, and which code state was verified.
+7. A multi-day workflow cannot depend on one editor tab or harness session remaining alive.
+8. Teams lack a durable record of who approved what, which harness/model/profile acted, and which code state was verified.
+9. Harness-native approvals, retries, workflows, worktrees, memory, and subagents can accidentally become a second unrecorded control plane.
+10. A product invoked transitively behind another harness can be misidentified as an equivalent direct adapter, weakening provenance and independence claims.
 
 ## Product vision
 
-A developer should be able to submit a feature request and receive an implementation that has passed explicit product and technical approval gates, deterministic quality checks, independent verification, and controlled PR review resolution—with every handoff inspectable and every model configurable.
+A developer should be able to submit a feature request and receive an implementation that has passed explicit product and technical approval gates, deterministic quality checks, independent verification, and controlled PR review resolution—with every handoff and governed execution attempt inspectable, attributable, and policy-bound.
 
 ## Target users
 
@@ -46,43 +51,44 @@ Needs high-quality agent assistance but wants to retain control over requirement
 
 ### Secondary persona: engineering lead
 
-Wants consistent delivery practices, model policies, auditability, cost controls, and standardized verification across repositories.
+Wants consistent delivery practices, harness/model policies, auditability, cost controls, and standardized verification across repositories.
 
 ### Future persona: platform team
 
-Needs a hosted control plane, GitHub App, service accounts, multi-tenant isolation, observability, and policy administration.
+Needs a hosted control plane, GitHub App, service accounts, multi-tenant isolation, observability, multiple qualified harnesses, and policy administration.
 
 ## Jobs to be done
 
 - When I have an ambiguous feature idea, help me explore options before code is written.
 - When an approach is approved, turn it into a complete, testable specification and plan.
-- When implementation starts, use the preferred builder model and stay inside the approved scope.
+- When implementation starts, use the explicitly governed execution identity and stay inside the approved scope.
 - When implementation is reported complete, independently prove or reject that claim.
 - When reviewers comment, resolve only requests that are within the approved change.
 - When a run fails or pauses, let me inspect and resume it without losing context.
-- When models or provider access changes, let me update configuration rather than rewrite the workflow.
+- When models, providers, harnesses, or access change, let me update explicit configuration rather than rewrite the workflow or accept silent substitution.
+- When I use different agent harnesses, preserve which harness/profile/model actually executed and what evidence it supplied.
 
 ## Goals
 
 ### G1 — Durable workflow
 
-Persist run state, events, configuration snapshots, and artifacts outside model context so work survives process and editor restarts.
+Persist run state, events, configuration snapshots, artifacts, and later governed attempt/evidence records outside model context so work survives process, editor, and harness restarts.
 
 ### G2 — Separation of duties
 
 Use distinct role executions for brainstorming, design, building, verification, and PR resolution. A writer must not approve its own edits.
 
-### G3 — Configurable model routing
+### G3 — Configurable model and harness routing
 
-Allow role-specific primary models, fallbacks, reasoning effort, permissions, and fail-closed model identity policy.
+Allow role-specific primary models, fallbacks, reasoning effort, permissions, and fail-closed model identity policy today. Under MH-00, evolve to explicit harness/transport/profile/provider/model routing matched against required capabilities and assurance facts without silent substitution.
 
 ### G4 — Deterministic gates
 
-Keep approvals, transition rules, tests, builds, and merge readiness in deterministic software.
+Keep approvals, transition rules, tests, builds, merge readiness, fallback choice, and evidence acceptance in deterministic MASWE software.
 
 ### G5 — Evidence-based verification
 
-Require an acceptance-criteria matrix, actual code inspection, command evidence, blocking findings, and a machine-readable verdict.
+Require an acceptance-criteria matrix, actual code inspection, command evidence, blocking findings, and a machine-readable verdict. Future external verifiers also expose typed identity/evidence completeness rather than treating final text as sufficient provenance.
 
 ### G6 — Safe PR comment automation
 
@@ -91,31 +97,52 @@ Classify review comments before editing, escalate scope changes, re-run CI after
 ### G7 — Cursor-first current experience and harness-neutral evolution
 
 Support Cursor CLI immediately, Cursor SDK through an adapter, Superpowers practices in stage
-prompts, and a Cursor plugin skill as the current editor entry point while preserving the approved
-future direction under Issues #31 and #32. External harness support remains unimplemented.
+prompts, and a Cursor plugin skill as the current editor entry point. Publish a harness-neutral
+planned execution contract under Issues #31/#32 so Claude Code, Codex CLI, GitHub Copilot CLI,
+OpenCode, Hermes Agent, and DeepSeek Harness can later be added without product-specific workflow
+authority. External harness support remains unimplemented until its gated implementation tranches.
+
+### G8 — Attributable multi-harness attempts
+
+Future governed attempts shall distinguish harness, adapter/executable, transport/protocol,
+profile/composition, requested provider/model/effort, runtime-reported identity, identity-evidence
+strength, permissions, ambient/hidden state, isolation, retries/auxiliary calls, child lineage, and
+raw/normalized evidence completeness.
+
+### G9 — One authority plane
+
+External harness approvals, schedulers, retries, worktrees, workflows, memory, and subagents shall
+remain subordinate execution mechanics/evidence. MASWE remains authoritative for workflow state,
+approvals, retry/fallback, workspace identity, evidence gates, deterministic commits, and
+publication.
 
 ## Non-goals (historical v0.1) and remaining out of scope
 
-The following were non-goals for the original v0.1 CLI and remain out of scope for local v0.2 except where noted:
+The following were non-goals for the original v0.1 CLI and remain out of scope except where a later explicitly governed milestone says otherwise:
 
 - Fully autonomous requirement approval.
 - Automatic merging.
-- Hosting a multi-user control plane.
+- Hosting a multi-user control plane in the current local release.
 - Replacing GitHub Actions or a project's existing CI.
 - General-purpose swarm or arbitrary recursive subagent framework.
-- Guaranteeing provider model availability or pricing.
-- Sandboxing untrusted repositories beyond the permissions supplied by Cursor and the local operating system.
-- Creating pull requests or merging automatically. **v0.2 does provide local branch/worktree/commit isolation**; remote PR/merge automation remains a later milestone.
+- Guaranteeing provider model availability, identity evidence that a provider does not expose, or pricing.
+- Sandboxing untrusted repositories beyond the permissions supplied by Cursor and the local operating system in the current release.
+- Claiming that a harness sandbox alone provides complete operating-system isolation.
+- Allowing an external harness to own authoritative worktrees, MASWE workflow state, retries/fallback, or Git/GitHub publication.
+- Treating transitive Claude Code/Codex/etc. behind another harness as equivalent to MASWE's future direct adapter for that product.
+- Creating pull requests or merging automatically in the current local product. GitHub Phase B may add governed PR publication, but automatic merge remains out of scope.
 
 ## Core principles
 
 1. **Artifacts over conversation memory.** Every stage consumes approved files and repository state.
-2. **One owner of orchestration.** Models perform stages; deterministic code decides what happens next.
+2. **One owner of orchestration.** Models and harnesses perform attempts; deterministic MASWE code decides what happens next.
 3. **Human control at requirement boundaries.** Brainstorm and design approval are explicit by default.
 4. **Independent verification.** The verifier is read-only and runs after deterministic checks.
-5. **Fail closed.** Invalid transitions, model mismatches, excessive cycles, and permission violations stop the run.
+5. **Fail closed.** Invalid transitions, identity/capability/evidence mismatches, excessive cycles, and permission violations stop the governed path.
 6. **Minimal PR corrections.** Resolver edits must be the smallest correct response to an in-scope comment.
-7. **Runtime portability.** Cursor-specific implementation stays behind an adapter.
+7. **Capability-negotiated portability.** Product-specific protocol code stays behind adapters; harness names do not imply permissions, provider/model, profile, memory, delegation, retry, or publication authority.
+8. **Exact execution provenance.** Planned, reported, and attested execution facts remain distinct.
+9. **MASWE-owned workspace and publication.** External harnesses consume assigned workspaces; deterministic commit/publication authority remains in MASWE unless a later explicit contract changes a bounded editing permission, not authority ownership.
 
 ## Functional requirements
 
@@ -135,7 +162,7 @@ workspace before `START`.
 
 The system shall support explicit states for discovery, approval, design, implementation, CI, verification, PR review, comment classification, resolution, merge readiness, completion, failure, and cancellation.
 
-Invalid state/event combinations shall fail without changing state.
+Invalid state/event combinations shall fail without changing state. Future harness-native events shall not become workflow events without an explicit public MASWE operation/state-machine transition.
 
 ### FR-4 — Brainstorm stage
 
@@ -155,7 +182,7 @@ The workflow shall stop after design until a human records approval when `requir
 
 ### FR-8 — Builder stage
 
-The builder shall receive only approved artifacts plus repository context, may modify the workspace, shall follow TDD practices, and shall produce a completion report with acceptance-criteria evidence and commands executed.
+The builder shall receive only approved artifacts plus repository context, may modify the workspace under its governed writer policy, shall follow TDD practices, and shall produce a completion report with acceptance-criteria evidence and commands executed.
 
 ### FR-9 — Deterministic quality checks
 
@@ -176,11 +203,12 @@ A failed verdict shall route to the builder within the configured cycle limit.
 Before `PR_READY`, `gates.requireVerifierPass=false` may make a failed verdict nonblocking, but the
 failed verdict remains SHA-bound evidence and does not satisfy either final workflow gate.
 
+Future external verifier adapters shall additionally satisfy the active assurance profile for exact workspace/head, execution identity, hidden-state disposition, and required evidence completeness.
+
 ### FR-11 — PR readiness
 
 Passing CI and verification produce `PR_READY`; explicitly nonblocking pre-PR policy may also
-advance there while retaining the failed evidence. v0.1 requires the user or external integration
-to create the PR and signal `PR_OPENED`.
+advance there while retaining the failed evidence. Until GitHub Phase B, the user or external integration creates the PR and signals `PR_OPENED`.
 
 ### FR-12 — Review comment classification
 
@@ -203,6 +231,10 @@ failures, including identity and permission violations, shall bypass fallback se
 attempt aggregation. Existing-run model selectors shall resolve to the trusted catalogue entry's
 canonical spelling before execution; that value, not runtime-reported metadata, shall drive the
 request and identity comparison.
+
+Under MH-00, requested provider/model, runtime-resolved provider/model, provider/runtime-reported
+identity, and identity-evidence strength remain separate. A material provider/model/profile/
+transport identity change is not silently absorbed inside one governed attempt.
 
 ### FR-16 — Read-only enforcement
 
@@ -234,9 +266,11 @@ separators; and `**/` is zero or more complete segments including zero.
 file paths, but the matcher special-cases both forms without a non-empty restriction. Dotfiles are
 ordinary and regex metacharacters are literal.
 
+Future external read-only harnesses remain enclosed by the MASWE outer HEAD/fingerprint fence even when the harness reports an inner sandbox. Unexpected mutation is a policy violation, not an ordinary provider failure.
+
 ### FR-17 — Run inspection
 
-The user shall list runs, inspect one run in human-readable or JSON form, and see state, timestamps, approvals, cycle counters, artifacts, and failures.
+The user shall list runs, inspect one run in human-readable or JSON form, and see state, timestamps, approvals, cycle counters, artifacts, and failures. Future attempt inspection shall make exact harness/profile/model/permission/evidence identity inspectable without confusing it with workflow events.
 
 ### FR-18 — Recovery controls
 
@@ -256,13 +290,19 @@ both bindings must be present, passing, and bound to the exact current head rega
 GitHub association publication shall be event-free and rollback-capable. Workflow request and
 retarget events shall publish only after association commit and shall never be rolled back.
 
+Terminal workflow state shall remain independent from terminal worktree cleanup. Cleanup retry shall not create a harness attempt or imply engineering re-execution.
+
 ### FR-19 — Runtime adapters
 
-The core shall support a mock runtime, Cursor CLI runtime, and optional Cursor SDK runtime behind a common interface.
+The current core shall support a mock runtime, Cursor CLI runtime, and optional Cursor SDK runtime behind a common interface.
+
+After #3 Phase B, MH-01 and MH-02 shall introduce a harness registry/capability contract while preserving current Cursor/mock semantics. External adapters shall not require harness-specific workflow branches.
 
 ### FR-20 — Environment diagnostics
 
 The system shall provide a doctor command that checks runtime availability, credentials where applicable, and configured model slugs. For runtimes that implement catalogue discovery (currently Cursor CLI), doctor shall perform fail-closed catalogue discovery and project-style logical→exact resolution before the probe, and shall not report transport success when model resolution failed. Doctor does not create a run or persist a `run.config` snapshot. Runtimes without catalogue capability (currently Cursor SDK) are diagnosed without `agent models` resolution.
+
+Future harness qualification/preflight shall bind its result to the exact executable/runtime and profile/composition generation observed; replacing either invalidates that qualification.
 
 ### FR-21 — CLI grammar
 
@@ -286,39 +326,81 @@ ordinary no-follow final file, remain bounded, and verify the recorded SHA-256 d
 trusted-local-user boundary does not claim to eliminate all concurrent same-user ancestor
 replacement races.
 
+### FR-23 — Planned capability-negotiated multi-harness execution
+
+After its implementation gates are satisfied, MASWE shall authorize one immutable execution
+attempt by matching required role capabilities and assurance facts against an exact qualified
+harness execution plan.
+
+The plan/evidence model shall distinguish at least:
+
+- harness and adapter/executable identity;
+- transport and protocol identity/version;
+- profile/composition and digest;
+- requested provider/model/effort;
+- runtime-resolved/reported identity and evidence strength;
+- requested/effective permissions;
+- sandbox and MASWE outer-isolation facts;
+- ambient inputs and hidden-state disposition;
+- MASWE attempt versus harness-local retries/auxiliary calls;
+- child/transitive execution lineage;
+- raw versus normalized evidence; and
+- evidence completeness.
+
+Unknown or insufficient required capabilities/evidence shall fail closed. Harness-native approval,
+retry, workflow, task-board, worktree, memory, or delegation state shall not authorize MASWE
+workflow changes. MASWE shall retain exact workspace ownership and deterministic Git/publication
+authority. Initial external harness adapters shall be read-only; writer authority requires a
+separately approved MH-07 contract.
+
+Direct and transitive product identities shall remain distinct, for example `MASWE -> Codex` versus
+`MASWE -> DeepSeek Harness -> Codex`.
+
+Hermes Agent and DeepSeek Harness are mandatory conformance examples for this requirement as
+defined by ADR-0008 and the MH-00 design specification.
+
 ## Non-functional requirements
 
 ### NFR-1 — Reliability
 
 - Run writes shall be atomic enough for a single local process and recoverable through JSON files.
 - Automatic transition loops shall have a hard iteration limit.
-- Retry loops shall be bounded by configuration.
+- Retry loops shall be bounded by configuration and later distinguish MASWE attempts from admitted harness-local retries.
+- Cancellation/timeout of a future external harness shall reach bounded process-tree quiescence or produce a typed failure/evidence result.
 
 ### NFR-2 — Security
 
 - Secrets shall come from environment variables or external secret stores, not configuration committed to git.
-- Read-only stages shall be mechanically checked.
+- Read-only stages shall be mechanically checked by MASWE outer policy.
 - Shell commands shall come only from trusted project configuration.
 - Untrusted review comments shall never be interpolated into shell commands.
+- Future required harness capabilities shall fail closed when unknown/unproven.
+- Exact executable/profile qualification and ambient-input disposition shall be recorded where required by the assurance profile.
+- No harness name alone shall imply permission, provider/model, sandbox, retry, workflow, delegation, or publication authority.
 
 ### NFR-3 — Auditability
 
 Every transition shall record event type, actor, source and destination state, timestamp, and available model/runtime metadata. Artifacts shall include a SHA-256 digest.
 
+Future governed attempts shall additionally retain attributable planned/reported/attested execution identity, raw-evidence references/digests where required, normalized evidence, and completeness. Attempt evidence shall not be confused with workflow authorization.
+
 ### NFR-4 — Portability
 
 The local product shall run on macOS, Linux, and Windows with Node.js in the supported range `>=22.22.2 <23 || >=24.18.0 <25`, where the configured Cursor CLI command and project commands are available. Exact Node `24.18.0` is the canonical contributor and primary-CI baseline; exact Node `22.22.2` is the blocking compatibility floor.
 
+Future adapter support may be platform-specific when a harness is not portable, but routing/qualification must expose that capability explicitly rather than silently selecting another harness.
+
 ### NFR-5 — Maintainability
 
 - State transitions remain centralized.
-- Runtime dependencies remain isolated.
+- Runtime/harness dependencies remain isolated behind adapters.
+- The orchestrator shall not accumulate harness-name conditionals for capability/policy semantics.
 - Prompt templates are versioned files.
 - New behavior includes tests and documentation.
 
 ### NFR-6 — Observability
 
-v0.1 shall preserve command output, duration, failure reasons, and run events. Later versions shall add structured logs, metrics, traces, and GitHub check summaries.
+The current product preserves command output, duration, failure reasons, and run events. Later versions shall add structured logs, metrics, traces, GitHub check summaries, attempt identity, token/cost accounting, and raw/normalized harness evidence with explicit completeness.
 
 ## MVP user journey
 
@@ -336,6 +418,8 @@ v0.1 shall preserve command output, duration, failure reasons, and run events. L
 12. Review comments can be classified and resolved through the loop.
 13. Developer marks merge-ready and complete after external merge policy passes.
 
+The MVP journey remains Cursor-first. MH-00 does not change it; later adapter tranches must preserve the same workflow authority and evidence gates.
+
 ## Success metrics
 
 For a pilot set of repositories:
@@ -347,6 +431,8 @@ For a pilot set of repositories:
 - Median manual effort to inspect a run state is under two minutes.
 - Model selection mismatches are surfaced in 100% of runtimes that report actual model identity.
 - At least 70% of accepted feature PRs require no requirement clarification after design approval.
+
+Future multi-harness qualification shall add metrics for evidence completeness, unexpected policy events, verifier precision/recall/false-blocking, cost, latency, and run-to-run variance on an approved MASWE corpus before making task-quality claims.
 
 ## Release acceptance criteria for v0.1
 
@@ -363,12 +449,16 @@ For a pilot set of repositories:
 
 ## Future requirements
 
-- GitHub App webhook ingestion and idempotent event processing.
-- Branch and worktree lifecycle management.
-- Check runs bound to exact head SHA.
-- Signed or identity-aware approvals.
-- SQLite and PostgreSQL stores with optimistic concurrency.
-- Hosted control plane, API, MCP server, and team dashboard.
-- Budget, token, latency, and provider policy controls.
+Required delivery order is governed by the roadmap and MH-00 design:
+
+- Complete or explicitly disposition #34 before GitHub Phase B obtains repository write authority.
+- Complete Issue #3 Phase B: digest-bound approvals, deterministic branch/PR publication, human-approved review lifecycle, and Actions/artifact observation.
+- MH-01: harness-neutral domain/configuration/capability/attempt/evidence contracts.
+- MH-02: Cursor-preserving harness registry refactor.
+- MH-03: deterministic global/project/private/invocation configuration hierarchy.
+- Add direct read-only adapters for Claude Code, Codex CLI, Copilot CLI, OpenCode, Hermes Agent, and DeepSeek Harness only after the shared gates and each adapter's own entry gate/owner approval.
+- MH-07: govern external writer authority while MASWE retains deterministic commit/publication authority.
+- MH-08: assurance profiles and differential verification.
+- MH-09 / Issue #4: PostgreSQL/object storage, queue/leases/outbox, API/MCP, and distributed qualified workers only after local attempt/evidence contracts and initial conformance are proven.
 - Multi-repository and cross-service change plans.
-- Sandboxed execution and policy-as-code for commands and file scopes.
+- Stronger sandboxing and policy-as-code for commands, file scopes, network/process capabilities, and data classes.
