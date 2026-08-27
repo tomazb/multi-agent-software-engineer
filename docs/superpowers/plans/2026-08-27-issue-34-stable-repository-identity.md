@@ -2,54 +2,57 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make GitHub numeric repository IDs authoritative for authorization, association, locking, canonical-name reconciliation, installation-token scope, and check ownership; provide a restartable authenticated migration for legacy name-only state; preserve exact PR/head/evidence semantics; and leave Phase B write authority disabled.
+**Goal:** Make GitHub numeric repository IDs authoritative for authorization, association, locking, canonical-name reconciliation, installation-token scope, and check ownership; migrate existing name-only state safely; preserve exact PR/head/evidence semantics; and leave Phase B write authority disabled.
 
-**Architecture:** Keep schema/config version 1 with additive stable-ID fields and explicit legacy-read boundaries. New repository-scoped execution uses stable ID fences and ID-scoped credentials. Pure GitHub identity/API parsing lives in focused modules instead of further expanding `adapter.ts`; the adapter composes those modules with the existing run mutation and association transaction primitives. Legacy ID-less authority reduction has its own `run target fence -> global association transaction` branch. Migration is explicit, quiescent, checkpointed, restartable, and reconciles existing production check ownership without rewriting immutable history.
+**Architecture:** Keep config/run schema version 1 with additive stable-ID fields and explicit legacy-read boundaries. Stable repository operations use ID-scoped credentials and ID-keyed fences. Pure GitHub API parsing lives in focused modules. Run/index mutation logic is extracted from the adapter into one shared transaction helper used by both live routing and migration. Legacy ID-less authority reduction uses only `run target fence -> global association transaction`. Migration is explicit, quiescent, checkpointed, restartable, and aliases existing production check ownership without rewriting immutable history.
 
-**Tech Stack:** TypeScript, Node.js built-in test runner, JSON Schema 2020-12, GitHub REST API, current immutable ticket journals, durable atomic file store, existing `FileRunStore` / `GitHubAssociationIndex` / `GitHubDeliveryInbox` primitives.
+**Tech Stack:** TypeScript, Node.js built-in test runner, JSON Schema 2020-12, GitHub REST API, current immutable ticket journals, durable atomic file store, `FileRunStore`, `GitHubAssociationIndex`, and `GitHubDeliveryInbox`.
 
 **Spec:** `docs/superpowers/specs/2026-08-27-issue-34-stable-repository-identity-design.md` at approved design head `06fc6be310332a997a6eff41c33cf7b5d8d09d9c`.
 
 ## Global Constraints
 
-- Exact implementation baseline is `main@4565d1c0661ff6cf20185f718b59c40d9c837c77`; the approved spec commits are documentation ancestry only.
-- Before implementation, use `superpowers:using-git-worktrees` and create an isolated worktree/implementation branch from the approved plan head. Do not implement directly on `main`.
-- Use test-driven development. Every task below begins with a failing focused regression, observes the expected failure, implements the smallest production change, and reruns the focused tests before committing.
-- Do not grant Phase B write authority. `githubApp.enabled === true` still requires `readOnlyChecks === true` throughout Issue #34.
-- `repositoryId` is the only repository authorization identity. `repository`/`owner/repo` remains routing/display/candidate metadata only.
-- Never use redirect behavior as repository identity proof.
-- Preserve exact PR target ownership via `base.repo.id`; fork PRs with a different `head.repo.id` remain valid.
-- Preserve exact SHA-bound evidence and the Issue #28 revalidation contract. Identity migration alone cannot make stale evidence current.
-- Pre-#34 and #34 GitHub writers must never run concurrently during migration. Cutover is quiescent: stop old writers, configure stable IDs, preflight old journals, migrate, then start the #34 listener.
-- Do not rewrite immutable workflow events, GitHub journals, old side-effect records, or historical run config snapshots to manufacture continuity.
-- Keep the hardcoded GitHub API origin `https://api.github.com`; API-origin configurability is not part of #34.
-- Permanent webhook identity/policy rejection is consumed with zero authority increase; transient API/I/O/lock failures remain retryable.
-- Every durable outcome-unknown path must re-read authoritative state and compare exact intended post-state before continuing.
-- Final validation must run on exact Node `24.18.0` and `22.22.2`; the existing Node 25 negative CI gate remains required.
+- Exact runtime baseline is `main@4565d1c0661ff6cf20185f718b59c40d9c837c77`; the approved design/plan commits are documentation ancestry.
+- Before implementation, invoke `superpowers:using-git-worktrees` and create an isolated implementation worktree/branch from the approved plan head. Do not implement on `main`.
+- Use test-driven development: write a focused regression, run it and observe the expected failure, implement the smallest production change, rerun focused tests, then commit.
+- Do not grant Phase B write authority. `githubApp.enabled === true` continues to require `readOnlyChecks === true` throughout #34.
+- `repositoryId` is the only repository authorization identity. `repository`/`owner/repo` is routing/display/candidate metadata only.
+- Never use redirect behavior as identity evidence.
+- Validate PR target ownership with `base.repo.id`; fork PRs with a different `head.repo.id` remain valid.
+- Preserve Issue #28 exact-head revalidation. Repository identity migration cannot make stale evidence current.
+- Cutover is quiescent: stop all pre-#34 GitHub writers, configure stable IDs, inspect old name-keyed journals, finish migrations, then start the #34 listener/manual publisher.
+- Do not rewrite immutable workflow events, GitHub journals, old side-effect records, or historical run config snapshots.
+- Keep the hardcoded GitHub API origin `https://api.github.com`; API-origin configurability is outside #34.
+- Permanent webhook identity/policy rejection is durably consumed with zero authority increase. Transient API/I/O/lock failures remain retryable.
+- Every durable outcome-unknown path re-reads authoritative state and compares the exact intended post-state before continuing.
+- Final validation runs on exact Node `24.18.0` and `22.22.2`; the existing Node 25 negative CI gate remains required.
 
 ## File Structure / Responsibility Map
 
-New focused modules:
+New modules:
 
-- `src/github/repository-identity.ts` — stable-ID authorization helpers plus authenticated canonical repository lookup with safe bounded pagination.
-- `src/github/pull-request.ts` — exact live PR snapshot parsing and target/base repository-ID proof.
-- `src/github/dispatch-disposition.ts` — permanent-vs-applied webhook dispatch result vocabulary; no persistence.
-- `src/github/check-identity-migration.ts` — legacy attempt-1 check ownership proof and stable local alias publication.
+- `src/github/pagination.ts` — shared strict GitHub `Link` parsing and safe page-URL validation.
+- `src/github/repository-identity.ts` — authenticated `repositoryId -> current canonical owner/repo` lookup with bounded pagination.
+- `src/github/pull-request.ts` — exact live PR snapshot parsing, including `base.repo.id`.
+- `src/github/association-mutation.ts` — shared run/index mutation, rollback, and outcome-unknown reconciliation primitives extracted from `adapter.ts`.
+- `src/github/dispatch-disposition.ts` — permanent-vs-applied webhook dispatch result vocabulary.
+- `src/github/check-identity-migration.ts` — legacy production attempt-1 check ownership proof and stable alias publication.
 - `src/github/repository-identity-migration-store.ts` — bounded exact migration checkpoint persistence.
 - `src/github/repository-identity-migration.ts` — quiescent restartable migration orchestration.
-- `test/fixtures/github-pre34-validators.ts` — frozen **test-only** pre-#34 config/association validators for downgrade evidence.
+- `test/fixtures/github-pre34-validators.ts` — frozen test-only pre-#34 validators for downgrade evidence.
 
-Existing modules keep these responsibilities:
+Existing responsibility changes:
 
-- `src/domain.ts`, `src/config.ts`, schemas, `src/store.ts` — additive schema-v1 stable-ID representation and legacy read compatibility.
-- `src/github/types.ts`, `normalize.ts`, `delivery-inbox-record.ts` — new event identity plus exact legacy durable-event migration boundary.
-- `src/github/token.ts` — ID-scoped least-privilege installation tokens.
+- `src/domain.ts`, `src/config.ts`, schemas, `src/store.ts` — additive schema-v1 stable-ID representation and legacy reads.
+- `src/github/types.ts`, `normalize.ts`, `delivery-inbox-record.ts` — stable event identity plus exact legacy durable-event compatibility.
+- `src/github/token.ts` — ID-scoped least-privilege installation tokens and the shared token-provider type.
+- `src/github/adapter-identities.ts` — stable allowlist guard, stable-association guard, owner/repo parsing, remote candidate matching.
 - `src/github/association.ts` — stable primary index, transitional legacy parser, global association transaction.
-- `src/github/journal.ts` — stable repository journal kind and read-only old-lock inspection.
-- `src/github/adapter.ts` — orchestration/composition only: stable routing, canonical-name sync, lock order, mixed stable/legacy revocation fan-out.
-- `src/github/checks.ts`, `side-effect-store.ts` — stable check idempotency and existing resource reconciliation.
-- `src/github/webhook-worker.ts`, `webhook-diagnostic.ts` — consume permanent dispositions, retry transient failures, emit bounded listener-process observability.
-- `src/cli-args.ts`, `src/cli-runner.ts` — migration command and quiescent listener cutover contract.
+- `src/github/journal.ts` — `repository-identity` journal kind and read-only pre-#34 ownership inspection.
+- `src/github/adapter.ts` — composition only: stable routing/reconciliation, lock order, mixed stable/legacy revocation fan-out.
+- `src/github/checks.ts` — stable check key and live publication.
+- `src/github/webhook-worker.ts`, `webhook-diagnostic.ts` — consume permanent dispositions, retry transient failures, emit listener-process observability.
+- `src/cli-args.ts`, `src/cli-runner.ts` — migration command and quiescent cutover guard.
 
 ---
 
@@ -66,21 +69,16 @@ Existing modules keep these responsibilities:
 - Create: `test/fixtures/github-pre34-validators.ts`
 - Create: `test/github-pre34-downgrade.test.ts`
 
-**Consumes:** Existing schema-v1 config/run records and exact-object validation.
+**Consumes:** Current schema-v1 config/run records and exact-object validation.
 
-**Produces:** Normalized `allowedRepositoryIds: number[]`, optional persisted `RunGitHubAssociation.repositoryId`, exact enabled-time migration rule, and frozen downgrade evidence.
+**Produces:** Normalized ID allowlist, optional persisted run `repositoryId`, exact enabled-time rule, and frozen downgrade evidence.
 
-- [ ] **Step 1: Write failing config tests.** Add cases proving:
-  - current name-only enabled config migrates to `allowedRepositoryIds: []` and remains loadable;
-  - ID-only enabled config migrates to `allowedRepositories: []` and is valid;
-  - enabled config with both arrays empty is invalid;
-  - duplicate, zero, negative, fractional, unsafe, or non-number repository IDs fail;
-  - repository names still normalize to lowercase but never populate IDs.
+- [ ] **Step 1: Write failing config tests.** Prove name-only enabled config remains loadable and normalizes `allowedRepositoryIds: []`; ID-only enabled config is valid and normalizes `allowedRepositories: []`; both-empty enabled config fails; duplicate/zero/negative/fractional/unsafe/non-number IDs fail; names normalize to lowercase but never populate IDs.
 
-Use normalized expectations like:
+Expected normalized ID-only shape:
 
 ```ts
-assert.deepEqual(config.githubApp, {
+{
   enabled: true,
   readOnlyChecks: true,
   webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
@@ -88,32 +86,30 @@ assert.deepEqual(config.githubApp, {
   privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
   allowedRepositoryIds: [1308655205],
   allowedRepositories: [],
-});
+}
 ```
 
-- [ ] **Step 2: Write failing run/schema tests.** Prove a legacy `github` association without `repositoryId` loads, a valid positive-safe-integer `repositoryId` round-trips, and malformed IDs fail in both `migrateRunRecord()` and JSON-schema checks.
+- [ ] **Step 2: Write failing run/schema tests.** A legacy `github` association without ID must load. A positive-safe-integer ID must round-trip. Malformed IDs must fail both run migration and schema validation.
 
-- [ ] **Step 3: Write the frozen downgrade regression before production changes.** In `test/fixtures/github-pre34-validators.ts`, copy only the exact baseline `4565d1c` GitHub config allowed-key rule and association allowed-field/name-key rule into clearly named test-only functions, for example:
+- [ ] **Step 3: Create frozen downgrade evidence before changing production validators.** `test/fixtures/github-pre34-validators.ts` contains only test copies of the exact baseline GitHub config key/rule and association allowed-field/name-key parser:
 
 ```ts
 export function pre34AcceptsGitHubConfig(raw: Record<string, unknown>): boolean;
 export function pre34AcceptsAssociationIndex(raw: unknown): boolean;
 ```
 
-In `test/github-pre34-downgrade.test.ts`, create migrated golden fixtures containing `allowedRepositoryIds` / `repositoryId` and require both frozen validators to reject them. Never import these helpers from `src/`.
+`test/github-pre34-downgrade.test.ts` feeds migrated golden fixtures containing `allowedRepositoryIds` / `repositoryId` and requires both old validators to reject them. Production code never imports the fixture.
 
 - [ ] **Step 4: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/config.test.ts \
-  test/schema.test.ts \
-  test/github-pre34-downgrade.test.ts
+  test/config.test.ts test/schema.test.ts test/github-pre34-downgrade.test.ts
 ```
 
-Expected: failures for unknown `allowedRepositoryIds`, missing normalized arrays, unsupported run `repositoryId`, and the not-yet-existing downgrade fixture behavior.
+Expected: unknown stable fields/current name-only enabled rule cause failures.
 
-- [ ] **Step 5: Implement the normalized domain shape.** Use:
+- [ ] **Step 5: Implement domain types.**
 
 ```ts
 export interface GitHubAppConfig {
@@ -130,7 +126,7 @@ export interface GitHubAppConfig {
 
 export interface RunGitHubAssociation {
   installationId: number;
-  repositoryId?: number; // optional only because historical schema-v1 records exist
+  repositoryId?: number; // legacy-read boundary only
   repository: string;
   pullRequestNumber: number;
   baseSha: string;
@@ -144,21 +140,17 @@ export interface RunGitHubAssociation {
 export type StableRunGitHubAssociation = RunGitHubAssociation & { repositoryId: number };
 ```
 
-- [ ] **Step 6: Implement config migration/validation.** Raw missing arrays normalize independently to `[]`. Enabled config requires `allowedRepositoryIds.length > 0 || allowedRepositories.length > 0`. `allowedRepositoryIds` must be unique positive safe integers. Preserve `readOnlyChecks === true` when enabled.
+- [ ] **Step 6: Implement config migration/validation.** Raw missing arrays normalize independently to `[]`. Enabled config requires `allowedRepositoryIds.length > 0 || allowedRepositories.length > 0`. IDs are unique positive safe integers. Preserve the Phase A `readOnlyChecks` guard.
 
-- [ ] **Step 7: Synchronize JSON schemas and `migrateRunRecord()`.** Keep version constants at 1. Require both normalized allowlist arrays in the normalized config schema; encode enabled-time rejection of both-empty arrays. Add optional positive integer `repositoryId` to run schema and exact run migration allowed fields.
+- [ ] **Step 7: Synchronize schemas and `migrateRunRecord()`.** Keep version constants at 1. Normalized config schema contains both arrays and rejects enabled both-empty. Run schema accepts optional positive integer `repositoryId`; exact run migration allows and validates it.
 
-- [ ] **Step 8: Run GREEN and typecheck.**
+- [ ] **Step 8: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/config.test.ts \
-  test/schema.test.ts \
-  test/github-pre34-downgrade.test.ts
+  test/config.test.ts test/schema.test.ts test/github-pre34-downgrade.test.ts
 npm run _typecheck
 ```
-
-Expected: all pass.
 
 - [ ] **Step 9: Commit.**
 
@@ -180,13 +172,13 @@ git commit -m "feat: add stable GitHub repository identity contracts"
 - Modify: `test/github-delivery-inbox.test.ts`
 - Modify: `test/github-durable-ingress.test.ts`
 
-**Consumes:** Signed parsed GitHub payloads and persisted format-2 inbox records.
+**Consumes:** Authenticated parsed GitHub payloads and persisted format-2 inbox records.
 
-**Produces:** New repo-scoped events with `repositoryId + repository`, ID/name pairs for installation repository changes, and explicit migrated representation for old name-only inbox events.
+**Produces:** New ID-bearing repo events, ID/name repository-change pairs, and explicit `legacyRepositories` for old persisted name arrays.
 
-- [ ] **Step 1: Add failing normalization cases.** Every supported repository-scoped event must include a positive safe integer `repository.id`. Add malformed cases for missing/zero/fractional/unsafe IDs. Update normal event expectations to include `repositoryId`.
+- [ ] **Step 1: Write failing normalization tests.** Every supported repo-scoped new payload requires a positive safe `repository.id` and normalized `repository.full_name`. Add missing/zero/fractional/unsafe cases.
 
-- [ ] **Step 2: Add failing `installation_repositories` pairing cases.** Define:
+- [ ] **Step 2: Write failing installation-repository pairing tests.**
 
 ```ts
 export interface GitHubRepositoryIdentity {
@@ -195,48 +187,30 @@ export interface GitHubRepositoryIdentity {
 }
 ```
 
-New normalized events use `repositories?: GitHubRepositoryIdentity[]`. Prove identical duplicate pairs dedupe deterministically and same ID with conflicting names is malformed.
+New `installation_repositories` events use `repositories?: GitHubRepositoryIdentity[]`. Identical pairs dedupe; same ID/conflicting names is malformed.
 
-- [ ] **Step 3: Add failing historical durable-record cases.** Persist exact pre-#34 format-2 event JSON and prove `parseRecord()` can still read:
-  - ordinary PR/push events with name but no ID;
-  - old `installation_repositories` events with `repositories: string[]`.
-
-Do **not** infer IDs. Migrate old repository-array records into an internal legacy-only field such as:
-
-```ts
-legacyRepositories?: string[];
-```
-
-so the operational type does not expose a union of names and stable identity objects.
+- [ ] **Step 3: Write failing historical durable-record tests.** Pre-#34 repo events with name/no ID remain readable. Old `installation_repositories` `repositories: string[]` is migrated at the durable-record boundary to exact internal `legacyRepositories?: string[]`. No parser synthesizes IDs.
 
 - [ ] **Step 4: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-normalize.test.ts \
-  test/github-delivery-inbox.test.ts \
-  test/github-durable-ingress.test.ts
+  test/github-normalize.test.ts test/github-delivery-inbox.test.ts test/github-durable-ingress.test.ts
 ```
 
-Expected: new ID assertions fail against name-only normalization/current exact durable-event parser.
+- [ ] **Step 5: Implement one exact repository-identity extractor** and use it for all supported repo-scoped new events.
 
-- [ ] **Step 5: Implement exact repository identity extraction.** Add one helper that validates `repository.id` and `repository.full_name`; reuse it across event families. New repository-scoped events always carry both values.
+- [ ] **Step 6: Implement durable compatibility migration.** New exact forms and recognized pre-#34 exact forms are distinct. Legacy ordinary events remain ID-less; old name arrays become `legacyRepositories`.
 
-- [ ] **Step 6: Implement durable-event compatibility migration.** `validEvent`/record parsing must distinguish new exact forms from recognized pre-#34 exact forms. Legacy forms remain marked by absence of `repositoryId` or `legacyRepositories`; no parser path may synthesize a repository ID.
+- [ ] **Step 7: Update newly generated test payloads** to include `repository: { id: 1308655205, full_name: "owner/repo" }`; only historical fixtures omit the ID.
 
-- [ ] **Step 7: Update ingress fixtures.** All newly generated signed payloads in the touched tests must include `repository: { id: 1308655205, full_name: "owner/repo" }`; only explicit historical fixtures omit it.
-
-- [ ] **Step 8: Run GREEN and typecheck.**
+- [ ] **Step 8: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-normalize.test.ts \
-  test/github-delivery-inbox.test.ts \
-  test/github-durable-ingress.test.ts
+  test/github-normalize.test.ts test/github-delivery-inbox.test.ts test/github-durable-ingress.test.ts
 npm run _typecheck
 ```
-
-Expected: all pass.
 
 - [ ] **Step 9: Commit.**
 
@@ -248,44 +222,47 @@ git commit -m "feat: persist stable repository ids in GitHub events"
 
 ---
 
-## Task 3: Replace name-scoped installation credentials with ID-scoped least-privilege purposes and add canonical-ID lookup
+## Task 3: Move installation credentials to repository IDs and add authenticated canonical lookup
 
 **Files:**
 - Modify: `src/github/token.ts`
 - Create: `src/github/pagination.ts`
 - Create: `src/github/repository-identity.ts`
-- Modify: `src/github/checks.ts` (consume shared pagination parser without changing check semantics)
+- Modify: `src/github/checks.ts`
 - Modify: `test/github-token.test.ts`
 - Create: `test/github-repository-identity.test.ts`
 - Modify: `test/github-checks.test.ts`
 
-**Consumes:** Installation ID + stable repository ID + purpose; injected `GitHubHttpClient`.
+**Consumes:** Installation ID, stable repository ID, token purpose, injected `GitHubHttpClient`.
 
-**Produces:** ID-restricted tokens and an authenticated `repositoryId -> current full_name` lookup with safe bounded pagination.
+**Produces:** ID-restricted least-privilege tokens, named token-provider type, and bounded authenticated canonical lookup.
 
-- [ ] **Step 1: Write failing token tests** for the three exact purposes:
+- [ ] **Step 1: Write failing token-purpose tests.** Define exactly:
 
 ```ts
-type GitHubInstallationTokenPurpose =
+export type GitHubInstallationTokenPurpose =
   | "metadata-reconcile"
   | "pull-request-read"
   | "checks";
+
+export type GitHubRepositoryTokenProvider = (
+  installationId: number,
+  repositoryId: number,
+  purpose: GitHubInstallationTokenPurpose,
+) => Promise<string>;
 ```
 
-Require request body `repository_ids: [repositoryId]` and forbid `repositories`. Assert exact permissions:
-  - metadata-reconcile: `{ metadata: "read" }`;
-  - pull-request-read: `{ metadata: "read", pull_requests: "read" }`;
-  - checks: `{ checks: "write", metadata: "read", pull_requests: "read" }`.
-
-- [ ] **Step 2: Write failing canonical lookup pagination tests.** Cover page 1, page 2+, terminal absent target, duplicate ID/conflicting name, unsafe cross-origin/path/query, duplicate/multiple next rels, loop, page-limit exhaustion, rate limit/5xx. The first URL must be exactly based on:
+All token requests use `repository_ids: [repositoryId]` and never `repositories`. Exact permissions:
 
 ```ts
-const GITHUB_API_ORIGIN = "https://api.github.com";
-const url = new URL("/installation/repositories", GITHUB_API_ORIGIN);
-url.searchParams.set("per_page", "100");
+metadata-reconcile -> { metadata: "read" }
+pull-request-read  -> { metadata: "read", pull_requests: "read" }
+checks             -> { checks: "write", metadata: "read", pull_requests: "read" }
 ```
 
-- [ ] **Step 3: Extract shared strict Link parsing.** Move the already-hardened generic mechanics from `checks.ts` into `src/github/pagination.ts` with an interface such as:
+- [ ] **Step 2: Write failing canonical-lookup tests.** Cover target page 1/page 2+, clean terminal absence, duplicate ID/conflicting name, unsafe origin/path/query, duplicate/multiple next rels, loop, rate-limit/5xx, and 100-page exhaustion.
+
+- [ ] **Step 3: Extract current hardened Link logic into `pagination.ts`.** Use exact API:
 
 ```ts
 export function nextGitHubLink(headers: Record<string, string>): string | undefined;
@@ -298,22 +275,18 @@ export function requireSafeGitHubPageUrl(rawUrl: string, policy: {
 }): string;
 ```
 
-Existing check pagination must remain behaviorally identical under its current tests.
+Update existing check pagination to consume it with no behavior change.
 
 - [ ] **Step 4: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-token.test.ts \
-  test/github-repository-identity.test.ts \
-  test/github-checks.test.ts
+  test/github-token.test.ts test/github-repository-identity.test.ts test/github-checks.test.ts
 ```
 
-Expected: token-body/purpose tests and new repository lookup tests fail; pre-existing check tests still show the baseline behavior to preserve.
+- [ ] **Step 5: Implement ID-scoped token creation.** Reject invalid IDs/unknown purposes. Repository name never participates in credential scope.
 
-- [ ] **Step 5: Implement ID-scoped token creation.** Change the input to `repositoryId` + `purpose`; reject non-positive-safe IDs and unknown purposes. No repository name may participate in credential scope.
-
-- [ ] **Step 6: Implement canonical lookup.** Use a result union:
+- [ ] **Step 6: Implement canonical lookup.**
 
 ```ts
 export type InstallationRepositoryLookupResult =
@@ -321,31 +294,27 @@ export type InstallationRepositoryLookupResult =
   | { kind: "not-found" };
 ```
 
-Use `per_page=100`, max 100 pages, a visited-URL set, cross-page ID/name consistency checks, and exact canonical owner/name validation. A safely exhausted list returns `not-found`. Ambiguous/incomplete traversal throws a typed retryable/blocked error. A 100-page exhaustion gets a distinct operator-facing traversal-limit code and never becomes revocation evidence.
+Use hardcoded `https://api.github.com`, `/installation/repositories?per_page=100`, max 100 pages, visited-URL loop detection, strict URL policy, cross-page ID/name consistency, and canonical name validation. Clean terminal absence returns `not-found`. Page-limit/malformed/unsafe/rate-limit/5xx throws a typed retryable/blocked lookup error; traversal limit has a distinct operator-facing code and never means revocation.
 
-- [ ] **Step 7: Run GREEN and typecheck.**
+- [ ] **Step 7: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-token.test.ts \
-  test/github-repository-identity.test.ts \
-  test/github-checks.test.ts
+  test/github-token.test.ts test/github-repository-identity.test.ts test/github-checks.test.ts
 npm run _typecheck
 ```
-
-Expected: all pass.
 
 - [ ] **Step 8: Commit.**
 
 ```bash
-git add src/github/token.ts src/github/pagination.ts src/github/repository-identity.ts \
-  src/github/checks.ts test/github-token.test.ts test/github-repository-identity.test.ts test/github-checks.test.ts
+git add src/github/token.ts src/github/pagination.ts src/github/repository-identity.ts src/github/checks.ts \
+  test/github-token.test.ts test/github-repository-identity.test.ts test/github-checks.test.ts
 git commit -m "feat: scope GitHub identity reads by repository id"
 ```
 
 ---
 
-## Task 4: Re-key the association index by stable repository ID with an exact transitional legacy parser
+## Task 4: Re-key associations by repository ID with an exact transitional parser
 
 **Files:**
 - Modify: `src/github/types.ts`
@@ -355,79 +324,74 @@ git commit -m "feat: scope GitHub identity reads by repository id"
 - Modify: `test/github-concurrency.test.ts`
 - Modify: `test/fixtures/github-store-worker.ts`
 
-**Consumes:** Mixed historical name-keyed and new ID-keyed association index records.
+**Consumes:** Mixed historical name-keyed and new ID-keyed association records.
 
-**Produces:** Stable operational APIs, migration-only legacy APIs, exact mixed-state parser, and stable repository/PR keying.
+**Produces:** Stable operational transaction/query APIs and migration-only legacy APIs under the existing global association journal.
 
-- [ ] **Step 1: Write failing stable-key tests.** New records must serialize under `${repositoryId}#${pullRequestNumber}` and contain `repositoryId` plus mutable `repository`.
+- [ ] **Step 1: Write failing stable-key tests.** New stable record key is `${repositoryId}#${pullRequestNumber}` and the record contains both stable ID and mutable canonical name.
 
-- [ ] **Step 2: Write failing transitional parser tests.** Accept exact legacy `<owner/repo>#<pr>` records without ID and exact stable `<id>#<pr>` records with ID in the same index. Reject malformed mixed keys, stable key/record mismatch, duplicate stable PR identity, conflicting stable/legacy claims for one run, duplicate active run IDs, unknown fields, and malformed IDs/timestamps.
+- [ ] **Step 2: Write failing mixed-parser tests.** Accept exact legacy `<owner/repo>#<pr>` without ID and exact stable `<id>#<pr>` with ID in one file. Reject malformed key/record pairs, duplicate stable PR identity, duplicate active run ID, inconsistent stable/legacy claims, unknown fields, malformed IDs/timestamps.
 
-- [ ] **Step 3: Write failing API tests for explicit separation.** Implement/target these interfaces consistently:
+- [ ] **Step 3: Define concrete transaction types in production.**
 
 ```ts
+export type SuspensionReason = "pull-request-closed" | "authorization-revoked";
+
+export type StableAssociationBindInput = Omit<
+  AssociationRecord,
+  "repositoryId" | "suspended" | "updatedAt"
+> & {
+  repositoryId: number;
+  suspended?: boolean;
+};
+
 export interface GitHubAssociationTransaction {
   findStable(repositoryId: number, pullRequestNumber: number): AssociationRecord | undefined;
   findLegacy(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
   bindStable(input: StableAssociationBindInput): AssociationRecord;
-  migrateLegacy(input: {
-    legacyRepository: string;
-    stable: StableAssociationBindInput;
-  }): AssociationRecord;
-  refreshCanonicalRepository(
-    repositoryId: number,
-    pullRequestNumber: number,
-    repository: string,
-  ): AssociationRecord | undefined;
+  migrateLegacy(input: { legacyRepository: string; stable: StableAssociationBindInput }): AssociationRecord;
+  refreshCanonicalRepository(repositoryId: number, pullRequestNumber: number, repository: string): AssociationRecord | undefined;
   suspendStable(repositoryId: number, pullRequestNumber: number, reason: SuspensionReason): AssociationRecord | undefined;
   suspendLegacy(repository: string, pullRequestNumber: number, reason: SuspensionReason): AssociationRecord | undefined;
   onRollback(callback: () => Promise<void>): void;
 }
 ```
 
-Public index queries must include `findStable`, `findAllStableByRepositoryId`, `findAllLegacyByRepository`, `findAllByInstallation` (mixed), and stable `findAllByRepositoryBranch(repositoryId, branch)`.
+Public queries: `findStable`, `findAllStableByRepositoryId`, `findAllLegacyByRepository`, `findAllByInstallation` (mixed), and stable `findAllByRepositoryBranch(repositoryId, branch)`.
 
 - [ ] **Step 4: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-association.test.ts \
-  test/github-authoritative-state.test.ts \
-  test/github-concurrency.test.ts
+  test/github-association.test.ts test/github-authoritative-state.test.ts test/github-concurrency.test.ts
 ```
 
-Expected: new API/key assertions fail against the current name-primary index.
+- [ ] **Step 5: Implement parser/APIs.** `migrateLegacy()` removes the exact legacy key and inserts the exact stable key in one in-memory transaction followed by one durable index write. Keep the existing global `association/associations` journal.
 
-- [ ] **Step 5: Implement stable/mixed parser and transaction APIs.** Keep one authoritative `associations.json` and the existing single global association journal. `migrateLegacy()` must atomically remove the exact legacy key and publish the exact stable record in the same in-memory transaction before one durable index write.
+- [ ] **Step 6: Preserve durable uncertainty and filesystem hardening.** Outcome unknown remains re-read/reconcile; do not weaken bounded no-follow reads, capacity checks, or symlink rejection.
 
-- [ ] **Step 6: Preserve outcome-unknown semantics.** Existing durable index outcome-unknown behavior remains “re-read/reconcile, do not blind rollback.” Do not weaken bounded ordinary file reads or symlink/size protections.
+- [ ] **Step 7: Update multi-process fixture/tests** for stable new operations plus explicit legacy fixtures.
 
-- [ ] **Step 7: Update multi-process fixture and tests** to use stable keys for new operations while retaining explicit legacy fixtures for migration tests.
-
-- [ ] **Step 8: Run GREEN and typecheck.**
+- [ ] **Step 8: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-association.test.ts \
-  test/github-authoritative-state.test.ts \
-  test/github-concurrency.test.ts
+  test/github-association.test.ts test/github-authoritative-state.test.ts test/github-concurrency.test.ts
 npm run _typecheck
 ```
-
-Expected: all pass.
 
 - [ ] **Step 9: Commit.**
 
 ```bash
 git add src/github/types.ts src/github/association.ts \
-  test/github-association.test.ts test/github-authoritative-state.test.ts \
-  test/github-concurrency.test.ts test/fixtures/github-store-worker.ts
+  test/github-association.test.ts test/github-authoritative-state.test.ts test/github-concurrency.test.ts \
+  test/fixtures/github-store-worker.ts
 git commit -m "feat: key GitHub associations by repository id"
 ```
 
 ---
 
-## Task 5: Add stable repository journals and read-only pre-#34 ownership inspection
+## Task 5: Add stable repository journals and read-only pre-#34 lock inspection
 
 **Files:**
 - Modify: `src/lock-journal.ts`
@@ -436,13 +400,13 @@ git commit -m "feat: key GitHub associations by repository id"
 - Modify: `test/fixtures/github-journal-worker.ts`
 - Modify: `test/github-concurrency.test.ts`
 
-**Consumes:** Existing immutable GitHub journal protocol and old name-keyed publication/association-identity journal directories.
+**Consumes:** Immutable ticket journals and current pre-#34 name-keyed publication/association-identity journal directories.
 
-**Produces:** `repository-identity` journal kind plus conservative read-only cutover preflight that acquires no old operational lock.
+**Produces:** `repository-identity` journal kind and a conservative read-only old-lock preflight.
 
-- [ ] **Step 1: Write failing repository-journal tests.** `withGitHubJournal(root, "repository-identity", String(repositoryId), ...)` must initialize/acquire/release under the same immutable ticket protocol. Add the necessary `ClaimOperation` value (for example `github-repository-identity`) and exact mapping.
+- [ ] **Step 1: Write failing repository-journal tests.** Add exact `ClaimOperation` value `github-repository-identity`; add `repository-identity` to `GitHubJournalKind`, `JOURNAL_KINDS`, operation map, initialization/recovery.
 
-- [ ] **Step 2: Write failing read-only inspection tests.** Export a focused API:
+- [ ] **Step 2: Write failing read-only inspection tests** for:
 
 ```ts
 export type LegacyGitHubJournalOwnershipState =
@@ -455,61 +419,57 @@ export type LegacyGitHubJournalOwnershipState =
 export async function inspectLegacyGitHubJournalOwnership(options: {
   githubRoot: string;
   kind: "publication" | "association-identity";
-  logicalKey: string; // exact old owner/repo#pr key
+  logicalKey: string; // exact old owner/repo#pr
   isProcessDefinitelyDead?: (pid: number) => boolean;
 }): Promise<{ state: LegacyGitHubJournalOwnershipState }>;
 ```
 
-It must scan/validate the old name-keyed journal state without publishing a claim to that logical key. Live owner => `live`; dead owner => `dead`; corrupt/incomplete/unsafe => `malformed` or `ambiguous`; absent path => `absent`.
+Classification: no unresolved owner -> `absent`; exactly proven dead current owner -> `dead`; exactly proven live owner -> `live`; corrupt/unsafe records -> `malformed`; queued/incomplete/ownership state that cannot be classified exactly -> `ambiguous`.
 
-- [ ] **Step 3: Add a concurrency fixture proving inspection does not acquire/block the old lock.** A live old writer remains the owner while inspection reports `live`; no new name-keyed claim is written by the #34 inspector.
+- [ ] **Step 3: Prove inspection acquires no old operational lock.** Hold a live old name-keyed journal claim in a fixture process; inspection reports `live`, does not append a competing claim, and does not disturb the owner.
 
 - [ ] **Step 4: Run RED.**
 
 ```bash
-node --experimental-strip-types --test \
-  test/github-journal.test.ts \
-  test/github-concurrency.test.ts
+node --experimental-strip-types --test test/github-journal.test.ts test/github-concurrency.test.ts
 ```
 
-Expected: unknown journal kind/API and missing inspection semantics fail.
+- [ ] **Step 5: Implement registration/inspection.** Reuse `scanLockJournal()` and stable journal reads. Do not recover/acquire the old logical lock inside inspection.
 
-- [ ] **Step 5: Implement journal registration and inspection.** Reuse `scanLockJournal()`/stable journal reads and the existing conservative PID identity rules. Do not recover or acquire the old logical lock inside inspection; recovery/remediation remains a separate explicit operator path.
-
-- [ ] **Step 6: Run GREEN and typecheck.**
+- [ ] **Step 6: Run GREEN/typecheck.**
 
 ```bash
-node --experimental-strip-types --test \
-  test/github-journal.test.ts \
-  test/github-concurrency.test.ts
+node --experimental-strip-types --test test/github-journal.test.ts test/github-concurrency.test.ts
 npm run _typecheck
 ```
-
-Expected: all pass.
 
 - [ ] **Step 7: Commit.**
 
 ```bash
-git add src/lock-journal.ts src/github/journal.ts \
-  test/github-journal.test.ts test/fixtures/github-journal-worker.ts test/github-concurrency.test.ts
+git add src/lock-journal.ts src/github/journal.ts test/github-journal.test.ts \
+  test/fixtures/github-journal-worker.ts test/github-concurrency.test.ts
 git commit -m "feat: add stable GitHub repository identity fences"
 ```
 
 ---
 
-## Task 6: Centralize exact PR target ownership and stable authorization helpers
+## Task 6: Centralize exact PR target proof, stable authorization guards, and shared run/index mutation
 
 **Files:**
 - Create: `src/github/pull-request.ts`
+- Create: `src/github/association-mutation.ts`
 - Modify: `src/github/adapter-identities.ts`
+- Modify: `src/github/adapter.ts` (extract mutation helpers only)
 - Create: `test/github-pull-request.test.ts`
+- Create: `test/github-association-mutation.test.ts`
 - Modify: `test/github-remote-match.test.ts`
+- Modify: `test/github-adapter.integration.test.ts`
 
-**Consumes:** Canonical current repository name, stable repository ID, ID-scoped PR-read/check token.
+**Consumes:** Canonical route, stable ID, PR-read/check token, run store, association transaction.
 
-**Produces:** Exact PR snapshot and one stable authorization helper; local remote remains candidate metadata only.
+**Produces:** Exact PR snapshot, stable guards, and one shared mutation primitive usable by adapter and migration.
 
-- [ ] **Step 1: Write failing PR snapshot tests.** Target interface:
+- [ ] **Step 1: Write failing PR snapshot tests.**
 
 ```ts
 export interface GitHubPullRequestSnapshot {
@@ -521,80 +481,79 @@ export interface GitHubPullRequestSnapshot {
   baseRepositoryId: number;
   baseRepository: string;
 }
-
-export async function readGitHubPullRequestSnapshot(options: {
-  http: GitHubHttpClient;
-  token: string;
-  repository: string;
-  pullRequestNumber: number;
-}): Promise<GitHubPullRequestSnapshot>;
 ```
 
-Prove malformed/missing `base.repo.id` fails, mismatched target ID can be detected by callers, and a fork PR with different `head.repo.id` is accepted when `base.repo.id` matches.
+`readGitHubPullRequestSnapshot({http, token, repository, pullRequestNumber})` rejects malformed/missing base repo identity. Fork PR with different `head.repo.id` remains parseable; caller compares only `baseRepositoryId` to target ID.
 
-- [ ] **Step 2: Write failing stable allowlist helper tests.** Replace name authorization with:
+- [ ] **Step 2: Write failing guard tests.**
 
 ```ts
-export function isRepositoryIdAllowed(
-  config: GitHubAppConfig,
-  repositoryId: number | undefined,
-): boolean;
-
-export function requireStableGitHubAssociation(
-  association: RunGitHubAssociation | undefined,
-): StableRunGitHubAssociation;
+export function isRepositoryIdAllowed(config: GitHubAppConfig, repositoryId: number | undefined): boolean;
+export function requireStableGitHubAssociation(association: RunGitHubAssociation | undefined): StableRunGitHubAssociation;
 ```
 
-Name-only associations must throw an explicit migration-required error in operational paths.
+ID-less association throws an explicit migration-required error. `remoteMatchesRepository()` remains exact candidate metadata and never authorizes.
 
-- [ ] **Step 3: Preserve remote semantics.** Keep `remoteMatchesRepository()` unchanged as exact GitHub-host candidate matching; add tests/comments making clear it is not authorization and no redirect resolution is attempted.
+- [ ] **Step 3: Write failing shared mutation tests.** Extract current `eventHistoryIdentity`, `associationRollbackInvariant`, run rollback, and association-coupled save into `association-mutation.ts` with concrete API:
+
+```ts
+export async function saveGitHubAssociationMutation(options: {
+  store: RunStore;
+  transaction: GitHubAssociationTransaction;
+  before: RunRecord;
+  candidate: RunRecord;
+}): Promise<void>;
+```
+
+It may change only `github` and `evidence`; known transaction failure can compensate the run; durable outcome unknown is re-read/reconciled, never blind rollback.
 
 - [ ] **Step 4: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-pull-request.test.ts \
-  test/github-remote-match.test.ts
+  test/github-pull-request.test.ts test/github-association-mutation.test.ts \
+  test/github-remote-match.test.ts test/github-adapter.integration.test.ts
 ```
 
-- [ ] **Step 5: Implement the modules** with exact shape validation and current hardcoded GitHub API origin. The PR helper parses data only; repository-ID comparison is explicit at each caller so tests can prove fork behavior.
+- [ ] **Step 5: Implement PR helper/guards/shared mutation module.** Make `adapter.ts` consume the shared mutation module so migration will not reach into private adapter methods.
 
-- [ ] **Step 6: Run GREEN and typecheck.**
+- [ ] **Step 6: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-pull-request.test.ts \
-  test/github-remote-match.test.ts
+  test/github-pull-request.test.ts test/github-association-mutation.test.ts \
+  test/github-remote-match.test.ts test/github-adapter.integration.test.ts
 npm run _typecheck
 ```
 
 - [ ] **Step 7: Commit.**
 
 ```bash
-git add src/github/pull-request.ts src/github/adapter-identities.ts \
-  test/github-pull-request.test.ts test/github-remote-match.test.ts
-git commit -m "feat: prove GitHub pull request target identity"
+git add src/github/pull-request.ts src/github/association-mutation.ts src/github/adapter-identities.ts \
+  src/github/adapter.ts test/github-pull-request.test.ts test/github-association-mutation.test.ts \
+  test/github-remote-match.test.ts test/github-adapter.integration.test.ts
+git commit -m "refactor: share GitHub association mutation safety"
 ```
 
 ---
 
-## Task 7: Give webhook processing a typed permanent disposition and listener-process drop observability
+## Task 7: Give webhook dispatch a permanent disposition and listener-process drop observability
 
 **Files:**
 - Create: `src/github/dispatch-disposition.ts`
 - Modify: `src/github/webhook-worker.ts`
 - Modify: `src/github/webhook-diagnostic.ts`
-- Modify: `src/github/adapter.ts` (dispatch return type/callback plumbing only; stable routing comes next task)
-- Modify: `src/cli-runner.ts` (safe diagnostic rendering only)
+- Modify: `src/github/adapter.ts`
+- Modify: `src/cli-runner.ts` (diagnostic rendering only)
 - Modify: `test/github-webhook-worker.test.ts`
 - Modify: `test/github-durable-ingress.test.ts`
 - Modify: `test/github-cli-http.test.ts`
 
-**Consumes:** Normalized events and dispatch result; durable inbox complete/retry primitives.
+**Consumes:** Dispatch result and durable inbox completion/retry.
 
-**Produces:** Permanent reject => complete, transient throw => retry; process-local reason-coded counter emitted through the existing listener diagnostic callback.
+**Produces:** Permanent reject -> complete; transient throw -> retry; process-local reason/count emitted only after durable completion.
 
-- [ ] **Step 1: Write failing worker tests** for a result vocabulary:
+- [ ] **Step 1: Write failing worker tests** for exact result vocabulary:
 
 ```ts
 export type GitHubPermanentRepositoryRejectReason =
@@ -608,38 +567,28 @@ export type GitHubDispatchResult =
   | { kind: "permanent-reject"; reason: GitHubPermanentRepositoryRejectReason };
 ```
 
-A permanent result must call `inbox.complete`, not `retry`. A thrown transient error still calls `retry`.
+Permanent result calls `complete`, not `retry`. Thrown transient failure still calls `retry`.
 
-- [ ] **Step 2: Protect exactly-once counter semantics around completion.** Add a test where permanent dispatch succeeds but `inbox.complete` fails: the counter callback must **not** increment yet, because the delivery was not durably consumed. On a later successful completion it increments once.
+- [ ] **Step 2: Test completion/counter ordering.** Permanent dispatch + failed `complete()` must not increment the counter. A later successful completion increments exactly once.
 
-- [ ] **Step 3: Define the counter reader.** `GitHubAppAdapter` owns:
+- [ ] **Step 3: Define the counter reader.** Adapter owns `permanentRepositoryDropsSinceStart`, saturating at `Number.MAX_SAFE_INTEGER`. After successful durable completion of a permanently rejected repo delivery, increment and emit a bounded reason-coded diagnostic through the existing listener-process `onWebhookDiagnostic` callback. This callback is the reader. Do not persist the counter or expose it via `doctor`.
 
-```ts
-private permanentRepositoryDropsSinceStart = 0;
-```
-
-After successful durable completion of a permanent repository reject, saturating-increment it to `Number.MAX_SAFE_INTEGER` and emit a diagnostic through the existing `onWebhookDiagnostic` listener-process callback containing `reason` and current count. This callback emission is the defined reader; do not persist the counter and do not expose it through `doctor`.
-
-- [ ] **Step 4: Add safe production rendering test.** `src/cli-runner.ts` must print only bounded/sanitized code, reason, delivery/event identity, attempt, and count; arbitrary causes/secrets remain redacted.
+- [ ] **Step 4: Write safe CLI diagnostic rendering tests.** Output contains only sanitized code/reason/delivery/event/attempt/count, not arbitrary cause/secret text.
 
 - [ ] **Step 5: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-webhook-worker.test.ts \
-  test/github-durable-ingress.test.ts \
-  test/github-cli-http.test.ts
+  test/github-webhook-worker.test.ts test/github-durable-ingress.test.ts test/github-cli-http.test.ts
 ```
 
-- [ ] **Step 6: Implement worker/adapter completion plumbing.** Both background worker and synchronous deterministic dispatch use the same result type. Emit the permanent diagnostic only after `complete()` succeeds. Completion failure follows existing completion-recovery semantics.
+- [ ] **Step 6: Implement background and synchronous completion plumbing** with the same result type. Emit permanent-drop diagnostics only after `complete()` succeeds. Completion failure follows current recovery/retry semantics.
 
-- [ ] **Step 7: Run GREEN and typecheck.**
+- [ ] **Step 7: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-webhook-worker.test.ts \
-  test/github-durable-ingress.test.ts \
-  test/github-cli-http.test.ts
+  test/github-webhook-worker.test.ts test/github-durable-ingress.test.ts test/github-cli-http.test.ts
 npm run _typecheck
 ```
 
@@ -647,116 +596,96 @@ npm run _typecheck
 
 ```bash
 git add src/github/dispatch-disposition.ts src/github/webhook-worker.ts src/github/webhook-diagnostic.ts \
-  src/github/adapter.ts src/cli-runner.ts \
-  test/github-webhook-worker.test.ts test/github-durable-ingress.test.ts test/github-cli-http.test.ts
+  src/github/adapter.ts src/cli-runner.ts test/github-webhook-worker.test.ts \
+  test/github-durable-ingress.test.ts test/github-cli-http.test.ts
 git commit -m "feat: consume permanent GitHub identity rejections"
 ```
 
 ---
 
-## Task 8: Move the adapter to stable routing/reconciliation and split mixed revocation fan-out by record class
+## Task 8: Move the adapter to stable routing/reconciliation and split mixed revocation fan-out
 
 **Files:**
 - Modify: `src/github/adapter.ts`
-- Modify: `src/github/adapter-identities.ts`
 - Modify: `test/github-adapter.integration.test.ts`
 - Modify: `test/github-suspend-reconcile.test.ts`
 - Modify: `test/issue28-github-reconciliation.test.ts`
 - Modify: `test/github-concurrency.test.ts`
 
-**Consumes:** Stable events, stable/mixed association APIs, canonical lookup, exact PR snapshot, stable journal kinds, typed dispatch disposition.
+**Consumes:** Stable events/index/guards, token provider, canonical lookup, PR snapshot, shared mutation helper, stable journal kind, dispatch disposition.
 
-**Produces:** Stable-ID publication/association locking, live rename reconciliation, stable first association, and explicit mixed `installation.deleted` fan-out.
+**Produces:** Stable ID routing/locking, live rename reconciliation, and explicit stable-vs-legacy `installation.deleted`/removal fan-out.
 
-- [ ] **Step 1: Update test fixtures first** to include stable repository ID and complete live PR objects (`base.repo.id/full_name`, base/head refs/SHA). Keep explicit historical legacy fixtures where the test is about migration/removal.
+- [ ] **Step 1: Update ordinary fixtures first** with stable repo ID and complete live PR base/head objects; retain ID-less fixtures only where historical behavior is under test.
 
-- [ ] **Step 2: Write failing rename tests.** Prove:
-  - same ID/new name locates the existing association;
-  - old-name replay with same ID cannot overwrite current canonical name;
-  - same name/different ID permanently rejects with zero run/index/check mutation;
-  - manual publication reconciles canonical name by ID before building REST paths;
-  - an already associated run survives rename even if `workspace.remote` remains the old slug;
-  - an unassociated stale old remote does not auto-associate.
+- [ ] **Step 2: Write failing rename tests.** Same ID/new name resolves existing run; old-name replay same ID cannot roll name back; same text/different ID permanently rejects with zero authority increase; manual publication reconciles canonical name first; stale old `workspace.remote` does not invalidate an already stable association; stale old remote cannot first-associate automatically.
 
-- [ ] **Step 3: Write failing stable fence tests.** Replace name keys with:
+- [ ] **Step 3: Write failing stable fence tests.** Exact stable sequence:
 
-```ts
-withGitHubJournal(root, "repository-identity", String(repositoryId), ...)
-withGitHubJournal(root, "publication", `${repositoryId}#${pr}`, ...)
-withGitHubJournal(root, "association-identity", `${repositoryId}#${pr}`, ...)
+```text
+repository-identity(repositoryId)
+  -> publication/association-identity(repositoryId#pr)
+    -> run target mutation fence(runId)
+      -> global association transaction / check-create
 ```
 
-Require lock order: repository -> PR -> run target -> association transaction/check-create.
+No global association transaction may acquire a run target fence from inside the transaction.
 
-- [ ] **Step 4: Write failing mixed `installation.deleted` tests (round-3 clarification).** Seed one stable association and one legacy ID-less association for the same installation. The shared suspension fan-out must classify each record:
-  - stable record: `repository-identity(id) -> PR association fence -> run target fence -> global association transaction`;
-  - legacy record: `run target fence -> global association transaction`, re-proving `repositoryId === undefined`, same installation, same legacy name; no name-keyed or ID-keyed repository fence.
+- [ ] **Step 4: Write mixed `installation.deleted` tests (round-3 clarification).** Seed stable and legacy ID-less records under one installation. Shared fan-out classifies first:
+  - stable -> repository-ID fence -> PR fence -> run fence -> global association transaction;
+  - legacy -> run fence -> global association transaction, re-proving ID absent + same installation/name; no name-keyed or ID-keyed repository fence.
 
-Keep aggregation semantics: a failure on one record does not skip later records; aggregate after attempting all. Preserve non-ENOENT load errors. For a genuinely missing run record, only authority-reducing index state may be reconciled; never invent a run or stable identity.
+A failure on one record does not skip later records; aggregate after all attempts. Non-ENOENT run-load errors propagate. If an index record points to a truly missing run, only authority-reducing index suspension may be reconciled under the global association transaction; never invent a run or ID.
 
 - [ ] **Step 5: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-adapter.integration.test.ts \
-  test/github-suspend-reconcile.test.ts \
-  test/issue28-github-reconciliation.test.ts \
-  test/github-concurrency.test.ts
+  test/github-adapter.integration.test.ts test/github-suspend-reconcile.test.ts \
+  test/issue28-github-reconciliation.test.ts test/github-concurrency.test.ts
 ```
 
-Expected: current name fences/name allowlist/current PR parser and shared name-fenced suspension path fail the new assertions.
+- [ ] **Step 6: Change adapter token provider** to `GitHubRepositoryTokenProvider`; all repository authorization uses stable ID.
 
-- [ ] **Step 6: Change the adapter token-provider contract** to:
+- [ ] **Step 7: Implement canonical reconciliation.** Under stable repository fence: allowlist ID -> metadata token -> canonical lookup -> shared run/index name refresh -> reload/re-prove -> route API by reconciled name.
 
-```ts
-(installationId: number, repositoryId: number, purpose: GitHubInstallationTokenPurpose) => Promise<string>
-```
+- [ ] **Step 8: Replace current PR read** with `readGitHubPullRequestSnapshot()` and require `snapshot.baseRepositoryId === repositoryId`. Preserve stale/out-of-order lifecycle logic and #28 behavior.
 
-and route all repository authorization through `isRepositoryIdAllowed()`.
+- [ ] **Step 9: Refactor suspension fan-out** into `suspendStableAssociation()` and `suspendLegacyAssociation()` with the exact lock orders above and shared mutation helper. New ID-bearing repository removal selects stable records by ID; historical ID-less removal selects only unresolved legacy records by exact installation/name.
 
-- [ ] **Step 7: Implement stable canonical reconciliation.** Under repository-ID fence, ID-scope metadata token -> canonical lookup -> recoverable run/index name refresh -> reload/re-prove. Name mismatch alone never authorizes mutation.
-
-- [ ] **Step 8: Replace `currentPullRequest()` with `readGitHubPullRequestSnapshot()`.** For every association/publication read require `snapshot.baseRepositoryId === repositoryId`. Preserve live-state/head ordering and #28 stale-head behavior.
-
-- [ ] **Step 9: Refactor suspension fan-out.** Replace one name-fenced `suspendAssociations()` path with explicit `suspendStableAssociation()` and `suspendLegacyAssociation()` helpers and one classifier. Stable and legacy branches must use the exact lock orders above; no transaction may acquire a run fence after it is already held.
-
-- [ ] **Step 10: Run GREEN and typecheck.**
+- [ ] **Step 10: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-adapter.integration.test.ts \
-  test/github-suspend-reconcile.test.ts \
-  test/issue28-github-reconciliation.test.ts \
-  test/github-concurrency.test.ts
+  test/github-adapter.integration.test.ts test/github-suspend-reconcile.test.ts \
+  test/issue28-github-reconciliation.test.ts test/github-concurrency.test.ts
 npm run _typecheck
 ```
 
 - [ ] **Step 11: Commit.**
 
 ```bash
-git add src/github/adapter.ts src/github/adapter-identities.ts \
-  test/github-adapter.integration.test.ts test/github-suspend-reconcile.test.ts \
+git add src/github/adapter.ts test/github-adapter.integration.test.ts test/github-suspend-reconcile.test.ts \
   test/issue28-github-reconciliation.test.ts test/github-concurrency.test.ts
 git commit -m "feat: route GitHub operations by stable repository id"
 ```
 
 ---
 
-## Task 9: Make check ownership stable across rename and build a verified legacy alias primitive
+## Task 9: Make check ownership stable across rename and verify legacy production aliases
 
 **Files:**
 - Modify: `src/github/checks.ts`
 - Create: `src/github/check-identity-migration.ts`
-- Modify: `src/github/side-effect-store.ts` only if a small read/put reconciliation helper is needed; do not change persisted record shape.
 - Modify: `test/github-checks.test.ts`
 - Create: `test/github-check-identity-migration.test.ts`
 - Modify: `test/github-concurrency.test.ts`
 
-**Consumes:** Stable repository ID, canonical route name, PR/head/check identity, old name-derived side-effect records/check resources.
+**Consumes:** Stable ID, canonical route name, PR/head/check identity, existing side-effect store.
 
-**Produces:** Stable check key and one-time authenticated attempt-1 legacy ownership aliasing.
+**Produces:** Stable check key and one-time authenticated legacy production attempt-1 aliasing. `GitHubSideEffectStore` persisted shape remains unchanged.
 
-- [ ] **Step 1: Write failing stable-key tests.** Export deterministic key builders:
+- [ ] **Step 1: Write failing stable-key tests.**
 
 ```ts
 export function checkRunIdempotencyKey(
@@ -778,9 +707,9 @@ export function legacyCheckRunIdempotencyKey(
 ): string;
 ```
 
-`CheckPublisher` receives `repositoryId`; owner/repo remains only REST routing.
+`CheckPublisher` receives `repositoryId`; owner/repo is REST routing only.
 
-- [ ] **Step 2: Write failing alias tests.** Target helper:
+- [ ] **Step 2: Write failing alias tests** for:
 
 ```ts
 export async function aliasLegacyAttemptOneChecks(options: {
@@ -795,61 +724,50 @@ export async function aliasLegacyAttemptOneChecks(options: {
 }): Promise<void>;
 ```
 
-For each MASWE check/head:
-  - if old local record exists, GET/verify the exact GitHub check resource has expected check name, head SHA, and legacy external ID before writing the new stable key -> same resource ID;
-  - if old local record is absent, list exact head/name and find a unique legacy external-ID match;
-  - multiple matches conflict;
-  - no match means no alias;
-  - old local record remains untouched.
+If old local record exists, authenticated GET verifies exact check name/head/legacy external ID before stable key -> same resource ID is written. If local record is absent, list exact head/name and require a unique legacy external-ID match. Multiple matches conflict; no match produces no alias; old record stays untouched.
 
-- [ ] **Step 3: Prove production attempt scope.** Add a source-level/constructor test that production `GitHubAppAdapter` does not pass `attempt`, so production remains attempt 1. Explicit non-1 tests continue to work but are not migration authority.
+- [ ] **Step 3: Prove production attempt scope.** Source/constructor regression verifies the sole production adapter construction does not pass an `attempt`, so production remains default 1. Explicit non-1 test seams remain non-migration authority.
 
 - [ ] **Step 4: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-checks.test.ts \
-  test/github-check-identity-migration.test.ts \
-  test/github-concurrency.test.ts
+  test/github-checks.test.ts test/github-check-identity-migration.test.ts test/github-concurrency.test.ts
 ```
 
-- [ ] **Step 5: Implement stable keying and alias helper.** Side-effect alias writes remain ordinary `GitHubSideEffectStore.put()` under the stable create lock. If an alias write reports outcome unknown, re-read the stable key and continue only if it equals the intended resource ID.
+- [ ] **Step 5: Implement stable keying and alias helper** using existing side-effect `get`/`put` and stable check-create lock. Outcome-unknown alias write is re-read; continue only when the stable key maps to the intended resource ID.
 
-- [ ] **Step 6: Run GREEN and typecheck.**
+- [ ] **Step 6: Run GREEN/typecheck.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-checks.test.ts \
-  test/github-check-identity-migration.test.ts \
-  test/github-concurrency.test.ts
+  test/github-checks.test.ts test/github-check-identity-migration.test.ts test/github-concurrency.test.ts
 npm run _typecheck
 ```
 
 - [ ] **Step 7: Commit.**
 
 ```bash
-git add src/github/checks.ts src/github/check-identity-migration.ts src/github/side-effect-store.ts \
+git add src/github/checks.ts src/github/check-identity-migration.ts \
   test/github-checks.test.ts test/github-check-identity-migration.test.ts test/github-concurrency.test.ts
 git commit -m "feat: stabilize GitHub check ownership across renames"
 ```
 
 ---
 
-## Task 10: Implement the restartable repository-identity migration checkpoint and service
+## Task 10: Implement the restartable repository-identity migration store/service
 
 **Files:**
 - Create: `src/github/repository-identity-migration-store.ts`
 - Create: `src/github/repository-identity-migration.ts`
 - Create: `test/github-repository-identity-migration.test.ts`
 - Create: `test/github-repository-identity-migration-crash.test.ts`
-- Modify: `src/github/association.ts` only for migration query/reconciliation gaps discovered by these tests.
-- Modify: `src/github/adapter.ts` only to expose/reuse already-hardened association mutation primitives if needed; do not duplicate them.
 
-**Consumes:** Quiescent legacy state, stable live config, read-only legacy journal inspection, canonical lookup, PR target proof, association transaction, run store, #28 revalidation, check alias helper.
+**Consumes:** Quiescent legacy state, stable config, old-lock inspection, canonical lookup, PR proof, association APIs, shared mutation helper, #28 revalidation, check alias helper.
 
-**Produces:** Exact migration checkpoint, union candidate-universe restart logic, stable run/index associations, current canonical metadata, preserved/invalidated SHA evidence as appropriate.
+**Produces:** Exact checkpoint, union candidate universe, stable run/index state, current canonical metadata, correct stale-head revalidation and check aliases.
 
-- [ ] **Step 1: Write the checkpoint store tests first.** Persist exact record:
+- [ ] **Step 1: Write checkpoint-store tests.** Exact record:
 
 ```ts
 export interface RepositoryIdentityMigrationRecord {
@@ -863,9 +781,9 @@ export interface RepositoryIdentityMigrationRecord {
 }
 ```
 
-Store under `.maswe/github/repository-identity-migrations/<sha256(repositoryId + "\0" + legacyRepository)>.json`. Use bounded ordinary reads and durable atomic writes; exact fields only; symlink/oversize/malformed state fails closed.
+Path: `.maswe/github/repository-identity-migrations/<sha256(repositoryId + "\0" + legacyRepository)>.json`. Use bounded no-follow reads/durable atomic writes/exact fields. Symlink/oversize/malformed state fails.
 
-- [ ] **Step 2: Write migration happy-path tests.** Target service:
+- [ ] **Step 2: Write happy-path service tests** for concrete constructor:
 
 ```ts
 export class RepositoryIdentityMigrationService {
@@ -880,56 +798,56 @@ export class RepositoryIdentityMigrationService {
     afterStep?: (step: RepositoryIdentityMigrationStep) => Promise<void>;
   });
 
-  migrate(input: {
-    legacyRepository: string;
-    repositoryId: number;
-  }): Promise<RepositoryIdentityMigrationResult>;
+  migrate(input: { legacyRepository: string; repositoryId: number }): Promise<RepositoryIdentityMigrationResult>;
 }
 ```
 
-Prove old-name run/index becomes same stable ID/current canonical name; rerun is no-op; same normalized selector/different ID conflicts with zero mutation.
+Prove legacy run/index -> same stable ID/current canonical name; rerun no-op; same normalized selector/different ID conflict with zero mutation.
 
-- [ ] **Step 3: Write union candidate-universe restart tests.** After one run is already migrated and another remains legacy, restart must inspect both:
-  1. legacy records matching normalized old name;
-  2. stable records matching target repository ID.
+- [ ] **Step 3: Write union restart tests.** Candidate universe each pass is unresolved legacy-by-normalized-name **union** stable-by-target-ID. Re-derive distinct installation IDs from that union. A partially migrated run remains visible after restart.
 
-Re-derive distinct installation IDs from that union every pass.
+- [ ] **Step 4: Write proof/lifecycle tests.** Every installation must prove the ID via canonical lookup; every PR must report `base.repo.id === repositoryId`. Closed PR applies closure suspension. Same ID can reconcile to another newer canonical name during restart.
 
-- [ ] **Step 4: Write migration proof tests.** For every candidate require installation access by ID and live PR `base.repo.id === repositoryId`. Missing/ambiguous API data is not identity proof. Closed PR uses existing closure suspension. Same ID/current new name can refresh again during restart.
+- [ ] **Step 5: Write stale-head tests with exact lock sequence.** Under outer repository-ID + PR fence:
+  1. acquire run target fence + global association transaction;
+  2. migrate stable identity/update `run.github.headSha` and pending cancellation intent through `saveGitHubAssociationMutation()`;
+  3. release global association transaction/run fence;
+  4. if live head differs from workflow target, call existing `RevalidationService.route()` while still under repository/PR fences so it may acquire the run target fence in the correct order;
+  5. only after revalidation state is durable, alias/check ownership work may continue.
 
-- [ ] **Step 5: Write stale-head tests.** Unchanged head preserves valid evidence. Changed head must create/update the same #28 GitHub-origin revalidation semantics and pending cancellation intent; migration cannot silently make old evidence current.
+Unchanged head preserves valid evidence. Changed head cannot silently reuse old evidence.
 
-- [ ] **Step 6: Write crash/outcome-unknown tests with an explicit step seam.** Cover at least:
-  - before checkpoint;
-  - checkpoint published before first mutation;
-  - run save before index publication;
-  - index publication before checkpoint refresh;
-  - stable check alias publication;
-  - all associations stable before final complete marker;
-  - run/index/checkpoint/side-effect alias atomic outcome unknown.
+- [ ] **Step 6: Write crash/outcome-unknown tests** using exact `afterStep` names:
 
-On restart, exact intended post-state must be re-read and either resumed idempotently or rejected on concrete conflict.
+```ts
+type RepositoryIdentityMigrationStep =
+  | "checkpoint-started"
+  | "association-published"
+  | "revalidation-routed"
+  | "check-aliases-published"
+  | "before-complete"
+  | "complete";
+```
 
-- [ ] **Step 7: Write old-lock preflight tests.** For every affected legacy PR, inspect old name-keyed publication and association-identity keys. `live`, `malformed`, or `ambiguous` blocks migration before run/index mutation. `dead`/`absent` can proceed according to documented journal recovery policy. The service never proves process quiescence from lock inspection alone; CLI/operator precondition remains mandatory.
+Inject failure before checkpoint, after checkpoint, after run publication before index commit via store/index seams, after index before checkpoint refresh, during check alias, before complete; separately inject run/index/checkpoint/side-effect outcome unknown. Restart either proves exact intended state and continues or fails on a concrete conflict.
+
+- [ ] **Step 7: Write old-lock preflight tests.** For every affected legacy PR inspect old `publication` and `association-identity` logical keys. `live`, `malformed`, or `ambiguous` blocks migration before run/index mutation. `dead`/`absent` follows documented recovery policy. Inspection never claims operator quiescence; quiescence remains a CLI/operator precondition.
 
 - [ ] **Step 8: Run RED.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-repository-identity-migration.test.ts \
-  test/github-repository-identity-migration-crash.test.ts
+  test/github-repository-identity-migration.test.ts test/github-repository-identity-migration-crash.test.ts
 ```
 
-- [ ] **Step 9: Implement checkpoint store and migration service.** Acquire `repository-identity(repositoryId)` once for a migration pass; do not recursively reacquire it. For each run use PR/run/global-association order. Use `migrateLegacy()` for index key conversion, `saveAssociationMutation`-equivalent rollback discipline for run/index synchronization, canonical lookup/PR proof, check aliasing, and final full rescan before `status: "complete"`.
+- [ ] **Step 9: Implement store/service.** Acquire `repository-identity(repositoryId)` once for the migration pass. Per PR acquire stable PR fence, then run/global association as required. Use shared mutation module, canonical/PR proof, `RevalidationService.route()` only after releasing the previous run/global transaction, check alias helper, outcome-unknown re-reads, and final full union rescan before checkpoint `complete`.
 
 - [ ] **Step 10: Run GREEN plus adjacent recovery suites.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/github-repository-identity-migration.test.ts \
-  test/github-repository-identity-migration-crash.test.ts \
-  test/issue28-github-reconciliation.test.ts \
-  test/github-suspend-reconcile.test.ts \
+  test/github-repository-identity-migration.test.ts test/github-repository-identity-migration-crash.test.ts \
+  test/issue28-github-reconciliation.test.ts test/github-suspend-reconcile.test.ts \
   test/github-authoritative-state.test.ts
 npm run _typecheck
 ```
@@ -938,15 +856,15 @@ npm run _typecheck
 
 ```bash
 git add src/github/repository-identity-migration-store.ts src/github/repository-identity-migration.ts \
-  src/github/association.ts src/github/adapter.ts \
   test/github-repository-identity-migration.test.ts test/github-repository-identity-migration-crash.test.ts \
-  test/issue28-github-reconciliation.test.ts test/github-suspend-reconcile.test.ts test/github-authoritative-state.test.ts
+  test/issue28-github-reconciliation.test.ts test/github-suspend-reconcile.test.ts \
+  test/github-authoritative-state.test.ts
 git commit -m "feat: migrate legacy GitHub repository identity safely"
 ```
 
 ---
 
-## Task 11: Add the migration CLI, enforce quiescent cutover, synchronize active docs/contracts, and gate Issue #3
+## Task 11: Add migration CLI, enforce cutover, synchronize docs, and gate Issue #3
 
 **Files:**
 - Modify: `src/cli-args.ts`
@@ -958,57 +876,50 @@ git commit -m "feat: migrate legacy GitHub repository identity safely"
 - Modify: `docs/SECURITY.md`
 - Modify: `docs/ARCHITECTURE.md`
 - Modify: `CHANGELOG.md`
-- GitHub metadata: update Issue #3 Phase B entry gate after code/docs are locally green.
+- GitHub metadata: update Issue #3 after local code/docs are green.
 
-**Consumes:** Migration service, approved stable config, listener/manual publisher entrypoints.
+**Consumes:** Migration service and listener/manual publisher entrypoints.
 
-**Produces:** Operator command, enforceable cutover ordering, documented redelivery procedure, synchronized Phase B gate.
+**Produces:** Operator migration command, enforceable stable-ID listener gate, documented cutover/redelivery procedure, explicit #3 entry gate.
 
-- [ ] **Step 1: Write failing CLI parser tests** for:
+- [ ] **Step 1: Write failing parser tests** for:
 
 ```text
-maswe github-migrate-repository \
-  --from <legacy-owner/repo> \
-  --repository-id <positive-safe-integer> \
-  [--json]
+maswe github-migrate-repository --from <legacy-owner/repo> --repository-id <positive-safe-integer> [--json]
 ```
 
-Add `from` and `repository-id` as exact single-value options. Reject missing option, duplicate option, invalid owner/repo, zero/fractional/unsafe ID, positional extras. Normalize `--from Owner/Repo` to lowercase before service invocation.
+Add exact single-value options `from`, `repository-id`; reject missing/duplicate/invalid names/IDs/extra positionals. Normalize `Owner/Repo` to lowercase before service call.
 
-- [ ] **Step 2: Write failing command tests.** Migration requires GitHub App credentials + live stable allowlist. It prints deterministic JSON when requested and a concise text summary otherwise. It must never start a listener.
+- [ ] **Step 2: Write failing command tests.** Migration requires GitHub credentials + live stable allowlist, invokes migration service, never starts listener, emits deterministic JSON/text result.
 
-- [ ] **Step 3: Write failing listener cutover tests.** `github-webhook` must reject before listener readiness when `allowedRepositoryIds` is empty. Tests must configure IDs before listener start. Maintain the permanent-reject counter only as a defense for embedded/direct adapter misuse; the supported CLI ordering makes that window zero.
+- [ ] **Step 3: Write failing listener cutover tests.** `github-webhook` rejects before listener readiness if `allowedRepositoryIds` is empty. Supported cutover configures IDs and completes migration before listener start. Process-local permanent-drop defense remains for embedded/direct misuse only.
 
-- [ ] **Step 4: Update the CLI token factory.** `githubAdapterForCommand` provides `(installationId, repositoryId, purpose)` to `createInstallationAccessToken`. Ensure token, PR, repository-list, and check calls share the current bounded `GitHubHttpClient`.
+- [ ] **Step 4: Update CLI token factory** to `GitHubRepositoryTokenProvider`; token, repository lookup, PR read, and checks all share current bounded `GitHubHttpClient`.
 
 - [ ] **Step 5: Run RED.**
 
 ```bash
-node --experimental-strip-types --test \
-  test/github-identity-cli.test.ts \
-  test/github-cli-http.test.ts
+node --experimental-strip-types --test test/github-identity-cli.test.ts test/github-cli-http.test.ts
 ```
 
-- [ ] **Step 6: Implement CLI command/cutover guard and run GREEN.**
+- [ ] **Step 6: Implement command/cutover guard and run GREEN/typecheck.**
 
 ```bash
-node --experimental-strip-types --test \
-  test/github-identity-cli.test.ts \
-  test/github-cli-http.test.ts
+node --experimental-strip-types --test test/github-identity-cli.test.ts test/github-cli-http.test.ts
 npm run _typecheck
 ```
 
-- [ ] **Step 7: Synchronize active documentation.** Document exact cutover order:
+- [ ] **Step 7: Synchronize active docs.** Exact cutover:
   1. stop all pre-#34 webhook/manual publishers;
   2. configure approved `allowedRepositoryIds`;
-  3. run read-only old-journal preflight through migration command;
-  4. run all required migrations to completion;
+  3. run old-journal preflight through migration;
+  4. finish required migrations;
   5. start #34 listener/manual publisher;
-  6. inspect GitHub App delivery history for transport failures during the deliberate outage and explicitly redeliver them.
+  6. inspect GitHub App delivery history for transport failures during outage and explicitly redeliver them.
 
-Also document 10,000-row traversal-limit action (narrow installation repository scope; do not raise bound ad hoc), unsupported downgrade, stable/legacy lock orders, stable token purposes, permanent-drop diagnostic counter semantics, check-key migration, and no redirect-based equivalence.
+Also document 10,000-row traversal-limit response (narrow installation scope), unsupported downgrade, stable/legacy lock orders, token purposes, permanent-drop diagnostic semantics, check-key aliasing, and no redirect-based identity.
 
-- [ ] **Step 8: Run doc/code drift searches.** Inspect every result; names may remain only as routing/display/migration selector.
+- [ ] **Step 8: Run drift searches and inspect every hit.**
 
 ```bash
 git grep -n "allowedRepositories" -- src schemas docs test
@@ -1017,17 +928,17 @@ git grep -n "new CheckPublisher" -- src
 git grep -n "withGitHubJournal.*publication\|withGitHubJournal.*association-identity" -- src/github
 ```
 
-Expected: no repository-scoped authorization or stable lock is still keyed by mutable owner/repo; the sole production `CheckPublisher` construction has no non-1 attempt override.
+Expected: no operational authorization/stable lock is name-keyed; sole production `CheckPublisher` construction has no non-1 attempt override.
 
-- [ ] **Step 9: Update Issue #3 Phase B entry gate through GitHub.** Add an explicit unchecked gate item equivalent to:
+- [ ] **Step 9: Update Issue #3 through GitHub.** Add entry gate:
 
 ```markdown
 - [ ] #34 stable repository identity is completed, independently validated, merged, and post-merge `main` is revalidated before Phase B obtains GitHub write authority.
 ```
 
-Also update the status prose so it no longer says Phase B is blocked only by #27. Do not alter B1-B4 scope.
+Update status prose so #27 is not the only blocker; do not alter B1-B4 scope.
 
-- [ ] **Step 10: Run focused docs/CLI plus full typecheck.**
+- [ ] **Step 10: Run focused docs/CLI/typecheck/diff validation.**
 
 ```bash
 node --experimental-strip-types --test test/github-identity-cli.test.ts test/github-cli-http.test.ts
@@ -1035,7 +946,7 @@ npm run _typecheck
 git diff --check
 ```
 
-- [ ] **Step 11: Commit.**
+- [ ] **Step 11: Commit code/docs.**
 
 ```bash
 git add src/cli-args.ts src/cli-runner.ts test/github-identity-cli.test.ts test/github-cli-http.test.ts \
@@ -1043,21 +954,21 @@ git add src/cli-args.ts src/cli-runner.ts test/github-identity-cli.test.ts test/
 git commit -m "docs: operationalize stable GitHub repository identity"
 ```
 
-Record the Issue #3 mutation URL/ID in the implementation report; the GitHub issue edit is external metadata and is not part of the Git commit.
+Record Issue #3 mutation URL/ID in the implementation report; it is external metadata, not Git history.
 
 ---
 
 ## Task 12: Full regression, exact supported-baseline validation, independent review, and governed merge
 
 **Files:**
-- Modify only if validation exposes a concrete Issue #34 defect; otherwise no new product scope.
-- GitHub: PR for the implementation branch; Issue #34 completion evidence; Issue #3 gate already updated in Task 11.
+- Modify only for a concrete #34 defect exposed by validation/review; no new feature scope.
+- GitHub: implementation PR, #34 completion evidence, #3 gate already updated.
 
 **Consumes:** Complete implementation branch.
 
 **Produces:** Fresh exact-head evidence suitable for owner merge decision.
 
-- [ ] **Step 1: Run canonical Node 24.18.0 validation from a clean dependency install.**
+- [ ] **Step 1: Exact Node 24.18.0 validation from clean dependencies.**
 
 ```bash
 nvm use 24.18.0
@@ -1068,9 +979,9 @@ npm run pack:dry
 git diff --check
 ```
 
-Expected: Node prints `v24.18.0`; all commands exit 0.
+Expected: `v24.18.0`; all commands exit 0.
 
-- [ ] **Step 2: Run exact Node 22.22.2 compatibility validation.**
+- [ ] **Step 2: Exact Node 22.22.2 compatibility validation.**
 
 ```bash
 nvm use 22.22.2
@@ -1081,75 +992,64 @@ npm run pack:dry
 git diff --check
 ```
 
-Expected: Node prints `v22.22.2`; all commands exit 0.
+Expected: `v22.22.2`; all commands exit 0.
 
-- [ ] **Step 3: Re-run the focused #34 matrix on the final head.**
+- [ ] **Step 3: Re-run the focused final-head #34 matrix.**
 
 ```bash
 node --experimental-strip-types --test \
-  test/config.test.ts \
-  test/schema.test.ts \
-  test/github-pre34-downgrade.test.ts \
-  test/github-normalize.test.ts \
-  test/github-delivery-inbox.test.ts \
-  test/github-token.test.ts \
-  test/github-repository-identity.test.ts \
-  test/github-pull-request.test.ts \
-  test/github-association.test.ts \
-  test/github-journal.test.ts \
-  test/github-webhook-worker.test.ts \
-  test/github-adapter.integration.test.ts \
-  test/github-suspend-reconcile.test.ts \
-  test/github-checks.test.ts \
-  test/github-check-identity-migration.test.ts \
-  test/github-repository-identity-migration.test.ts \
-  test/github-repository-identity-migration-crash.test.ts \
-  test/github-identity-cli.test.ts \
-  test/issue28-github-reconciliation.test.ts \
-  test/github-concurrency.test.ts \
-  test/github-authoritative-state.test.ts
+  test/config.test.ts test/schema.test.ts test/github-pre34-downgrade.test.ts \
+  test/github-normalize.test.ts test/github-delivery-inbox.test.ts test/github-token.test.ts \
+  test/github-repository-identity.test.ts test/github-pull-request.test.ts \
+  test/github-association.test.ts test/github-association-mutation.test.ts test/github-journal.test.ts \
+  test/github-webhook-worker.test.ts test/github-adapter.integration.test.ts test/github-suspend-reconcile.test.ts \
+  test/github-checks.test.ts test/github-check-identity-migration.test.ts \
+  test/github-repository-identity-migration.test.ts test/github-repository-identity-migration-crash.test.ts \
+  test/github-identity-cli.test.ts test/issue28-github-reconciliation.test.ts \
+  test/github-concurrency.test.ts test/github-authoritative-state.test.ts
 ```
 
 Expected: all pass.
 
-- [ ] **Step 4: Perform final static invariants review.** Require evidence for each:
-  - every new repo-bearing normalized event has stable ID;
+- [ ] **Step 4: Final invariant audit.** Produce concrete evidence that:
+  - every new repo-bearing event contains stable ID;
   - no operational repository authorization uses `allowedRepositories`;
   - token restriction uses `repository_ids` only;
-  - every live PR target check uses `base.repo.id`;
+  - live PR ownership uses `base.repo.id`;
   - stable publication/association locks are ID-keyed;
-  - §6.2 legacy authority reduction uses run fence -> global association transaction only;
-  - `installation.deleted` mixed fan-out classifies records before choosing lock path;
+  - legacy ID-less authority reduction uses run fence -> global association transaction only;
+  - `installation.deleted` mixed fan-out classifies record type before lock path;
+  - no global association transaction acquires a run fence from inside the transaction;
   - permanent worker outcomes complete rather than retry;
-  - permanent-drop count is emitted only after durable completion;
-  - stable check keys use repository ID and production attempt remains 1;
+  - permanent-drop diagnostic increments only after durable completion;
+  - stable check keys use ID and production attempt remains 1;
   - migration restart universe is legacy-by-name union stable-by-ID;
   - no immutable journal/event/history rewrite exists.
 
-- [ ] **Step 5: Open a draft PR against `main` with exact base/head disclosure.** Include Issue #34 design/plan links, migration/cutover warning, supported-node evidence, and explicit statement that Phase B write authority remains disabled.
+- [ ] **Step 5: Open a draft PR against `main`** with exact base/head disclosure, #34 spec/plan links, migration/cutover warning, supported-node evidence, and explicit statement that Phase B write authority remains disabled.
 
-- [ ] **Step 6: Wait for exact-head CI and verify the checked SHA.** Require canonical Node 24.18.0, Node 22.22.2 compatibility, and Node 25.9.0 negative jobs all terminal-success as applicable to their expected semantics. Do not use stale CI from an earlier head.
+- [ ] **Step 6: Verify exact-head CI.** Require canonical Node 24.18.0, Node 22.22.2 compatibility, and Node 25.9.0 negative jobs to reach their expected terminal-success semantics on the same PR head. Stale CI does not count.
 
-- [ ] **Step 7: Request independent exact-head verification and review.** Use `superpowers:requesting-code-review`. Any correction creates a new head, so rerun focused validation and exact-head CI before merge readiness.
+- [ ] **Step 7: Request independent exact-head review/verification** using `superpowers:requesting-code-review`. Every correction creates a new head and requires fresh focused validation and exact-head CI.
 
-- [ ] **Step 8: Resolve or explicitly owner-disposition every substantive review thread.** Do not infer reviewer silence as approval.
+- [ ] **Step 8: Resolve or explicitly owner-disposition every substantive review thread.** Reviewer silence is not approval.
 
-- [ ] **Step 9: Before claiming completion, use `superpowers:verification-before-completion` and re-run the proof commands required for every success claim.**
+- [ ] **Step 9: Invoke `superpowers:verification-before-completion` before every completion/pass claim** and rerun the command that proves the claim.
 
-- [ ] **Step 10: Governed merge and post-merge main revalidation.** Merge only after exact-head CI, independent verification, scope review, and thread resolution pass. Then run/observe `main` CI on the merge commit. Only after post-merge `main` revalidation may Issue #34 be closed and Issue #3 Phase B entry gate be considered satisfied.
+- [ ] **Step 10: Governed merge/post-merge validation.** Merge only after exact-head CI, independent verification, scope review, and thread resolution. Revalidate `main` CI on the merge commit. Only then close #34 and consider the #3 Phase B stable-identity entry gate satisfied.
 
 ---
 
 ## Plan Self-Review Checklist
 
-Before implementation starts, the executing agent must verify this plan still matches the approved spec and current branch state:
-
-- [ ] Every spec section 3-23 maps to at least one implementation task above.
-- [ ] Round-3 non-blocking clarification is explicit: `installation.deleted` classifies mixed stable/legacy records and routes each to its own lock discipline.
-- [ ] Round-3 observability clarification is explicit: `permanentRepositoryDropsSinceStart` is read through the existing listener-process diagnostic callback after durable completion; it is not persisted and not exposed through `doctor`.
-- [ ] No task introduces Phase B side effects.
-- [ ] No task uses repository name/redirect as authorization proof.
-- [ ] No placeholder terms such as `TODO`, `TBD`, “appropriate error handling”, or unspecified tests remain in the plan.
-- [ ] New module interfaces are type-consistent across tasks: token provider takes `(installationId, repositoryId, purpose)`; stable association APIs take `repositoryId`; PR snapshot returns base repository ID; migration consumes all three.
-- [ ] Each task has a RED command, GREEN command, and reviewable commit boundary.
+- [ ] Every design section with implementation consequences maps to a task above.
+- [ ] Round-3 clarification is explicit: `installation.deleted` classifies mixed stable/legacy associations and routes each to the correct lock branch.
+- [ ] Round-3 observability clarification is explicit: the process-local permanent-drop count is read through listener diagnostics after durable completion, never through `doctor`.
+- [ ] Shared run/index mutation is a dedicated module; migration does not call private adapter helpers or duplicate rollback rules.
+- [ ] Token provider is explicitly `(installationId, repositoryId, purpose)` everywhere.
+- [ ] Stable association input/reason types are named and reused.
+- [ ] Migration head-drift sequence releases the previous run/global association lock before `RevalidationService.route()` reacquires the run target fence under repository/PR fences.
+- [ ] No task introduces Phase B side effects or name/redirect-based authorization.
+- [ ] No unresolved implementation markers or unspecified test steps remain.
+- [ ] Every implementation task has a RED command, GREEN command, and reviewable commit boundary.
 - [ ] Final validation is fresh on exact supported Node baselines and exact GitHub head.
