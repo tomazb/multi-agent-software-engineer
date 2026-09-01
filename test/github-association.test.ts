@@ -478,6 +478,71 @@ test("migrateLegacy removes the exact legacy key and inserts the exact stable ke
   assert.deepEqual(Object.keys(raw), ["2468#8"]);
 });
 
+test("migrateLegacy that throws on invalid input leaves the durable index exactly as it was", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-migrate-atomic-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
+  await index.bind({
+    runId: "run-migrate-fail",
+    installationId: 10,
+    repository: "owner/repo",
+    pullRequestNumber: 8,
+    baseSha: "base",
+    headSha: "head",
+    branch: "maswe/migrate",
+  });
+
+  await index.withTransaction(async (transaction) => {
+    // An unrelated valid mutation in the same transaction sets `dirty`, so the
+    // transaction below still commits even though the migration that follows
+    // throws and its error is swallowed right here by this callback.
+    transaction.bindStable({
+      runId: "run-unrelated",
+      installationId: 10,
+      repositoryId: 111,
+      repository: "owner/unrelated",
+      pullRequestNumber: 1,
+      baseSha: "base",
+      headSha: "head",
+      branch: "maswe/unrelated",
+    });
+
+    try {
+      transaction.migrateLegacy({
+        legacyRepository: "owner/repo",
+        stable: {
+          runId: "run-migrate-fail",
+          installationId: 10,
+          repositoryId: -1, // invalid: must be a positive integer
+          repository: "owner/repo",
+          pullRequestNumber: 8,
+          baseSha: "base",
+          headSha: "head",
+          branch: "maswe/migrate",
+        },
+      });
+    } catch {
+      // Swallowed on purpose: reproduces a caller that does not propagate the failure.
+    }
+  });
+
+  const raw = JSON.parse(
+    await readFile(path.join(githubRoot, "associations.json"), "utf8"),
+  ) as Record<string, unknown>;
+  // The legacy key must survive: migrateLegacy must validate before it mutates.
+  assert.ok(
+    Object.hasOwn(raw, "owner/repo#8"),
+    "legacy key must not be destroyed by a failed migration",
+  );
+  assert.ok(!Object.hasOwn(raw, "-1#8"), "no stable key must be written for a failed migration");
+  assert.ok(
+    Object.hasOwn(raw, "111#1"),
+    "the unrelated valid mutation in the same transaction must still commit",
+  );
+  assert.equal((await index.find("owner/repo", 8))?.runId, "run-migrate-fail");
+});
+
 // --- Step 2: failing mixed-parser tests ---
 
 test("mixed association index accepts exact legacy and exact stable records in one file", async (t) => {
@@ -533,10 +598,11 @@ test("mixed association index rejects malformed keys, mismatches, and unknown fi
         },
       },
     ],
-    // malformed id: zero
-    ["555#9-zero-id", { "555#9": stableRecord({ repositoryId: 0 }) }],
-    // malformed id: negative
-    ["555#9-negative-id", { "555#9": stableRecord({ repositoryId: -1 }) }],
+    // malformed id: zero (key matches the derived stable key so only the
+    // Number.isSafeInteger/>0 check can reject this case, not a key/record mismatch)
+    ["0#9-zero-id", { "0#9": stableRecord({ repositoryId: 0 }) }],
+    // malformed id: negative (key matches the derived stable key for the same reason)
+    ["-1#9-negative-id", { "-1#9": stableRecord({ repositoryId: -1 }) }],
     // malformed id: non-integer
     ["555#9-float-id", { "555.5#9": stableRecord({ repositoryId: 555.5 }) }],
     // unknown field alongside a valid stable record
@@ -824,7 +890,11 @@ test("a baseline name-keyed record stays reachable only through generic methods 
     ["run-baseline"],
   );
 
-  // The stable record is invisible to the generic name-primary surface under its real name...
+  // The stable record is invisible to the generic point lookup (`find`) under its real
+  // name. This test uses a different name AND branch than the legacy record above, so it
+  // does not by itself exercise `findAllByRepositoryBranch`'s name/branch filter against a
+  // same-name, same-branch stable record — that leak-closure is covered by the dedicated
+  // "findAllByRepositoryBranch (generic) excludes stable records" test below.
   assert.equal(await index.find("owner/stable-repo", 4), undefined);
   // ...and reachable only through the explicit stable methods.
   assert.equal((await index.findStable(77_001, 4))?.runId, "run-stable-only");
@@ -835,5 +905,41 @@ test("a baseline name-keyed record stays reachable only through generic methods 
   assert.deepEqual(
     stableBranchMatches.map((record) => record.runId),
     ["run-stable-only"],
+  );
+});
+
+test("findAllByRepositoryBranch (generic) excludes stable records sharing the same name and branch as a legacy record", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-branch-leak-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+
+  await index.bind({
+    runId: "run-legacy-shared",
+    installationId: 10,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "shared-branch",
+  });
+  await index.withTransaction(async (transaction) =>
+    transaction.bindStable({
+      runId: "run-stable-shared",
+      installationId: 10,
+      repositoryId: 9999,
+      repository: "owner/repo",
+      pullRequestNumber: 2,
+      baseSha: "base",
+      headSha: "head",
+      branch: "shared-branch",
+    }),
+  );
+
+  // Same repository name AND same branch on both records: only the difference between a
+  // legacy record (no repositoryId) and a stable record (has repositoryId) is exercised.
+  const matches = await index.findAllByRepositoryBranch("owner/repo", "shared-branch");
+  assert.deepEqual(
+    matches.map((record) => record.runId),
+    ["run-legacy-shared"],
   );
 });

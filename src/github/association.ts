@@ -135,11 +135,15 @@ function assertUniqueActiveRun(
   key: string,
   runId: string,
   suspended: boolean,
+  ignoreKey?: string,
 ): void {
   if (suspended) return;
   const conflict = Object.entries(records).find(
     ([candidateKey, record]) =>
-      candidateKey !== key && record.runId === runId && !record.suspended,
+      candidateKey !== key &&
+      candidateKey !== ignoreKey &&
+      record.runId === runId &&
+      !record.suspended,
   );
   if (conflict) {
     throw new Error(`Run ${runId} is already associated to an active pull request`);
@@ -165,7 +169,7 @@ function assertUniqueStablePrIdentity(
   }
 }
 
-type AssociationBindInput = Omit<AssociationRecord, "suspended" | "updatedAt"> & {
+type AssociationBindInput = Omit<AssociationRecord, "repositoryId" | "suspended" | "updatedAt"> & {
   suspended?: boolean;
 };
 
@@ -375,7 +379,6 @@ export class GitHubAssociationIndex {
           }
           const stableKey = stableAssociationKey(stable.repositoryId, stable.pullRequestNumber);
           const suspended = stable.suspended ?? false;
-          assertUniqueStablePrIdentity(records, stableKey, stable.runId, suspended);
           const record: AssociationRecord = {
             runId: stable.runId,
             installationId: stable.installationId,
@@ -391,11 +394,17 @@ export class GitHubAssociationIndex {
               : {}),
             updatedAt: new Date().toISOString(),
           };
-          // Remove the legacy key before the run-uniqueness recheck so the record's own prior
-          // legacy entry (same run id) is not mistaken for a conflicting active duplicate.
-          delete records[legacyKey];
-          assertUniqueActiveRun(records, stableKey, record.runId, suspended);
+          // Validate everything BEFORE any mutation, so the delete+insert pair below can
+          // never fail partway through and leave the index with neither key or both keys.
+          // `assertUniqueActiveRun` is given the legacy key to ignore explicitly, instead of
+          // relying on it having already been deleted, so this check can run before the
+          // delete without mistaking the record's own prior legacy entry (same run id) for a
+          // conflicting active duplicate.
+          assertUniqueStablePrIdentity(records, stableKey, stable.runId, suspended);
+          assertUniqueActiveRun(records, stableKey, record.runId, suspended, legacyKey);
           parseAssociationRecords(`${JSON.stringify({ [stableKey]: record })}\n`);
+          // Nothing below this line can throw: delete-and-insert is the only unfailable step.
+          delete records[legacyKey];
           records[stableKey] = record;
           dirty = true;
           return { ...record };
@@ -501,7 +510,15 @@ export class GitHubAssociationIndex {
     return Object.values(records)
       .filter(
         (record) =>
-          record.repository === repository && record.branch === branch && !record.suspended,
+          // Excludes stable (repositoryId-keyed) records: this name-primary lookup is the
+          // legacy enumeration path, and letting a mutable name resolve a stable record's
+          // identity here is exactly the identity confusion Issue #34 removes. This filter
+          // is behaviorally invisible on all pre-#34 data, because no legacy record ever
+          // carries a repositoryId, so it preserves this method's pre-#34 behavior exactly.
+          record.repositoryId === undefined &&
+          record.repository === repository &&
+          record.branch === branch &&
+          !record.suspended,
       )
       .map((record) => ({ ...record }))
       .sort(
