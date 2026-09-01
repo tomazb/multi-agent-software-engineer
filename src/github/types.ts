@@ -70,15 +70,25 @@ export interface GitHubInternalEvent {
   rawAction?: string;
 }
 
+export type SuspensionReason = "pull-request-closed" | "authorization-revoked";
+
 export interface AssociationRecord {
   runId: string;
   installationId: number;
+  /**
+   * Stable numeric repository identity. Present only on records bound/migrated under the
+   * `<repositoryId>#<pullRequestNumber>` key; absent (legacy-read boundary only) on records that
+   * still live under the mutable `<repository>#<pullRequestNumber>` key. A name never upgrades to
+   * an ID and an ID never derives a name.
+   */
+  repositoryId?: number;
+  /** Mutable canonical repository name; routing/display metadata only, never authorizes. */
   repository: string;
   pullRequestNumber: number;
   baseSha: string;
   headSha: string;
   branch: string;
   suspended: boolean;
-  suspensionReason?: "pull-request-closed" | "authorization-revoked";
+  suspensionReason?: SuspensionReason;
   updatedAt: string;
 }

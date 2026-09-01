@@ -27,7 +27,7 @@ function spawnStoreWorker(
   githubRoot: string,
   barrierPath: string,
   actor: string,
-  mode: "association" | "check-create",
+  mode: "association" | "association-stable" | "check-create",
   extraEnv: Record<string, string>,
 ): { child: ChildProcess; next(type: WorkerMessage["type"]): Promise<WorkerMessage> } {
   const child = fork(workerPath, [], {
@@ -208,6 +208,29 @@ test("separate processes concurrently binding two PRs preserve both association 
   const index = new GitHubAssociationIndex(root);
   assert.equal((await index.find("owner/repo", 1))?.runId, "run-one");
   assert.equal((await index.find("owner/repo", 2))?.runId, "run-two");
+});
+
+test("separate processes concurrently binding two stable PRs preserve both stable association records", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-stable-lock-"));
+  const barrierPath = path.join(root, "association-stable.start");
+  const first = spawnStoreWorker(root, barrierPath, "one", "association-stable", {
+    MASWE_GITHUB_PULL_REQUEST_NUMBER: "1",
+  });
+  const second = spawnStoreWorker(root, barrierPath, "two", "association-stable", {
+    MASWE_GITHUB_PULL_REQUEST_NUMBER: "2",
+  });
+  t.after(async () => {
+    await terminateWorkers([first.child, second.child]);
+    await rm(root, { recursive: true, force: true });
+  });
+  await Promise.all([first.next("READY"), second.next("READY")]);
+  await writeFile(barrierPath, "start\n", "utf8");
+  await Promise.all([expectCompleted(first), expectCompleted(second)]);
+  await waitForWorkers([first.child, second.child]);
+
+  const index = new GitHubAssociationIndex(root);
+  assert.equal((await index.findStable(9090, 1))?.runId, "run-one");
+  assert.equal((await index.findStable(9090, 2))?.runId, "run-two");
 });
 
 test("two processes sharing a full check key execute exactly one create section", async (t) => {

@@ -38,6 +38,7 @@ try {
   await waitForBarrier(barrierPath);
 
   if (mode === "association") {
+    // Explicit legacy fixture: baseline name-primary bind, unchanged since before #34.
     const pullRequestNumber = Number(process.env.MASWE_GITHUB_PULL_REQUEST_NUMBER);
     if (!Number.isSafeInteger(pullRequestNumber)) {
       throw new Error("association worker requires a pull request number");
@@ -52,6 +53,24 @@ try {
       headSha: `head-${actor}`,
       branch: `branch-${actor}`,
     });
+  } else if (mode === "association-stable") {
+    const pullRequestNumber = Number(process.env.MASWE_GITHUB_PULL_REQUEST_NUMBER);
+    if (!Number.isSafeInteger(pullRequestNumber)) {
+      throw new Error("association-stable worker requires a pull request number");
+    }
+    const index = new GitHubAssociationIndex(githubRoot);
+    await index.withTransaction(async (transaction) =>
+      transaction.bindStable({
+        runId: `run-${actor}`,
+        installationId: 41,
+        repositoryId: 9090,
+        repository: "owner/repo",
+        pullRequestNumber,
+        baseSha: "base",
+        headSha: `head-${actor}`,
+        branch: `branch-${actor}`,
+      }),
+    );
   } else if (mode === "check-create") {
     const idempotencyKey = process.env.MASWE_GITHUB_IDEMPOTENCY_KEY;
     const createsPath = process.env.MASWE_GITHUB_CREATES_PATH;
