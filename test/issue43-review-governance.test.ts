@@ -141,18 +141,29 @@ test("artifact contracts describe review report semantics without changing termi
     "utf8",
   );
 
-  assert.match(
-    contracts,
-    /verification report.*governing requirement.*reachable.*evidence.*smallest safe remediation/is,
-  );
-  assert.match(
-    contracts,
-    /comment classification.*defect validity.*remediation.*design decision/is,
-  );
-  assert.match(
-    contracts,
-    /resolution report.*authorized.*minimal correction.*design decision/is,
-  );
+  assertInOrder(contracts, [
+    /## `06-verification-report\.md`/i,
+    /governing requirement/i,
+    /concrete reachable (failure|impact)/i,
+    /supporting code, test, diff, or execution evidence/i,
+    /smallest safe remediation/i,
+  ]);
+  assertInOrder(contracts, [
+    /## `08-comment-classification\.md`/i,
+    /defect validity/i,
+    /governing requirement/i,
+    /concrete reachable impact/i,
+    /supporting evidence/i,
+    /remediation disposition/i,
+    /minimal permitted change/i,
+    /design decision outside the ordinary correction loop/i,
+  ]);
+  assertInOrder(contracts, [
+    /## `09-resolution-report\.md`/i,
+    /governing requirement/i,
+    /authorized minimal correction/i,
+    /design decision required/i,
+  ]);
   assert.match(
     contracts,
     /report semantics.*do not.*change.*terminal marker|terminal markers.*remain unchanged/is,
