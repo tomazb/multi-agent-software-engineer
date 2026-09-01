@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { RunRecord } from "../src/domain.ts";
 import {
   buildCommentClassifierPrompt,
@@ -22,7 +21,7 @@ function makeRun(): RunRecord {
     updatedAt: "2026-09-01T00:00:00.000Z",
     approvals: { brainstorm: true, design: true },
     counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
-    config: structuredClone(DEFAULT_CONFIG),
+    config: {} as RunRecord["config"],
     artifacts: [],
     events: [],
   };
@@ -65,10 +64,7 @@ test("verifier blockers are evidence-backed and remediation is a separate archit
     prompt,
     /unnecessary[- ]complexity.*states.*branches.*retries.*compatibility.*abstractions.*configuration.*defensive/is,
   );
-  assert.match(
-    prompt,
-    /uncertainty|missing evidence/i,
-  );
+  assert.match(prompt, /uncertainty|missing evidence/i);
 });
 
 test("classifier can validate a defect while routing architectural remediation to human specification disposition", async () => {
@@ -117,22 +113,18 @@ test("resolver implements only authorized minimal corrections and reports design
     prompt,
     /valid defect.*design decision|approved architecture.*insufficient.*design decision/is,
   );
-  assert.match(
-    prompt,
-    /do not resolve the GitHub thread.*fresh verifier.*CI/is,
-  );
+  assert.match(prompt, /do not resolve the GitHub thread.*fresh verifier.*CI/is);
 });
 
 test("AGENTS policy preserves requirements before simplification and establishes single-writer authority", async () => {
   const agents = await readFile(new URL("../AGENTS.md", import.meta.url), "utf8");
 
+  assert.match(
+    agents,
+    /correctness, safety, security, concurrency, recovery, idempotency, audit, evidence, compatibility[^\n]*take precedence over YAGNI, KISS, and DRY/i,
+  );
   assertInOrder(agents, [
-    /correctness.*safety.*security.*concurrency.*recovery.*idempotency.*audit.*evidence.*compatibility/is,
-    /precedence|take precedence/i,
-    /YAGNI.*KISS.*DRY/is,
-  ]);
-  assertInOrder(agents, [
-    /preserve governing requirements|preserve.*approved behavior/i,
+    /preserve governing requirements and approved behavior/i,
     /do not add requirements/i,
     /smallest clear and explicit model/i,
     /share authoritative knowledge/i,
@@ -182,6 +174,9 @@ test("role permissions and terminal-marker constraints remain unchanged", async 
   assert.match(resolver, /RESOLUTION_COMPLETE/);
   for (const prompt of [verifier, classifier, resolver]) {
     assert.match(prompt, /very last line|final line/i);
-    assert.match(prompt, /only on that final line|may appear only on that final line|token may appear only on that final line/i);
+    assert.match(
+      prompt,
+      /only on that final line|may appear only on that final line|token may appear only on that final line/i,
+    );
   }
 });
