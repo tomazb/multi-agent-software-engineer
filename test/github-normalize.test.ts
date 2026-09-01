@@ -178,6 +178,21 @@ test("normalize never derives a repository id from a name or a name from an id",
       }),
     MalformedGitHubWebhookError,
   );
+  // No repository.full_name at all: normalization must fail, never synthesize one from the id.
+  assert.throws(
+    () =>
+      normalizeGitHubWebhook({
+        deliveryId: "del-no-reverse-synthesis",
+        eventName: "push",
+        payload: {
+          installation: { id: 1 },
+          repository: { id: 1308655205 },
+          ref: "refs/heads/main",
+          after: "sha",
+        },
+      }),
+    MalformedGitHubWebhookError,
+  );
 });
 
 test("normalize installation.deleted", () => {

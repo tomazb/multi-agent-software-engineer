@@ -78,13 +78,22 @@ function canonicalRepository(value: unknown): value is string {
  * and already-migrated records (which no longer carry a `repositories` key)
  * pass through unchanged, so this is idempotent across re-reads and lifecycle
  * rewrites of the same in-memory record. Never synthesizes a repository id.
+ *
+ * Two shapes are deliberately left unmigrated so `validEvent`'s mutual-
+ * exclusion guard stays reachable: an empty `repositories: []` (byte-identical
+ * between the pre-#34 and new forms, so migrating it would silently relabel a
+ * new-form empty pair list as legacy), and any record that already carries a
+ * `legacyRepositories` key (migrating it would overwrite that key instead of
+ * letting the validator reject the both-keys record as invalid).
  */
 function migrateLegacyEvent(value: unknown): unknown {
   if (!isRecord(value)) return value;
   if (
     (value.type === "installation_repositories.added" ||
       value.type === "installation_repositories.removed") &&
+    value.legacyRepositories === undefined &&
     Array.isArray(value.repositories) &&
+    value.repositories.length > 0 &&
     value.repositories.every((item) => typeof item === "string")
   ) {
     const { repositories, ...rest } = value;

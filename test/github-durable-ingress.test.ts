@@ -579,3 +579,53 @@ test("queue-marker reopen failure is not masked by closing the original handle t
   );
   assert.equal(closeCalls, 1);
 });
+
+test("inbox.enqueue rejects an ID-less repo-scoped event in strict mode", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-enqueue-strict-no-id-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const inbox = new GitHubDeliveryInbox(root);
+
+  await assert.rejects(
+    inbox.enqueue({
+      deliveryId: "strict-missing-repository-id",
+      eventName: "push",
+      receivedAt: "2026-08-11T00:00:00.000Z",
+      rawBodyDigest: `sha256:${"d".repeat(64)}`,
+      event: {
+        eventId: "strict-missing-repository-id",
+        type: "push",
+        repository: "owner/repo",
+        installationId: 44,
+        headSha: "head",
+        branch: "feature",
+        receivedAt: "2026-08-11T00:00:00.000Z",
+      },
+    }),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
+test("inbox.enqueue rejects a legacyRepositories-bearing installation_repositories event in strict mode", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-enqueue-strict-legacy-names-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const inbox = new GitHubDeliveryInbox(root);
+
+  await assert.rejects(
+    inbox.enqueue({
+      deliveryId: "strict-legacy-repositories",
+      eventName: "installation_repositories",
+      receivedAt: "2026-08-11T00:00:00.000Z",
+      rawBodyDigest: `sha256:${"e".repeat(64)}`,
+      event: {
+        eventId: "strict-legacy-repositories",
+        type: "installation_repositories.removed",
+        installationId: 7,
+        repository: "owner/one",
+        legacyRepositories: ["owner/one"],
+        rawAction: "removed",
+        receivedAt: "2026-08-11T00:00:00.000Z",
+      },
+    }),
+    /Invalid GitHub durable inbox event/,
+  );
+});

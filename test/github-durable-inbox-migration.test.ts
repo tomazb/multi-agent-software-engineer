@@ -307,6 +307,108 @@ test("a pre-#34 installation_repositories string array migrates to legacyReposit
   assert.equal(event.repositoryId, undefined);
 });
 
+test("a new-form installation_repositories record with an empty repositories array round-trips without becoming legacyRepositories", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-empty-pairs-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-empty-pairs";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repositories: [],
+    rawAction: "removed",
+  });
+
+  const inbox = new GitHubDeliveryInbox(githubRoot);
+  await inbox.initialize();
+  const claimed = await inbox.claimNext(Date.now());
+  assert.ok(claimed, "expected the empty-pairs new-form event to be claimable");
+  const event = claimed!.record.event as GitHubInternalEvent;
+  assert.deepEqual(event.repositories, []);
+  assert.equal(event.legacyRepositories, undefined);
+});
+
+test("a both-keys installation_repositories record is rejected instead of laundered into a legacy record", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-both-keys-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "both-keys-record";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: ["owner/one"],
+    legacyRepositories: ["owner/evil"],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
+test("a new-form pairs record with conflicting names for the same repository id is rejected", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-pairs-conflict-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-pairs-conflicting-name";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: [
+      { repositoryId: 111, repository: "owner/one" },
+      { repositoryId: 111, repository: "owner/two" },
+    ],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
+test("a new-form pairs record with a mixed string/object array is rejected", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-pairs-mixed-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-pairs-mixed-array";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: ["owner/one", { repositoryId: 222, repository: "owner/two" }],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
+test("a both-keys record with genuine object pairs alongside legacyRepositories is rejected", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-pairs-both-keys-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-pairs-both-keys";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: [{ repositoryId: 111, repository: "owner/one" }],
+    legacyRepositories: ["owner/evil"],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
 test("startup rejects symlinked inbox namespaces without mutating their targets", async (t) => {
   for (const relativePath of [
     "deliveries",
