@@ -67,6 +67,42 @@ test("verifier blockers are evidence-backed and remediation is a separate archit
   assert.match(prompt, /uncertainty|missing evidence/i);
 });
 
+test("verifier reports design disposition without inventing a verifier human-gate transition", async () => {
+  const prompt = await buildRolePrompt("verifier", makeRun(), artifactStore());
+
+  assert.match(
+    prompt,
+    /owner.*specification.*disposition|specification.*owner.*disposition/is,
+  );
+  assert.match(
+    prompt,
+    /current verifier path.*does not.*human[- ]gate transition|do not claim.*human[- ]gate transition/is,
+  );
+  assert.doesNotMatch(prompt, /route the design decision back to human\/specification approval/i);
+});
+
+test("post-resolution verifier independently rechecks the review defect from supplied context", async () => {
+  const prompt = await buildRolePrompt(
+    "verifier",
+    makeRun(),
+    artifactStore({
+      "07-review-comment.md": "The parser accepts an invalid state transition.",
+      "08-comment-classification.md": "Valid defect; authorized minimal correction required.",
+    }),
+  );
+
+  assert.match(prompt, /The parser accepts an invalid state transition\./);
+  assert.match(prompt, /Valid defect; authorized minimal correction required\./);
+  assertInOrder(prompt, [
+    /review comment/i,
+    /scope classification|comment classification/i,
+    /independently.*re[- ]?check|re[- ]?verify/i,
+    /current repository state/i,
+    /still.*valid|remains.*valid/i,
+    /blocking|fail/i,
+  ]);
+});
+
 test("classifier can validate a defect while routing architectural remediation to human specification disposition", async () => {
   const prompt = await buildCommentClassifierPrompt(
     makeRun(),
@@ -114,6 +150,10 @@ test("resolver implements only authorized minimal corrections and reports design
     /valid defect.*design decision|approved architecture.*insufficient.*design decision/is,
   );
   assert.match(prompt, /do not resolve the GitHub thread.*fresh verifier.*CI/is);
+  assert.match(
+    prompt,
+    /completion.*not.*proof.*review concern.*resolved|terminal marker.*not.*proof.*resolved/is,
+  );
 });
 
 test("AGENTS policy preserves requirements before simplification and establishes single-writer authority", async () => {
@@ -148,6 +188,14 @@ test("artifact contracts describe review report semantics without changing termi
     /supporting code, test, diff, or execution evidence/i,
     /smallest safe remediation/i,
   ]);
+  assert.match(
+    contracts,
+    /verifier.*does not.*human[- ]gate transition|human[- ]gate transition.*not.*verifier/is,
+  );
+  assert.match(
+    contracts,
+    /review comment.*classification.*post[- ]resolution verifier|post[- ]resolution verifier.*review comment.*classification/is,
+  );
   assertInOrder(contracts, [
     /## `08-comment-classification\.md`/i,
     /defect validity/i,
