@@ -30,7 +30,7 @@ test("file and directory sync failures prevent durable acknowledgement", async (
     ref: "refs/heads/feature",
     after: "sha",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
   });
 
   for (const failure of ["state-file", "state-directory", "queue-file", "queue-directory"] as const) {

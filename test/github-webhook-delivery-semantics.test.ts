@@ -41,7 +41,7 @@ function pullRequest(headSha = "sha-new") {
   return {
     action: "synchronize",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
     pull_request: {
       number: 9,
       head: { sha: headSha, ref: "feature" },
@@ -142,7 +142,7 @@ test("same delivery id with a different event or digest returns 409", async (t) 
       ref: "refs/heads/feature",
       after: "sha-new",
       installation: { id: 44 },
-      repository: { full_name: "owner/repo" },
+      repository: { id: 1308655205, full_name: "owner/repo" },
     }))).status,
     409,
   );

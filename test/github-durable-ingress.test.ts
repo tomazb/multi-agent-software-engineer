@@ -50,14 +50,35 @@ async function withWatchdog<T>(promise: Promise<T>, message: string): Promise<T>
   }
 }
 
+const DURABLE_INGRESS_REPO_ID = 1308655205;
+
 function signedRequest(deliveryId: string, headSha = "sha-durable") {
+  const rawBody = JSON.stringify({
+    action: "synchronize",
+    installation: { id: 44 },
+    repository: { id: DURABLE_INGRESS_REPO_ID, full_name: "owner/repo" },
+    pull_request: {
+      number: 9,
+      head: { sha: headSha, ref: "feature" },
+      base: { sha: "base" },
+    },
+  });
+  return {
+    deliveryId,
+    eventName: "pull_request",
+    signatureHeader: `sha256=${createHmac("sha256", SECRET).update(rawBody).digest("hex")}`,
+    rawBody,
+  };
+}
+
+function signedRequestMissingRepositoryId(deliveryId: string) {
   const rawBody = JSON.stringify({
     action: "synchronize",
     installation: { id: 44 },
     repository: { full_name: "owner/repo" },
     pull_request: {
       number: 9,
-      head: { sha: headSha, ref: "feature" },
+      head: { sha: "sha-durable", ref: "feature" },
       base: { sha: "base" },
     },
   });
@@ -279,6 +300,33 @@ test("signed direct adapter ingress rejects unsafe delivery ids without durable 
   assert.equal(response.status, 400);
   await assert.rejects(
     access(path.join(cwd, ".maswe", "github", "inbox", "state")),
+    { code: "ENOENT" },
+  );
+});
+
+test("a new payload missing repository.id is rejected before durable enqueue", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-durable-missing-repo-id-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: { async request() { throw new Error("malformed identity must not dispatch"); } },
+    tokenProvider: async () => "token",
+  });
+
+  const response = await adapter.handleWebhook(
+    signedRequestMissingRepositoryId("missing-repository-id"),
+  );
+
+  assert.equal(response.status, 400);
+  await assert.rejects(
+    access(path.join(cwd, ".maswe", "github", "inbox", "state")),
+    { code: "ENOENT" },
+  );
+  await assert.rejects(
+    access(path.join(cwd, ".maswe", "github", "inbox", "queue")),
     { code: "ENOENT" },
   );
 });
@@ -520,6 +568,7 @@ test("queue-marker reopen failure is not masked by closing the original handle t
         eventId: "queue-marker-reopen",
         type: "push",
         repository: "owner/repo",
+        repositoryId: 1308655205,
         installationId: 44,
         headSha: "head",
         branch: "feature",

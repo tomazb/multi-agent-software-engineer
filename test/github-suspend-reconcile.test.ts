@@ -79,7 +79,7 @@ test("redelivery after run-save failure still suspends the authoritative run", a
   const body = JSON.stringify({
     action: "removed",
     installation: { id: 44 },
-    repositories_removed: [{ full_name: "owner/one" }],
+    repositories_removed: [{ id: 1, full_name: "owner/one" }],
   });
   const result = await adapter.handleWebhook({
     deliveryId: "del-suspend-retry",
@@ -163,8 +163,8 @@ for (const eventKind of ["installation", "repository-removal"] as const) {
           action: "removed",
           installation: { id: 44 },
           repositories_removed: [
-            { full_name: "owner/one" },
-            { full_name: "owner/two" },
+            { id: 1, full_name: "owner/one" },
+            { id: 2, full_name: "owner/two" },
           ],
         });
 

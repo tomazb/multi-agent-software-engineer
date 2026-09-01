@@ -231,7 +231,7 @@ function prPayload(headSha: string, number = 9, action = "synchronize") {
   return {
     action,
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
     pull_request: {
       number,
       head: { sha: headSha, ref: "maswe/run-1" },
@@ -1070,7 +1070,7 @@ test("integration: push events invalidate every matching PR association", async 
     ref: "refs/heads/maswe/run-1",
     after: "sha-push",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
   });
   const result = await adapter.handleWebhook({
     deliveryId: "del-push",
@@ -1162,7 +1162,7 @@ test("integration: push attempts later PRs before reporting an earlier invalidat
     ref: "refs/heads/maswe/run-1",
     after: "sha-push",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
   });
 
   await assert.rejects(
@@ -1659,7 +1659,7 @@ test("integration: installation_repositories.removed suspends every listed repo"
   const body = JSON.stringify({
     action: "removed",
     installation: { id: 44 },
-    repositories_removed: [{ full_name: "owner/one" }, { full_name: "owner/two" }],
+    repositories_removed: [{ id: 1, full_name: "owner/one" }, { id: 2, full_name: "owner/two" }],
   });
   const result = await multiAdapter.handleWebhook({
     deliveryId: "del-multi-removed",

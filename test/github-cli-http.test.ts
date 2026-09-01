@@ -56,7 +56,7 @@ function pullRequestBody(headSha: string): string {
   return JSON.stringify({
     action: "synchronize",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
     pull_request: {
       number: 9,
       head: { sha: headSha, ref: "feature" },

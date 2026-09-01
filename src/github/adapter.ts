@@ -708,12 +708,19 @@ export class GitHubAppAdapter {
 
     if (event.type === "installation_repositories.removed") {
       if (event.installationId === undefined) return;
+      // #34 ingress (Task 2) carries repository names either as new ID/name
+      // pairs or, for historical durable records, as a migrated
+      // `legacyRepositories` name list; this name-based lookup is unchanged
+      // pre-#34 behavior and is superseded by stable-ID authority reduction
+      // in a later task (see spec §6.2).
       const repositories =
         event.repositories && event.repositories.length > 0
-          ? event.repositories
-          : event.repository
-            ? [event.repository]
-            : [];
+          ? event.repositories.map((identity) => identity.repository)
+          : event.legacyRepositories && event.legacyRepositories.length > 0
+            ? event.legacyRepositories
+            : event.repository
+              ? [event.repository]
+              : [];
       const failures: unknown[] = [];
       for (const repository of repositories) {
         try {

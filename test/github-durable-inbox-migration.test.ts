@@ -7,6 +7,7 @@ import test from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import { GitHubDeliveryInbox } from "../src/github/delivery-inbox.ts";
+import type { GitHubInternalEvent } from "../src/github/types.ts";
 import { FileRunStore } from "../src/store.ts";
 
 const SECRET_ENV = "MASWE_TEST_INBOX_MIGRATION_SECRET";
@@ -31,7 +32,7 @@ function request(deliveryId: string, headSha: string) {
   const rawBody = JSON.stringify({
     action: "synchronize",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
     pull_request: {
       number: 9,
       head: { sha: headSha, ref: "feature" },
@@ -221,6 +222,89 @@ test("orphan queue markers cannot lease payloadless legacy migration states", as
 
     assert.equal(await inbox.claimNext(Date.now() + 1), undefined);
   }
+});
+
+/**
+ * Writes a pre-#34 format-2 durable inbox record directly to disk, bypassing
+ * normalization entirely, to prove historical ID-less events remain exactly
+ * loadable at the durable-record boundary. Historical records never carry a
+ * `repositoryId`; #34 must not synthesize one on read.
+ */
+async function writeFormat2QueuedFixture(
+  githubRoot: string,
+  deliveryId: string,
+  eventName: string,
+  event: Record<string, unknown>,
+): Promise<void> {
+  const hash = createHash("sha256").update(deliveryId).digest("hex");
+  const prefix = hash.slice(0, 2);
+  const stateDirectory = path.join(githubRoot, "inbox", "state", prefix, hash);
+  const queueDirectory = path.join(githubRoot, "inbox", "queue", prefix);
+  await mkdir(stateDirectory, { recursive: true });
+  await mkdir(queueDirectory, { recursive: true });
+  const receivedAt = "2026-01-01T00:00:00.000Z";
+  const record = {
+    format: 2,
+    record: "github-delivery-inbox",
+    deliveryId,
+    eventName,
+    receivedAt,
+    rawBodyDigest: `sha256:${"a".repeat(64)}`,
+    status: "queued",
+    attempt: 0,
+    nextAttemptAt: receivedAt,
+    event: { eventId: deliveryId, receivedAt, ...event },
+  };
+  await writeFile(path.join(stateDirectory, "state.json"), JSON.stringify(record), "utf8");
+  await writeFile(path.join(queueDirectory, `${hash}.queued`), "", "utf8");
+}
+
+test("a pre-#34 ordinary repository event remains readable and stays ID-less", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-legacy-ordinary-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "pre34-ordinary-push";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "push", {
+    type: "push",
+    repository: "owner/repo",
+    installationId: 44,
+    headSha: "sha-legacy",
+    branch: "main",
+  });
+
+  const inbox = new GitHubDeliveryInbox(githubRoot);
+  await inbox.initialize();
+  const claimed = await inbox.claimNext(Date.now());
+  assert.ok(claimed, "expected the pre-#34 event to be claimable");
+  const event = claimed!.record.event as GitHubInternalEvent;
+  assert.equal(event.repository, "owner/repo");
+  assert.equal(event.repositoryId, undefined);
+  assert.equal(event.headSha, "sha-legacy");
+  assert.equal(event.branch, "main");
+});
+
+test("a pre-#34 installation_repositories string array migrates to legacyRepositories at the durable-record boundary", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-legacy-install-repos-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "pre34-installation-repositories-removed";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: ["owner/one", "owner/two"],
+    rawAction: "removed",
+  });
+
+  const inbox = new GitHubDeliveryInbox(githubRoot);
+  await inbox.initialize();
+  const claimed = await inbox.claimNext(Date.now());
+  assert.ok(claimed, "expected the pre-#34 installation_repositories event to be claimable");
+  const event = claimed!.record.event as GitHubInternalEvent;
+  assert.deepEqual(event.legacyRepositories, ["owner/one", "owner/two"]);
+  assert.equal(event.repositories, undefined);
+  assert.equal(event.repository, "owner/one");
+  assert.equal(event.repositoryId, undefined);
 });
 
 test("startup rejects symlinked inbox namespaces without mutating their targets", async (t) => {

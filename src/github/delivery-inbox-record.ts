@@ -71,12 +71,58 @@ function canonicalRepository(value: unknown): value is string {
   );
 }
 
+/**
+ * Renames a pre-#34 `installation_repositories` name-only repository list
+ * (`repositories: string[]`) to `legacyRepositories` at the durable-record
+ * boundary, on load. New-form pair lists (`repositories: GitHubRepositoryIdentity[]`)
+ * and already-migrated records (which no longer carry a `repositories` key)
+ * pass through unchanged, so this is idempotent across re-reads and lifecycle
+ * rewrites of the same in-memory record. Never synthesizes a repository id.
+ */
+function migrateLegacyEvent(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  if (
+    (value.type === "installation_repositories.added" ||
+      value.type === "installation_repositories.removed") &&
+    Array.isArray(value.repositories) &&
+    value.repositories.every((item) => typeof item === "string")
+  ) {
+    const { repositories, ...rest } = value;
+    return { ...rest, legacyRepositories: repositories };
+  }
+  return value;
+}
+
+function isRepositoryIdentityPair(
+  item: unknown,
+): item is { repositoryId: number; repository: string } {
+  return (
+    isRecord(item) &&
+    Number.isSafeInteger(item.repositoryId) &&
+    Number(item.repositoryId) > 0 &&
+    canonicalRepository(item.repository)
+  );
+}
+
+/**
+ * Validates a normalized GitHub internal event, either as durably written by
+ * this binary (`allowLegacy` false, the default -- used when enqueuing a
+ * fresh event) or as loaded from a possibly pre-#34 durable record
+ * (`allowLegacy` true -- used when parsing a persisted record). In legacy
+ * mode, ordinary repo-scoped events may omit `repositoryId` and
+ * `installation_repositories` events may carry a migrated `legacyRepositories`
+ * name list instead of `repositories` pairs. A fresh write always requires
+ * the stable identity; historical name-only records are the only ID-missing
+ * shape ever accepted.
+ */
 export function validEvent(
   value: unknown,
   deliveryId: string,
   receivedAt: string,
   eventName: string,
+  options?: { allowLegacy?: boolean },
 ): value is GitHubInternalEvent {
+  const allowLegacy = options?.allowLegacy ?? false;
   if (!isRecord(value)) return false;
   if (
     value.eventId !== deliveryId ||
@@ -93,6 +139,8 @@ export function validEvent(
     typeof value[field] === "string" && Boolean(value[field]);
   const positiveInteger = (field: string): boolean =>
     Number.isSafeInteger(value[field]) && Number(value[field]) > 0;
+  const repositoryIdOk = (): boolean =>
+    value.repositoryId === undefined ? allowLegacy : positiveInteger("repositoryId");
 
   if (value.type.startsWith("pull_request.")) {
     const action = value.type.slice("pull_request.".length);
@@ -101,6 +149,7 @@ export function validEvent(
       new Set(["opened", "synchronize", "reopened", "ready_for_review", "closed"]).has(action) &&
       exactFields([
         "repository",
+        "repositoryId",
         "installationId",
         "pullRequestNumber",
         "headSha",
@@ -109,6 +158,7 @@ export function validEvent(
         "rawAction",
       ]) &&
       canonicalRepository(value.repository) &&
+      repositoryIdOk() &&
       positiveInteger("installationId") &&
       positiveInteger("pullRequestNumber") &&
       nonEmpty("headSha") &&
@@ -120,8 +170,9 @@ export function validEvent(
   if (value.type === "push") {
     return (
       eventName === "push" &&
-      exactFields(["repository", "installationId", "headSha", "branch"]) &&
+      exactFields(["repository", "repositoryId", "installationId", "headSha", "branch"]) &&
       canonicalRepository(value.repository) &&
+      repositoryIdOk() &&
       positiveInteger("installationId") &&
       nonEmpty("headSha") &&
       nonEmpty("branch")
@@ -141,16 +192,46 @@ export function validEvent(
     value.type === "installation_repositories.removed"
   ) {
     const action = value.type.slice("installation_repositories.".length);
-    const repositories = value.repositories;
+    const pairs = value.repositories;
+    const legacyNames = value.legacyRepositories;
+    const hasPairs = pairs !== undefined;
+    const hasLegacyNames = legacyNames !== undefined;
+    if (hasPairs === hasLegacyNames) return false; // exactly one form must be present
+    if (hasLegacyNames && !allowLegacy) return false;
+    const validPairs = (): boolean => {
+      if (!Array.isArray(pairs) || !pairs.every(isRepositoryIdentityPair)) return false;
+      const typedPairs = pairs as { repositoryId: number; repository: string }[];
+      const nameById = new Map<number, string>();
+      for (const pair of typedPairs) {
+        const existingName = nameById.get(pair.repositoryId);
+        if (existingName !== undefined && existingName !== pair.repository) return false;
+        nameById.set(pair.repositoryId, pair.repository);
+      }
+      const pairKeys = typedPairs.map((pair) => `${pair.repositoryId}:${pair.repository}`);
+      return (
+        new Set(pairKeys).size === pairKeys.length &&
+        (typedPairs.length === 0 || value.repository === typedPairs[0]?.repository)
+      );
+    };
+    const validLegacyNames = (): boolean => {
+      if (!Array.isArray(legacyNames) || !legacyNames.every(canonicalRepository)) return false;
+      return (
+        new Set(legacyNames).size === legacyNames.length &&
+        (legacyNames.length === 0 || value.repository === legacyNames[0])
+      );
+    };
     return (
       eventName === "installation_repositories" &&
-      exactFields(["installationId", "repository", "repositories", "rawAction"]) &&
+      exactFields([
+        "installationId",
+        "repository",
+        "repositories",
+        "legacyRepositories",
+        "rawAction",
+      ]) &&
       positiveInteger("installationId") &&
       (value.repository === undefined || canonicalRepository(value.repository)) &&
-      Array.isArray(repositories) &&
-      repositories.every(canonicalRepository) &&
-      new Set(repositories).size === repositories.length &&
-      (repositories.length === 0 || value.repository === repositories[0]) &&
+      (hasPairs ? validPairs() : validLegacyNames()) &&
       value.rawAction === action
     );
   }
@@ -162,8 +243,9 @@ export function validEvent(
   return (
     observeEventName !== undefined &&
     eventName === observeEventName &&
-    exactFields(["repository", "installationId", "headSha", "observeOnly", "rawAction"]) &&
+    exactFields(["repository", "repositoryId", "installationId", "headSha", "observeOnly", "rawAction"]) &&
     canonicalRepository(value.repository) &&
+    repositoryIdOk() &&
     positiveInteger("installationId") &&
     nonEmpty("headSha") &&
     value.observeOnly === true &&
@@ -250,9 +332,15 @@ export function parseRecord(raw: string): InboxDeliveryRecord {
     }
     return result;
   }
-  if (!validEvent(result.event, result.deliveryId, result.receivedAt, result.eventName!)) {
+  const migratedEvent = migrateLegacyEvent(result.event);
+  if (
+    !validEvent(migratedEvent, result.deliveryId, result.receivedAt, result.eventName!, {
+      allowLegacy: true,
+    })
+  ) {
     throw new Error("Invalid GitHub durable inbox event");
   }
+  result.event = migratedEvent;
   if (result.status === "processing") {
     if (
       !result.leaseId ||

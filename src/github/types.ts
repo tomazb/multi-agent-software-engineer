@@ -40,12 +40,26 @@ export class MalformedGitHubWebhookError extends Error {
   }
 }
 
+/** A stable numeric repository ID paired with its current canonical name. */
+export interface GitHubRepositoryIdentity {
+  repositoryId: number;
+  repository: string;
+}
+
 export interface GitHubInternalEvent {
   eventId: string;
   type: GitHubInternalEventType;
   repository?: string;
-  /** All repositories affected by installation_repositories events. */
-  repositories?: string[];
+  /** Stable numeric identity for the single repository this event is scoped to. */
+  repositoryId?: number;
+  /** ID/name pairs affected by a new installation_repositories event. */
+  repositories?: GitHubRepositoryIdentity[];
+  /**
+   * Pre-#34 name-only installation_repositories repository list, migrated at the
+   * durable-record boundary from the historical `repositories: string[]` shape.
+   * Never produced by normalization of a new webhook payload.
+   */
+  legacyRepositories?: string[];
   installationId?: number;
   pullRequestNumber?: number;
   headSha?: string;

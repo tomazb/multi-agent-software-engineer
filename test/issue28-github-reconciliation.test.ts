@@ -88,7 +88,7 @@ function prPayload(headSha: string, baseSha = HEAD_A) {
   return {
     action: "synchronize",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
     pull_request: {
       number: 28,
       head: { sha: headSha, ref: "maswe/issue-28" },
