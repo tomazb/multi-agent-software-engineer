@@ -68,6 +68,7 @@ export type ClaimOperation =
   | "github-check-create"
   | "github-delivery"
   | "github-publication"
+  | "github-repository-identity"
   | "run-target-mutation"
   | "run-publication"
   | "run-terminal-cleanup"
@@ -218,6 +219,7 @@ const CLAIM_OPERATIONS: ClaimOperation[] = [
   "github-check-create",
   "github-delivery",
   "github-publication",
+  "github-repository-identity",
   "run-target-mutation",
   "run-publication",
   "run-terminal-cleanup",
