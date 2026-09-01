@@ -1,9 +1,12 @@
 /**
- * Shared hardened GitHub Link-header pagination primitives.
+ * Shared hardened GitHub Link pagination and response-classification helpers.
  *
  * Extracted from `checks.ts`'s check-run reconciliation pagination so the
  * same hardened URL/loop policy can be reused by the canonical repository
  * lookup in `repository-identity.ts` without duplicating the parsing rules.
+ * `isRateLimited` is response classification rather than Link pagination,
+ * but the move was kept mechanical and `checks.ts` re-exports it, so the
+ * pre-existing public surface is preserved; it stays in this module.
  *
  * `nextGitHubLink` and `requireSafeGitHubPageUrl` intentionally take no
  * caller-specific message/context parameter: their signatures are frozen by

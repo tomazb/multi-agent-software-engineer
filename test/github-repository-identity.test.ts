@@ -317,6 +317,55 @@ test("lookupCanonicalGitHubRepository fails closed on an invalid canonical name 
   );
 });
 
+test("lookupCanonicalGitHubRepository fails closed on path-traversal segments in the canonical name", async () => {
+  // A whole owner or repo segment of "." or ".." is a value GitHub never
+  // issues for full_name; reject it as a path-traversal hazard rather than
+  // accepting it as routing/display metadata.
+  const traversalNames = ["owner/..", "../repo", "owner/.", "./repo"];
+  for (const fullName of traversalNames) {
+    const http: GitHubHttpClient = {
+      async request() {
+        return page([{ id: 4242, full_name: fullName }]);
+      },
+    };
+    await rejectsWithCode(
+      lookupCanonicalGitHubRepository({ http, token: "ghs_test", repositoryId: 4242 }),
+      "canonical-name-invalid",
+    );
+  }
+});
+
+test("lookupCanonicalGitHubRepository fails closed on control characters in the canonical name", async () => {
+  const controlCharacterNames = ["own\u0001er/repo", "owner/re\u0007po", "owner\towner2/repo", "owner/repo\u007f"];
+  for (const fullName of controlCharacterNames) {
+    const http: GitHubHttpClient = {
+      async request() {
+        return page([{ id: 4242, full_name: fullName }]);
+      },
+    };
+    await rejectsWithCode(
+      lookupCanonicalGitHubRepository({ http, token: "ghs_test", repositoryId: 4242 }),
+      "canonical-name-invalid",
+    );
+  }
+});
+
+test("lookupCanonicalGitHubRepository accepts canonical names GitHub can legitimately issue", async () => {
+  // Dots and underscores anywhere within a segment (not as the whole
+  // segment) are real GitHub repository name characters and must not be
+  // rejected by the path-traversal tightening.
+  const legitimateNames = ["my-org/repo.name_1", "a.b.c/d_e-f", "owner123/.github", "owner/repo.."];
+  for (const fullName of legitimateNames) {
+    const http: GitHubHttpClient = {
+      async request() {
+        return page([{ id: 4242, full_name: fullName }]);
+      },
+    };
+    const result = await lookupCanonicalGitHubRepository({ http, token: "ghs_test", repositoryId: 4242 });
+    assert.deepEqual(result, { kind: "found", repositoryId: 4242, repository: fullName.toLowerCase() });
+  }
+});
+
 test("lookupCanonicalGitHubRepository rejects invalid repository ids", async () => {
   const invalidRepositoryIds = [0, -1, 1.5, Number.NaN];
   for (const repositoryId of invalidRepositoryIds) {

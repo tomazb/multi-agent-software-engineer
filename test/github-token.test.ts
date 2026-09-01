@@ -212,24 +212,36 @@ test("createRepositoryInstallationAccessToken rejects invalid installation ids b
 });
 
 test("createRepositoryInstallationAccessToken rejects an unknown purpose before requesting a token", async () => {
-  let requests = 0;
-  await assert.rejects(
-    createRepositoryInstallationAccessToken({
-      appId: "123",
-      privateKeyPem: testPrivateKeyPem(),
-      installationId: 9,
-      repositoryId: 4242,
-      purpose: "write-anything" as GitHubInstallationTokenPurpose,
-      http: {
-        async request() {
-          requests += 1;
-          return { status: 201, headers: {}, body: { token: "too-broad" } };
+  // Includes Object.prototype keys ("constructor", "toString", "valueOf",
+  // "hasOwnProperty") to pin the fix for the prototype-pollution fail-open
+  // hole: a naive `REPOSITORY_TOKEN_PERMISSIONS[purpose]` lookup on a plain
+  // object literal resolves these to inherited functions, which are truthy
+  // and silently dropped by JSON.stringify, so the request would go out with
+  // `permissions` omitted entirely -- GitHub then grants the installation's
+  // FULL permission set. Each case must reject with zero HTTP requests
+  // issued, not merely throw.
+  const invalidPurposes = ["write-anything", "constructor", "toString", "valueOf", "hasOwnProperty"];
+  for (const purpose of invalidPurposes) {
+    let requests = 0;
+    await assert.rejects(
+      createRepositoryInstallationAccessToken({
+        appId: "123",
+        privateKeyPem: testPrivateKeyPem(),
+        installationId: 9,
+        repositoryId: 4242,
+        purpose: purpose as GitHubInstallationTokenPurpose,
+        http: {
+          async request() {
+            requests += 1;
+            return { status: 201, headers: {}, body: { token: "too-broad" } };
+          },
         },
-      },
-    }),
-    /purpose/i,
-  );
-  assert.equal(requests, 0);
+      }),
+      /purpose/i,
+      `purpose '${purpose}' should be rejected`,
+    );
+    assert.equal(requests, 0, `purpose '${purpose}' must not issue a request`);
+  }
 });
 
 test("createRepositoryInstallationAccessToken rejects an explicit read-only policy opt-out for every purpose", async () => {

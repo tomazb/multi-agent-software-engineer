@@ -72,6 +72,41 @@ function malformed(message: string): never {
   throw new GitHubRepositoryLookupError("malformed-response", message, false);
 }
 
+/** ASCII control characters (C0 plus DEL); never legitimate in a GitHub owner or repo name. */
+const CONTROL_CHARACTER_PATTERN = /[\x00-\x1f\x7f]/;
+
+/**
+ * True when `segment` is a whole owner or repo path-traversal token. GitHub
+ * never issues "." or ".." as an owner login or repository name, and a
+ * downstream consumer that treats `full_name` as a path component would
+ * misinterpret either as traversal, so both are rejected outright.
+ */
+function isPathTraversalSegment(segment: string): boolean {
+  return segment === "." || segment === "..";
+}
+
+/**
+ * Validates a GitHub `full_name` against the hazards this lookup must reject
+ * -- path-traversal segments and control characters -- while staying
+ * permissive enough to accept every name GitHub can actually issue (GitHub
+ * logins: alphanumeric plus hyphen; repository names: letters, digits, `.`,
+ * `_`, `-`). This intentionally does not whitelist to that narrower
+ * character set: over-tightening risks rejecting a real repository name and
+ * blocking canonical reconciliation, which is worse than the hazard being
+ * fixed. See issue #34 Task 3 review Finding 4.
+ */
+function isValidCanonicalRepositoryName(fullName: string): boolean {
+  const slashIndex = fullName.indexOf("/");
+  if (slashIndex <= 0 || slashIndex === fullName.length - 1) return false;
+  const owner = fullName.slice(0, slashIndex);
+  const repo = fullName.slice(slashIndex + 1);
+  if (owner.includes("/") || repo.includes("/")) return false;
+  if (/\s/.test(owner) || /\s/.test(repo)) return false;
+  if (CONTROL_CHARACTER_PATTERN.test(owner) || CONTROL_CHARACTER_PATTERN.test(repo)) return false;
+  if (isPathTraversalSegment(owner) || isPathTraversalSegment(repo)) return false;
+  return true;
+}
+
 function validateRow(row: unknown): { id: number; name: string } {
   if (row === null || typeof row !== "object" || Array.isArray(row)) {
     malformed("GitHub installation repository lookup response row is malformed");
@@ -81,7 +116,7 @@ function validateRow(row: unknown): { id: number; name: string } {
     malformed("GitHub installation repository lookup response row id is malformed");
   }
   const fullName = (row as { full_name?: unknown }).full_name;
-  if (typeof fullName !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(fullName)) {
+  if (typeof fullName !== "string" || !isValidCanonicalRepositoryName(fullName)) {
     throw new GitHubRepositoryLookupError(
       "canonical-name-invalid",
       "GitHub installation repository lookup response row full_name is not a valid owner/repo canonical name",
@@ -192,6 +227,13 @@ export async function lookupCanonicalGitHubRepository(options: {
       }
       seen.set(id, name);
       if (id === repositoryId) {
+        // Stop-on-found deliberately takes precedence over self-conflict
+        // detection: spec §5.1 requires returning immediately once the
+        // requested ID is found, which is incompatible with draining the
+        // rest of the page (or later pages) to see whether that same ID
+        // recurs under a different name. The conflict check above therefore
+        // can never fire for the requested ID itself -- only for other IDs
+        // encountered while still searching. This is intentional, not a gap.
         return { kind: "found", repositoryId: id, repository: name };
       }
     }

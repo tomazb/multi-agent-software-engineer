@@ -131,8 +131,25 @@ export async function createRepositoryInstallationAccessToken(options: {
   if (!Number.isSafeInteger(options.repositoryId) || options.repositoryId <= 0) {
     throw new Error("GitHub repository id must be a positive safe integer");
   }
+  // Object.hasOwn guards against Object.prototype keys ("constructor",
+  // "toString", "valueOf", "hasOwnProperty", ...): REPOSITORY_TOKEN_PERMISSIONS
+  // is a plain object literal, so a bare `[options.purpose]` lookup on one of
+  // those keys resolves to an inherited function rather than `undefined`. A
+  // function is truthy, so a `!permissions` guard alone fails open, and
+  // JSON.stringify (src/github/http.ts) silently drops function-valued
+  // properties -- the request would go out with `permissions` omitted
+  // entirely, which GitHub interprets as "grant the installation's full
+  // permission set". Reject unless `purpose` is one of this table's own
+  // (non-inherited) keys.
+  if (!Object.hasOwn(REPOSITORY_TOKEN_PERMISSIONS, options.purpose)) {
+    throw new Error(`Unknown GitHub installation token purpose: ${String(options.purpose)}`);
+  }
   const permissions = REPOSITORY_TOKEN_PERMISSIONS[options.purpose];
-  if (!permissions) {
+  // Belt-and-braces: even with the own-property guard above, assert the
+  // resolved value is a plain permissions object before it is used to build
+  // the request body, so a future refactor of this table cannot silently
+  // reintroduce a non-object (or non-plain-object) value on this path.
+  if (permissions === null || typeof permissions !== "object" || Array.isArray(permissions)) {
     throw new Error(`Unknown GitHub installation token purpose: ${String(options.purpose)}`);
   }
   const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem);
