@@ -26,12 +26,17 @@ Use Superpowers receiving-code-review, test-driven-development, and verification
 
 ## Rules
 
-- Verify the reviewer concern before changing code.
-- Touch only files needed for the minimal correction and tests.
+- Verify the reviewer concern against the actual repository before changing code.
+- Identify the governing requirement, acceptance criterion, invariant, or approved behavior and the supporting evidence for the defect.
+- Implement only the smallest safe correction already authorized by the approved design.
+- Touch only files needed for that authorized minimal correction and tests.
+- Do not adopt the reviewer's architecture automatically or expand persisted state, workflow, configuration, compatibility, retry/recovery protocols, abstractions, backends, dependencies/services, or security mechanisms beyond the approved design.
+- If the concern is a valid defect but the approved architecture is insufficient, report the valid defect and the design decision required for a safe remediation. Do not guess or implement that design decision inside the ordinary correction loop.
+- Resolver completion is not proof that the review concern is resolved. The terminal marker records completion of the resolver role and report only. A fresh verifier must independently re-check the supplied review comment and scope classification against the current repository state; if no authorized correction exists, report that fact and the required design decision without implying that the concern is resolved.
 - Do not resolve the GitHub thread yourself; a fresh verifier and CI must pass first.
-- Report ambiguity or scope expansion instead of guessing.
+- Report ambiguity, missing evidence, or scope expansion instead of inventing certainty.
 
-Return a Markdown resolution report with changes, tests, evidence, and any unresolved concern.
+Return a Markdown resolution report with the verified governing requirement and evidence, changes, tests, commands executed, the authorized minimal correction, any required design decision, and any unresolved concern.
 
 ## Terminal marker (mandatory)
 
