@@ -587,6 +587,211 @@ test("CheckPublisher rejects duplicate rel attributes or relation tokens", async
   }
 });
 
+// The following four tests pin the exact historical error message families
+// (issue #34 Task 3: pagination.ts extraction must not change checks.ts's
+// asserted strings verbatim, not just their regex family).
+test("CheckPublisher preserves the exact 'Link header is malformed' message after pagination extraction", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-exact-header-malformed-"));
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET") {
+        return {
+          status: 200,
+          headers: { link: `<${url}>; rel="next"; rel="prev"` },
+          body: { check_runs: [] },
+        };
+      }
+      if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+      return { status: 200, headers: {}, body: {} };
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects: new GitHubSideEffectStore(root),
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await assert.rejects(
+    () => publisher.publishForHeadSha(run, "sha"),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "GitHub check-run pagination Link header is malformed");
+      return true;
+    },
+  );
+});
+
+test("CheckPublisher preserves the exact 'Link URL is malformed' message after pagination extraction", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-exact-url-malformed-"));
+  const http: GitHubHttpClient = {
+    async request(method) {
+      if (method === "GET") {
+        return {
+          status: 200,
+          headers: { link: `<:::not-a-url>; rel="next"` },
+          body: { check_runs: [] },
+        };
+      }
+      if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+      return { status: 200, headers: {}, body: {} };
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects: new GitHubSideEffectStore(root),
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await assert.rejects(
+    () => publisher.publishForHeadSha(run, "sha"),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "GitHub check-run pagination Link URL is malformed");
+      return true;
+    },
+  );
+});
+
+test("CheckPublisher preserves the exact 'Link URL is unsafe' message after pagination extraction", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-exact-url-unsafe-"));
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET") {
+        return {
+          status: 200,
+          headers: { link: `<${url.replace("https://api.github.com", "https://example.invalid")}>; rel="next"` },
+          body: { check_runs: [] },
+        };
+      }
+      if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+      return { status: 200, headers: {}, body: {} };
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects: new GitHubSideEffectStore(root),
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await assert.rejects(
+    () => publisher.publishForHeadSha(run, "sha"),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "GitHub check-run pagination Link URL is unsafe");
+      return true;
+    },
+  );
+});
+
+test("CheckPublisher preserves the exact 'page limit exceeded' message after pagination extraction", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-exact-page-limit-"));
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET") {
+        const next = new URL(url);
+        next.searchParams.set("page", String((Number(next.searchParams.get("page")) || 1) + 1));
+        return {
+          status: 200,
+          headers: { link: `<${next.toString()}>; rel="next"` },
+          body: { check_runs: [] },
+        };
+      }
+      if (method === "POST") return { status: 201, headers: {}, body: { id: 1 } };
+      return { status: 200, headers: {}, body: {} };
+    },
+  };
+  const publisher = new CheckPublisher({
+    http,
+    sideEffects: new GitHubSideEffectStore(root),
+    readOnlyChecks: true,
+    owner: "owner",
+    repo: "repo",
+    pullRequestNumber: 1,
+    token: "token",
+  });
+  const run = {
+    schemaVersion: 1,
+    version: 1,
+    id: "run-1",
+    title: "t",
+    request: "r",
+    repositoryPath: "/tmp",
+    state: "PR_REVIEW",
+    createdAt: "",
+    updatedAt: "",
+    approvals: { brainstorm: false, design: false },
+    counters: { buildVerifyCycles: 0, commentResolutionCycles: 0 },
+    config: DEFAULT_CONFIG,
+    artifacts: [],
+    events: [],
+  } as RunRecord;
+
+  await assert.rejects(
+    () => publisher.publishForHeadSha(run, "sha"),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "GitHub check-run pagination page limit exceeded");
+      return true;
+    },
+  );
+});
+
 test("CheckPublisher stops reconciliation at a finite page ceiling", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-page-limit-"));
   let gets = 0;

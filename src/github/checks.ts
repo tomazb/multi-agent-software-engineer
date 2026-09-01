@@ -1,8 +1,17 @@
 import { createHash } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
 import type { GitHubHttpClient } from "./http.ts";
+import {
+  GitHubPaginationError,
+  headerValue,
+  isRateLimited,
+  nextGitHubLink,
+  requireSafeGitHubPageUrl,
+} from "./pagination.ts";
 import type { GitHubSideEffectStore } from "./side-effect-store.ts";
 import { MASWE_CHECK_NAMES, type MasweCheckName } from "./types.ts";
+
+export { isRateLimited } from "./pagination.ts";
 
 export type { GitHubHttpClient } from "./http.ts";
 
@@ -115,113 +124,28 @@ export function externalIdFor(key: string): string {
 
 const CHECK_RECONCILIATION_PAGE_LIMIT = 10;
 
-function headerValue(
-  headers: Record<string, string>,
-  expectedName: string,
-): string | undefined {
-  const normalizedExpectedName = expectedName.toLowerCase();
-  for (const [name, value] of Object.entries(headers)) {
-    if (name.toLowerCase() === normalizedExpectedName) return value;
-  }
-  return undefined;
-}
-
-function nextLinkFrom(headers: Record<string, string>): string | undefined {
-  const value = headerValue(headers, "link");
-  if (value === undefined) return undefined;
-  if (value.trim() === "") throw new Error("GitHub check-run pagination Link header is malformed");
-
-  let nextUrl: string | undefined;
-  for (const segment of value.split(",")) {
-    const link = /^\s*<([^<>]+)>(.*)$/.exec(segment);
-    if (!link) throw new Error("GitHub check-run pagination Link header is malformed");
-    const parameterText = link[2]!;
-    const parameters = parameterText.split(";");
-    if (parameters.shift()!.trim() !== "") {
-      throw new Error("GitHub check-run pagination Link header is malformed");
+/**
+ * Extracted `nextGitHubLink`/`requireSafeGitHubPageUrl` (pagination.ts) throw
+ * a generic `GitHubPaginationError` since their signatures are frozen and
+ * carry no caller-specific message context. This remaps the extracted error
+ * codes back onto the exact historical check-run pagination strings that
+ * existing tests assert on verbatim, so the extraction changes no observable
+ * behavior.
+ */
+function remapCheckPaginationError(error: unknown): never {
+  if (error instanceof GitHubPaginationError) {
+    switch (error.code) {
+      case "link-header-malformed":
+        throw new Error("GitHub check-run pagination Link header is malformed");
+      case "link-multiple-next":
+        throw new Error("GitHub check-run pagination Link header has multiple next links");
+      case "link-url-malformed":
+        throw new Error("GitHub check-run pagination Link URL is malformed");
+      case "link-url-unsafe":
+        throw new Error("GitHub check-run pagination Link URL is unsafe");
     }
-
-    let relations: string[] = [];
-    let hasRelationParameter = false;
-    for (const parameter of parameters) {
-      const parsed = /^\s*([^=\s]+)\s*=\s*(?:"([^"]*)"|([^"\s;]+))\s*$/.exec(parameter);
-      if (!parsed) throw new Error("GitHub check-run pagination Link header is malformed");
-      if (parsed[1]!.toLowerCase() === "rel") {
-        if (hasRelationParameter) {
-          throw new Error("GitHub check-run pagination Link header is malformed");
-        }
-        hasRelationParameter = true;
-        relations = (parsed[2] ?? parsed[3] ?? "").split(/\s+/).filter(Boolean);
-        const normalizedRelations = relations.map((relation) => relation.toLowerCase());
-        if (new Set(normalizedRelations).size !== normalizedRelations.length) {
-          throw new Error("GitHub check-run pagination Link header is malformed");
-        }
-      }
-    }
-    if (!relations.some((relation) => relation.toLowerCase() === "next")) continue;
-    if (nextUrl !== undefined) {
-      throw new Error("GitHub check-run pagination Link header has multiple next links");
-    }
-    nextUrl = link[1]!;
   }
-  return nextUrl;
-}
-
-function safePaginationUrl(
-  rawUrl: string,
-  endpointPath: string,
-  checkName: string,
-): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    throw new Error("GitHub check-run pagination Link URL is malformed");
-  }
-  const allowedQueryKeys = new Set(["check_name", "filter", "per_page", "page"]);
-  const hasOnlyAllowedQueryKeys = Array.from(parsed.searchParams.keys()).every((key) =>
-    allowedQueryKeys.has(key),
-  );
-  const hasExactSingleValue = (key: string, expected: string): boolean => {
-    const values = parsed.searchParams.getAll(key);
-    return values.length === 1 && values[0] === expected;
-  };
-  const pageValues = parsed.searchParams.getAll("page");
-  const hasValidPage =
-    pageValues.length === 0 ||
-    (pageValues.length === 1 && /^[1-9]\d*$/.test(pageValues[0]!));
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.origin !== "https://api.github.com" ||
-    parsed.username !== "" ||
-    parsed.password !== "" ||
-    parsed.pathname !== endpointPath ||
-    parsed.hash !== "" ||
-    !hasOnlyAllowedQueryKeys ||
-    !hasExactSingleValue("check_name", checkName) ||
-    !hasExactSingleValue("filter", "all") ||
-    !hasExactSingleValue("per_page", "100") ||
-    !hasValidPage
-  ) {
-    throw new Error("GitHub check-run pagination Link URL is unsafe");
-  }
-  return parsed.toString();
-}
-
-export function isRateLimited(
-  status: number,
-  headers: Record<string, string>,
-  body: unknown,
-): boolean {
-  if (status === 429) return true;
-  if (status !== 403) return false;
-  const remaining = headerValue(headers, "x-ratelimit-remaining");
-  if (remaining === "0") return true;
-  const message =
-    body && typeof body === "object" && "message" in body
-      ? String((body as { message: unknown }).message)
-      : "";
-  return /rate limit/i.test(message);
+  throw error;
 }
 
 function rateLimitDelayMs(headers: Record<string, string>, attempt: number): number {
@@ -413,9 +337,29 @@ export class CheckPublisher {
       );
       if (match) return match.id;
 
-      const nextLink = nextLinkFrom(response.headers);
+      let nextLink: string | undefined;
+      try {
+        nextLink = nextGitHubLink(response.headers);
+      } catch (error) {
+        remapCheckPaginationError(error);
+      }
       if (nextLink === undefined) return undefined;
-      const nextUrl = safePaginationUrl(nextLink, endpointPath, name);
+      let nextUrl: string;
+      try {
+        nextUrl = requireSafeGitHubPageUrl(nextLink, {
+          origin: "https://api.github.com",
+          pathname: endpointPath,
+          requiredQuery: {
+            check_name: name,
+            filter: "all",
+            per_page: "100",
+          },
+          optionalPositiveIntegerQuery: ["page"],
+          allowedQueryKeys: ["check_name", "filter", "per_page", "page"],
+        });
+      } catch (error) {
+        remapCheckPaginationError(error);
+      }
       if (visited.has(nextUrl)) {
         throw new Error("GitHub check-run pagination Link loop detected");
       }
