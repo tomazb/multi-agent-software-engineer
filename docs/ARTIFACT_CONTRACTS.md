@@ -516,7 +516,8 @@ Required content:
 - Acceptance criteria matrix.
 - Commands and evidence inspected.
 - Blocking findings. Every blocker identifies the governing requirement, acceptance criterion, invariant, or approved behavior; the concrete reachable failure or impact; supporting code, test, diff, or execution evidence; the smallest safe remediation; and whether that remediation stays within the approved design or expands architecture.
-- Defect validity and proposed remediation are reported as separate decisions. An architecture-expanding remediation identifies the design decision requiring human/specification approval rather than presenting that expansion as an ordinary correction.
+- Defect validity and proposed remediation are reported as separate decisions. An architecture-expanding remediation identifies the required owner/specification disposition rather than presenting that expansion as an ordinary correction. The verifier does not create a verifier-specific human-gate transition; an unresolved valid defect remains blocking in the current verifier path.
+- When the review comment and classification are supplied to a post-resolution verifier, it independently re-checks that review context against the current repository state. The prior classification and resolver completion are claims, not proof that the defect is resolved.
 - Non-blocking warnings, including explicit uncertainty or missing evidence where applicable.
 - Final decision.
 
@@ -575,7 +576,7 @@ Required terminal marker:
 RESOLUTION_COMPLETE
 ```
 
-After this artifact is written, the workflow always runs deterministic quality checks and a fresh verifier.
+The terminal marker records completion of the resolver role and report; it is not proof that the review concern is resolved. After this artifact is written, the workflow always runs deterministic quality checks and a fresh verifier. The post-resolution verifier receives the review comment and classification and independently re-checks the concern against the current repository state.
 
 ## Event metadata
 
