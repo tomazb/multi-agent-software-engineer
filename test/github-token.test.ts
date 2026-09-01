@@ -220,7 +220,21 @@ test("createRepositoryInstallationAccessToken rejects an unknown purpose before 
   // `permissions` omitted entirely -- GitHub then grants the installation's
   // FULL permission set. Each case must reject with zero HTTP requests
   // issued, not merely throw.
-  const invalidPurposes = ["write-anything", "constructor", "toString", "valueOf", "hasOwnProperty"];
+  //
+  // "__proto__" is the case that pins the Object.hasOwn guard specifically.
+  // The four keys above all resolve to functions, so the defence-in-depth
+  // plain-object assertion would reject them even without Object.hasOwn.
+  // "__proto__" instead resolves to Object.prototype itself -- typeof
+  // "object", non-null, non-array -- so it slips past a type-only check and
+  // is rejected solely because Object.hasOwn is evaluated first.
+  const invalidPurposes = [
+    "write-anything",
+    "constructor",
+    "toString",
+    "valueOf",
+    "hasOwnProperty",
+    "__proto__",
+  ];
   for (const purpose of invalidPurposes) {
     let requests = 0;
     await assert.rejects(
