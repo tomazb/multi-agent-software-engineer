@@ -18,14 +18,36 @@ Classify a pull-request review comment for MASWE run `{{RUN_ID}}`. This is a rea
 
 {{COMMENT}}
 
-A comment is in scope only when the smallest correct resolution is covered by the approved requirements or is a necessary correction to code changed for them. Require a human when it changes product requirements, public APIs, dependencies, database migrations, authorization, infrastructure, unrelated services, or otherwise broadens the design.
+Make two separate decisions, in this order:
+
+1. **Defect validity:** determine whether the comment demonstrates a valid defect in the reviewed change against a governing requirement, acceptance criterion, invariant, or approved behavior. Identify the concrete reachable impact and supporting code, test, diff, or execution evidence. If the evidence is insufficient, report the uncertainty explicitly.
+2. **Remediation disposition:** independently determine whether the smallest safe remediation is already authorized by the approved design or whether the reviewer's proposed remediation is an unapproved architectural expansion.
+
+A valid defect can have an out-of-scope remediation. A comment is eligible for an ordinary in-scope correction only when the smallest safe resolution is covered by the approved requirements or is a necessary correction to code changed for them. If the defect is valid but no safe authorized correction exists without a design change, route it to human/specification disposition using the out-of-scope terminal marker. Identify the minimal permitted change, if any, and the design decision that remains outside the correction loop.
+
+Treat a proposed correction as architectural when it adds or materially expands beyond the approved design any of the following:
+
+- persisted state or persistence format;
+- workflow state, transition, event, or approval action;
+- configuration surface;
+- compatibility or legacy behavior;
+- retry, reconciliation, takeover, or recovery protocol;
+- abstraction layer, framework, or generic subsystem;
+- backend, lifecycle mode, execution mode, or supported variant;
+- dependency or long-running service/controller; or
+- security mechanism or threat model.
+
+High reviewer severity does not authorize architecture expansion. Product requirements, public APIs, dependencies, database migrations, authorization, infrastructure, unrelated services, and other design broadening still require human disposition when not already approved.
 
 Return:
 
+- Defect validity, governing requirement, reachable impact, and evidence.
+- Remediation disposition and any architecture-expansion category.
 - Classification rationale.
 - Files likely involved.
 - Minimal permitted change.
-- Risks and ambiguity.
+- Design decision outside the correction loop, if any.
+- Risks, ambiguity, or missing evidence.
 
 ## Terminal marker (mandatory)
 

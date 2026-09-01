@@ -23,6 +23,52 @@ This repository implements a deterministic multi-agent software delivery orchest
 - Persist handoffs through artifacts; do not add hidden cross-agent conversation state.
 - Do not store credentials, model responses containing secrets, or repository tokens in committed files.
 
+## Engineering decision and authority policy
+
+Correctness, safety, security, concurrency, recovery, idempotency, audit, evidence, compatibility, approved observable behavior, and operator-facing contracts take precedence over YAGNI, KISS, and DRY.
+
+Apply engineering decisions in this order:
+
+1. Preserve governing requirements and approved behavior.
+2. Do not add requirements that do not exist.
+3. Implement required behavior with the smallest clear and explicit model.
+4. Share authoritative knowledge only where doing so reduces duplication without adding coupling, hidden conditionals, or a broader abstraction.
+
+Fewer lines, states, files, or concepts do not justify weakening a required contract.
+
+### Orchestration and methodology authority
+
+- MASWE is the durable orchestration authority for workflow state and transitions, approvals, retry/fallback boundaries, attempt identity, workspace/worktree ownership, evidence acceptance, recovery, Git mutation, and publication.
+- Superpowers is responsible for the engineering methodology an agent uses while performing its assigned role.
+- Neither Superpowers nor an external harness may become a second durable MASWE control plane.
+
+### Writer authority and bounded parallelism
+
+One designated writer owns each mutable branch and worktree at a time.
+
+- Parallel agents may perform read-only investigation or review against shared state.
+- Parallel writers must use separate isolated worktrees/branches with a controlled integration boundary.
+- A writer handoff requires the previous writer to stop mutation and the new writer to refresh repository state and verify the exact current branch and HEAD before mutation.
+- Do not parallelize work that edits the same files, mutates the same external resource, depends on an unresolved interface, or can invalidate another task's evidence.
+- Require dependency or serialization metadata only where meaningful parallel execution is plausible; do not create boilerplate for trivial tasks.
+
+### Evidence-backed review and complexity firewall
+
+Every blocking verifier or review finding must identify:
+
+1. The governing requirement, acceptance criterion, invariant, or approved behavior that is violated.
+2. The concrete reachable failure or impact.
+3. Supporting code, test, diff, or execution evidence.
+4. The smallest safe remediation known to the reviewer.
+
+Labels such as "best practice", "more robust", "production grade", or a theoretically stronger design are not sufficient by themselves to make a finding blocking. Report uncertainty or missing evidence explicitly rather than inventing certainty.
+
+Treat a demonstrated defect and the reviewer's proposed remediation as separate decisions. A proposed correction is architectural when it adds or materially expands beyond the approved design any of the following: persisted state or persistence format; workflow state, transition, event, or approval action; configuration surface; compatibility or legacy behavior; retry, reconciliation, takeover, or recovery protocol; abstraction layer, framework, or generic subsystem; backend, lifecycle mode, execution mode, or supported variant; dependency or long-running service/controller; or security mechanism or threat model.
+
+Do not implement an architectural proposal inside an ordinary review-fix loop merely because the reviewer assigned high severity. The underlying defect may be accepted, but an architecture-expanding remediation returns to specification and owner approval unless the current approved design already requires it.
+
+A complexity-increasing proposal must state the violated requirement, concrete reachable failure, supporting evidence, smallest safe remediation, and why deletion, narrower scope, fail-closed behavior, an existing primitive, or explicit operator resolution is insufficient.
+
 ## Builder simplification gate
 
 Before declaring the implementation ready for deterministic CI and subsequent independent verification, the builder must review the changed code and the directly affected collaborators needed to understand the change for avoidable complexity introduced or materially worsened by the implementation.
