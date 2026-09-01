@@ -24,6 +24,14 @@ Use Superpowers requesting-code-review and verification-before-completion practi
 
 {{QUALITY_REPORT}}
 
+## Review comment
+
+{{COMMENT}}
+
+## Scope classification
+
+{{CLASSIFICATION}}
+
 ## Verification duties
 
 1. Map every acceptance criterion to code and test evidence.
@@ -33,6 +41,7 @@ Use Superpowers requesting-code-review and verification-before-completion practi
 5. Confirm deterministic quality checks correspond to the exact current workspace and commit.
 6. Apply the evidence-backed blocking-finding contract below before assigning blocking severity.
 7. Apply the unnecessary-complexity lens below without weakening an approved requirement or observable contract.
+8. When review context is supplied after a resolution attempt, independently re-check the review comment and scope classification against the current repository state. Treat the prior classification and resolver completion as claims, not proof. If a previously valid defect is still valid or remains reachable, keep it blocking and fail verification.
 
 ## Blocking finding contract
 
@@ -57,7 +66,7 @@ Treat defect validity as a separate decision from the proposed remediation. For 
 - dependency or long-running service/controller; or
 - security mechanism or threat model.
 
-When the defect is valid but the suggested remediation expands architecture, report the defect and the required design decision separately. Do not treat the architectural proposal as an ordinary correction unless the approved design already requires it; route the design decision back to human/specification approval.
+When the defect is valid but the suggested remediation expands architecture, report the defect and the required owner/specification disposition separately. Do not treat the architectural proposal as an ordinary correction unless the approved design already requires it. The current verifier path does not create a verifier-specific human-gate transition; do not claim MASWE has routed the run to one. Keep the unresolved defect blocking. A later correction may implement only a separately authorized remediation; otherwise the design decision remains outside the automatic correction path.
 
 A complexity-increasing proposal must make a complexity case covering the violated requirement, reachable failure, supporting evidence, smallest safe remediation, and why deletion, narrower scope, fail-closed behavior, an existing primitive, or explicit operator resolution is insufficient.
 
@@ -71,7 +80,8 @@ Return a Markdown report with:
 - Acceptance criteria matrix.
 - Commands executed and evidence inspected.
 - Blocking findings with file and line references. For each blocker include the governing requirement, reachable impact, supporting evidence, smallest safe remediation, and remediation architecture disposition.
-- Architecture-expanding remediation proposals and the design decision requiring human/specification approval, if any.
+- Architecture-expanding remediation proposals and the owner/specification disposition required outside the current automatic correction path, if any.
+- Post-resolution review-context check, when a review comment and scope classification are supplied: whether the original defect is no longer reachable in the current repository state.
 - Non-blocking warnings.
 - Final decision.
 
