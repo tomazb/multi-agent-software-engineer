@@ -100,6 +100,7 @@ interface LegacyMigrationRecord {
 }
 
 const ASSOCIATION_KEY = "associations";
+const REPOSITORY_ID_KEY_PATTERN = /^[1-9][0-9]*$/;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 10;
@@ -888,7 +889,8 @@ export async function withGitHubJournal<T>(
     !JOURNAL_KINDS.includes(kind) ||
     typeof logicalKey !== "string" ||
     !logicalKey ||
-    (kind === "association" && logicalKey !== ASSOCIATION_KEY)
+    (kind === "association" && logicalKey !== ASSOCIATION_KEY) ||
+    (kind === "repository-identity" && !REPOSITORY_ID_KEY_PATTERN.test(logicalKey))
   ) {
     throw publicError(
       "GITHUB_JOURNAL_INVALID_OPTIONS",
@@ -1049,7 +1051,9 @@ export async function inspectLegacyGitHubJournalOwnership(options: {
 
   // scanLockJournal()/initializeLockJournal() only complete idempotent journal scaffolding
   // (manifest/fixed directories) when missing; neither publishes a claim or a release, so no
-  // ownership state is created, acquired, or disturbed by this read.
+  // ownership state is created, acquired, or disturbed by this read. "Read-only" above therefore
+  // means read-only with respect to ownership, not to the filesystem: this call may still create
+  // the manifest/fixed-directory scaffolding on disk the first time a logical key is inspected.
   let scan;
   try {
     scan = await scanLockJournal(target, "data", { allowUnresolvedRawClaims: true });
@@ -1083,6 +1087,23 @@ export async function inspectLegacyGitHubJournalOwnership(options: {
   }
 
   const claimsByTicket = new Map(scan.claims.map((claim) => [claim.ticket, claim]));
+
+  // A ticket strictly behind the current (lowest unresolved) one is ordinary on-disk state for
+  // a live waiter: withGitHubJournal has it publish its claim to disk and then poll, so a queued
+  // claim or raw claim there does not imply its owner is dead, alive, or even fully written yet.
+  // Once the current owner is proven dead we therefore cannot report "dead" while any later
+  // ticket remains unresolved -- that queued entry could belong to a still-live pre-#34 process
+  // that will recover the dead owner and mutate concurrently with a #34 migration. Fail
+  // conservative ("ambiguous") rather than guess it is safe.
+  const hasLaterUnresolvedTicket = (currentTicket: bigint): boolean => {
+    for (let ticket = currentTicket + 1n; ticket <= scan.highestTicket; ticket += 1n) {
+      const ticketText = formatLockTicket(ticket);
+      if (scan.rawClaims.has(ticketText) && !scan.rawReleases.has(ticketText)) return true;
+      if (claimsByTicket.has(ticketText) && !scan.releases.has(ticketText)) return true;
+    }
+    return false;
+  };
+
   for (let ticket = 1n; ticket <= scan.highestTicket; ticket += 1n) {
     const ticketText = formatLockTicket(ticket);
     const rawClaim = scan.rawClaims.get(ticketText);
@@ -1093,15 +1114,16 @@ export async function inspectLegacyGitHubJournalOwnership(options: {
     const claim = claimsByTicket.get(ticketText);
     if (!claim) return { state: "malformed" };
     if (scan.releases.has(ticketText)) continue;
-    // This is the current (lowest unresolved) claim; any tickets behind it are queued and
-    // irrelevant to blocking classification. Prove death exactly or default to live.
+    // This is the current (lowest unresolved) claim. Prove death exactly or default to live.
     let dead: boolean;
     try {
       dead = isProcessDefinitelyDeadFn(claim.pid);
     } catch {
       return { state: "ambiguous" };
     }
-    return { state: dead ? "dead" : "live" };
+    if (!dead) return { state: "live" };
+    if (hasLaterUnresolvedTicket(ticket)) return { state: "ambiguous" };
+    return { state: "dead" };
   }
   return { state: "absent" };
 }

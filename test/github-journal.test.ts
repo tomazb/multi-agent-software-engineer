@@ -545,3 +545,176 @@ test("inspectLegacyGitHubJournalOwnership reports ambiguous when death cannot be
   assert.equal(scan.claims.length, 1);
   assert.equal(scan.releases.size, 0);
 });
+
+test("inspectLegacyGitHubJournalOwnership does not report dead when a later ticket is unresolved and live", async (t) => {
+  const githubRoot = await mkdtemp(
+    path.join(os.tmpdir(), "maswe-gh-journal-inspect-dead-queued-live-"),
+  );
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+  const logicalKey = "owner/repo#8";
+  const journalDirectory = ownershipJournalDirectory(githubRoot, "publication", logicalKey);
+  await mkdir(journalDirectory, { recursive: true });
+  await initializeLockJournal(journalDirectory);
+  const deadClaim = canonicalClaim({
+    kind: "data",
+    ticket: 1n,
+    owner: "550e8400-e29b-41d4-a716-446655440000",
+    pid: 999_999_999,
+    process: { startedAt: "2026-08-09T10:00:00.000Z", platformIdentity: null },
+    at: "2026-08-09T10:00:00.000Z",
+    operation: "github-publication",
+  });
+  await writeFile(
+    path.join(journalPaths(journalDirectory, "data").claims, "00000000000000000001.json"),
+    deadClaim.bytes,
+    "utf8",
+  );
+  const liveClaim = canonicalClaim({
+    kind: "data",
+    ticket: 2n,
+    owner: "660e8400-e29b-41d4-a716-446655440001",
+    pid: process.pid,
+    process: { startedAt: "2026-08-09T10:00:05.000Z", platformIdentity: null },
+    at: "2026-08-09T10:00:05.000Z",
+    operation: "github-publication",
+  });
+  await writeFile(
+    path.join(journalPaths(journalDirectory, "data").claims, "00000000000000000002.json"),
+    liveClaim.bytes,
+    "utf8",
+  );
+
+  const result = await inspectLegacyGitHubJournalOwnership({
+    githubRoot,
+    kind: "publication",
+    logicalKey,
+  });
+  assert.notEqual(result.state, "dead");
+  assert.deepEqual(result, { state: "ambiguous" });
+
+  const scan = await scanLockJournal(journalDirectory, "data");
+  assert.equal(scan.claims.length, 2);
+  assert.equal(scan.releases.size, 0);
+});
+
+test("inspectLegacyGitHubJournalOwnership does not report dead when a later raw claim is unresolved", async (t) => {
+  const githubRoot = await mkdtemp(
+    path.join(os.tmpdir(), "maswe-gh-journal-inspect-dead-queued-raw-"),
+  );
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+  const logicalKey = "owner/repo#9";
+  const journalDirectory = ownershipJournalDirectory(githubRoot, "publication", logicalKey);
+  await mkdir(journalDirectory, { recursive: true });
+  await initializeLockJournal(journalDirectory);
+  const deadClaim = canonicalClaim({
+    kind: "data",
+    ticket: 1n,
+    owner: "550e8400-e29b-41d4-a716-446655440000",
+    pid: 999_999_999,
+    process: { startedAt: "2026-08-09T10:00:00.000Z", platformIdentity: null },
+    at: "2026-08-09T10:00:00.000Z",
+    operation: "github-publication",
+  });
+  await writeFile(
+    path.join(journalPaths(journalDirectory, "data").claims, "00000000000000000001.json"),
+    deadClaim.bytes,
+    "utf8",
+  );
+  await writeFile(
+    path.join(journalPaths(journalDirectory, "data").claims, "00000000000000000002.json"),
+    "not-a-claim\n",
+    "utf8",
+  );
+
+  const result = await inspectLegacyGitHubJournalOwnership({
+    githubRoot,
+    kind: "publication",
+    logicalKey,
+  });
+  assert.notEqual(result.state, "dead");
+  assert.deepEqual(result, { state: "ambiguous" });
+});
+
+test("inspectLegacyGitHubJournalOwnership re-proves a valid-dead legacy ticket-zero owner exactly before reporting dead", async (t) => {
+  const githubRoot = await mkdtemp(
+    path.join(os.tmpdir(), "maswe-gh-journal-inspect-legacy-reproof-"),
+  );
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+  const logicalKey = "owner/repo#10";
+  const journalDirectory = ownershipJournalDirectory(githubRoot, "publication", logicalKey);
+  await mkdir(journalDirectory, { recursive: true });
+  await initializeLockJournal(journalDirectory);
+  const legacyRaw = `${JSON.stringify({
+    pid: 999_999_999,
+    owner: "legacy-owner",
+    at: "2026-08-09T10:00:00.000Z",
+  })}\n`;
+  await writeFile(path.join(journalDirectory, ".lock"), legacyRaw, "utf8");
+
+  let reproofCalls = 0;
+  const result = await inspectLegacyGitHubJournalOwnership({
+    githubRoot,
+    kind: "publication",
+    logicalKey,
+    isProcessDefinitelyDead: (pid) => {
+      reproofCalls += 1;
+      assert.equal(pid, 999_999_999);
+      return false;
+    },
+  });
+  assert.deepEqual(result, { state: "live" });
+  // Pins that the exact reproof callback was actually consulted, not skipped by an earlier
+  // branch (e.g. pidAliveConservative() itself reporting "valid-live" for this pid).
+  assert.equal(reproofCalls, 1);
+});
+
+test("inspectLegacyGitHubJournalOwnership reports malformed when scanLockJournal itself detects corruption", async (t) => {
+  const githubRoot = await mkdtemp(
+    path.join(os.tmpdir(), "maswe-gh-journal-inspect-scan-corrupt-"),
+  );
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+  const logicalKey = "owner/repo#11";
+  const journalDirectory = ownershipJournalDirectory(githubRoot, "publication", logicalKey);
+  await mkdir(journalDirectory, { recursive: true });
+  await initializeLockJournal(journalDirectory);
+  const claim = canonicalClaim({
+    kind: "data",
+    ticket: 2n,
+    owner: "550e8400-e29b-41d4-a716-446655440000",
+    pid: process.pid,
+    process: { startedAt: "2026-08-09T10:00:00.000Z", platformIdentity: null },
+    at: "2026-08-09T10:00:00.000Z",
+    operation: "github-publication",
+  });
+  await writeFile(
+    path.join(journalPaths(journalDirectory, "data").claims, "00000000000000000002.json"),
+    claim.bytes,
+    "utf8",
+  );
+
+  const result = await inspectLegacyGitHubJournalOwnership({
+    githubRoot,
+    kind: "publication",
+    logicalKey,
+  });
+  assert.deepEqual(result, { state: "malformed" });
+});
+
+test("withGitHubJournal rejects a name-shaped repository-identity logical key", async (t) => {
+  const githubRoot = await mkdtemp(
+    path.join(os.tmpdir(), "maswe-gh-journal-repo-identity-name-"),
+  );
+  t.after(async () => rm(githubRoot, { recursive: true, force: true }));
+
+  await assert.rejects(
+    withGitHubJournal(githubRoot, "repository-identity", "owner/repo", async () => undefined),
+    (error: unknown) =>
+      error instanceof GitHubJournalError && error.code === "GITHUB_JOURNAL_INVALID_OPTIONS",
+  );
+
+  await assert.rejects(
+    withGitHubJournal(githubRoot, "repository-identity", "0", async () => undefined),
+    (error: unknown) =>
+      error instanceof GitHubJournalError && error.code === "GITHUB_JOURNAL_INVALID_OPTIONS",
+  );
+});
