@@ -7,12 +7,47 @@ import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
 import {
   assertReadOnlyChecksMode,
   buildCheckConclusions,
+  checkRunIdempotencyKey,
   CheckPublisher,
   externalIdFor,
+  legacyCheckRunIdempotencyKey,
   type GitHubHttpClient,
 } from "../src/github/checks.ts";
 import type { RunRecord } from "../src/domain.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+
+/** The stable repository id every `CheckPublisher` fixture in this file is scoped to. */
+const REPOSITORY_ID = 424242;
+
+test("checkRunIdempotencyKey uses the stable repository id, not owner/repo text", () => {
+  assert.equal(
+    checkRunIdempotencyKey(REPOSITORY_ID, 1, "sha", "MASWE / deterministic quality", 1),
+    "check-run:424242/1/sha/MASWE / deterministic quality/1",
+  );
+  assert.notEqual(
+    checkRunIdempotencyKey(REPOSITORY_ID, 1, "sha", "MASWE / deterministic quality", 1),
+    checkRunIdempotencyKey(REPOSITORY_ID + 1, 1, "sha", "MASWE / deterministic quality", 1),
+    "a different repository id must never collide with another repository's key",
+  );
+});
+
+test("legacyCheckRunIdempotencyKey reproduces the pre-#34 baseline byte-for-byte", () => {
+  const key = legacyCheckRunIdempotencyKey(
+    "owner/repo",
+    1,
+    "sha",
+    "MASWE / deterministic quality",
+    1,
+  );
+  // Pinned to the exact pre-#34 baseline: TWO path segments from a separate
+  // owner/repo split, not one combined "owner/repo" segment.
+  assert.equal(key, "check-run:owner/repo/1/sha/MASWE / deterministic quality/1");
+  assert.equal(
+    externalIdFor(key),
+    "maswe:check-run:sha256:26f91d94b5264f291f2cfbafef75c48fe7f65713108a4b4251ad8eebc68e407e",
+    "must hash to the pre-existing pinned externalIdFor digest for this exact literal",
+  );
+});
 
 test("side-effect store remembers GitHub resource ids by idempotency key", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-side-"));
@@ -160,6 +195,7 @@ test("CheckPublisher PATCH bodies omit head_sha", async () => {
     http,
     sideEffects,
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -201,7 +237,7 @@ test("CheckPublisher reconciles all pages with filter=all and patches a later-pa
         assert.equal(requested.searchParams.get("filter"), "all");
         assert.equal(requested.searchParams.get("per_page"), "100");
         const name = requested.searchParams.get("check_name")!;
-        const key = `check-run:owner/repo/1/sha/${name}/1`;
+        const key = `check-run:${REPOSITORY_ID}/1/sha/${name}/1`;
         const id = name === "MASWE / specification compliance" ? 401 : 402 + calls.length;
         if (name === "MASWE / specification compliance" && !requested.searchParams.has("page")) {
           requested.searchParams.set("page", "2");
@@ -227,6 +263,7 @@ test("CheckPublisher reconciles all pages with filter=all and patches a later-pa
     http,
     sideEffects,
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -295,7 +332,7 @@ test("CheckPublisher reconciles a POST response without id, persists it, and pat
           status: 200,
           headers: {},
           body: {
-            check_runs: [{ id: idsByName.get(name), external_id: externalIdFor(`check-run:owner/repo/1/sha/${name}/1`) }],
+            check_runs: [{ id: idsByName.get(name), external_id: externalIdFor(`check-run:${REPOSITORY_ID}/1/sha/${name}/1`) }],
           },
         };
       }
@@ -314,6 +351,7 @@ test("CheckPublisher reconciles a POST response without id, persists it, and pat
     http,
     sideEffects,
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -338,7 +376,7 @@ test("CheckPublisher reconciles a POST response without id, persists it, and pat
 
   await publisher.publishForHeadSha(run, "sha");
 
-  const key = "check-run:owner/repo/1/sha/MASWE / specification compliance/1";
+  const key = `check-run:${REPOSITORY_ID}/1/sha/MASWE / specification compliance/1`;
   assert.deepEqual(await sideEffects.get(key), { resourceId: 700, kind: "check-run" });
   assert.equal(calls.filter((call) => call.method === "POST").length, 4);
   const recoveredPatch = calls.find(
@@ -391,6 +429,7 @@ test("CheckPublisher rejects unsafe or looping reconciliation links", async (t) 
         http,
         sideEffects: new GitHubSideEffectStore(root),
         readOnlyChecks: true,
+        repositoryId: REPOSITORY_ID,
         owner: "owner",
         repo: "repo",
         pullRequestNumber: 1,
@@ -494,6 +533,7 @@ test("CheckPublisher rejects duplicate, unknown, and noncanonical pagination que
         http,
         sideEffects: new GitHubSideEffectStore(root),
         readOnlyChecks: true,
+        repositoryId: REPOSITORY_ID,
         owner: "owner",
         repo: "repo",
         pullRequestNumber: 1,
@@ -556,6 +596,7 @@ test("CheckPublisher rejects duplicate rel attributes or relation tokens", async
         http,
         sideEffects: new GitHubSideEffectStore(root),
         readOnlyChecks: true,
+        repositoryId: REPOSITORY_ID,
         owner: "owner",
         repo: "repo",
         pullRequestNumber: 1,
@@ -609,6 +650,7 @@ test("CheckPublisher preserves the exact 'Link header is malformed' message afte
     http,
     sideEffects: new GitHubSideEffectStore(root),
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -659,6 +701,7 @@ test("CheckPublisher preserves the exact 'Link URL is malformed' message after p
     http,
     sideEffects: new GitHubSideEffectStore(root),
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -709,6 +752,7 @@ test("CheckPublisher preserves the exact 'Link URL is unsafe' message after pagi
     http,
     sideEffects: new GitHubSideEffectStore(root),
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -761,6 +805,7 @@ test("CheckPublisher preserves the exact 'page limit exceeded' message after pag
     http,
     sideEffects: new GitHubSideEffectStore(root),
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -815,6 +860,7 @@ test("CheckPublisher stops reconciliation at a finite page ceiling", async () =>
     http,
     sideEffects: new GitHubSideEffectStore(root),
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -860,6 +906,7 @@ test("CheckPublisher fails closed when a successful list response omits check_ru
     },
     sideEffects: new GitHubSideEffectStore(root),
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -901,7 +948,7 @@ test("CheckPublisher reconciles and cancels prior-SHA checks when local side eff
           const checkName = parsed.searchParams.get("check_name")!;
           const headSha = parsed.pathname.split("/").at(-2)!;
           if (headSha === "sha-old") {
-            const key = `check-run:owner/repo/1/sha-old/${checkName}/1`;
+            const key = `check-run:${REPOSITORY_ID}/1/sha-old/${checkName}/1`;
             return {
               status: 200,
               headers: {},
@@ -919,6 +966,7 @@ test("CheckPublisher reconciles and cancels prior-SHA checks when local side eff
     },
     sideEffects: new GitHubSideEffectStore(root),
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -976,6 +1024,7 @@ test("CheckPublisher creates checks idempotently and invalidates prior SHA succe
     http,
     sideEffects,
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -1043,6 +1092,7 @@ test("CheckPublisher surfaces rate limits without recording success", async () =
     http,
     sideEffects,
     readOnlyChecks: true,
+    repositoryId: REPOSITORY_ID,
     owner: "owner",
     repo: "repo",
     pullRequestNumber: 1,
@@ -1069,5 +1119,8 @@ test("CheckPublisher surfaces rate limits without recording success", async () =
 
   await assert.rejects(() => publisher.publishForHeadSha(run, "sha"), /rate limit/i);
   assert.ok(calls > 1);
-  assert.equal(await sideEffects.get("check-run:owner/repo/1/sha/MASWE / specification compliance/1"), undefined);
+  assert.equal(
+    await sideEffects.get(`check-run:${REPOSITORY_ID}/1/sha/MASWE / specification compliance/1`),
+    undefined,
+  );
 });

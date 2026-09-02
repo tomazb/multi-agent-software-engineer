@@ -505,6 +505,7 @@ export class GitHubAppAdapter {
                 run.github = {
                   ...run.github,
                   headSha: liveHead,
+                  repository,
                   ...(pendingHeadShas.length > 0
                     ? { pendingCancellationHeadShas: pendingHeadShas }
                     : {}),
@@ -513,12 +514,25 @@ export class GitHubAppAdapter {
                   delete run.github.pendingCancellationHeadShas;
                 }
                 await this.saveAssociationMutation(before, run, transaction);
+              } else if (run.github.repository !== repository) {
+                // §10/carry-forward from Task 8 (adapter.ts, review of 6ed112a):
+                // `reconcileCanonicalRepository` above only refreshes names it
+                // finds by iterating EXISTING index records, so a missing
+                // index record leaves `run.github.repository` stale even
+                // though the live canonical name was just proven. Sync it here
+                // -- unconditionally on the reconciled name, never on stale
+                // event/remote text -- so the association bound below, and
+                // therefore `publishChecks` routing, never carries a stale
+                // slug forward.
+                const before = structuredClone(run);
+                run.github = { ...run.github, repository };
+                await this.saveAssociationMutation(before, run, transaction);
               }
               const committedAssociation = transaction.bindStable({
                 runId: run.id,
                 installationId: run.github.installationId,
                 repositoryId,
-                repository: run.github.repository,
+                repository,
                 pullRequestNumber: run.github.pullRequestNumber,
                 baseSha: run.github.baseSha,
                 headSha: liveHead,
@@ -1688,6 +1702,7 @@ export class GitHubAppAdapter {
       http: this.http,
       sideEffects: this.sideEffects,
       readOnlyChecks: app.readOnlyChecks,
+      repositoryId: target.repositoryId,
       owner,
       repo,
       pullRequestNumber: target.pullRequestNumber,

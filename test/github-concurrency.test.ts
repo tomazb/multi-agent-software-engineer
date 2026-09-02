@@ -176,6 +176,7 @@ test("concurrent check publishers serialize creates for the same key", async (t)
       http,
       sideEffects,
       readOnlyChecks: true,
+      repositoryId: 424242,
       owner: "owner",
       repo: "repo",
       pullRequestNumber: 1,

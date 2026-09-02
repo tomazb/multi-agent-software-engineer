@@ -23,6 +23,7 @@ import {
   type StableAssociationBindInput,
 } from "../src/github/association.ts";
 import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
+import { MASWE_CHECK_NAMES } from "../src/github/types.ts";
 import { FileRunStore, type RunStore } from "../src/store.ts";
 import type { MasweConfig } from "../src/domain.ts";
 import type { GitHubInstallationTokenPurpose } from "../src/github/token.ts";
@@ -97,6 +98,8 @@ async function setup(options: {
   let completionFailuresArmed = 0;
   const additionalCanonicalRepositories = options.additionalCanonicalRepositories ?? [];
   const posts: unknown[] = [];
+  /** The exact REST URL each check-run creation POST targeted (issue #34 Task 9). */
+  const postUrls: string[] = [];
   const checkRunHeadShas = new Map<number, string>();
   const patches: Array<{ url: string; body: unknown; headSha: string | undefined }> = [];
   const tokens: Array<{
@@ -170,6 +173,7 @@ async function setup(options: {
         const headSha = (options?.body as { head_sha?: unknown } | undefined)?.head_sha;
         if (typeof headSha === "string") await beforeCheckPost?.(headSha);
         posts.push(options?.body);
+        postUrls.push(url);
         const id = nextId++;
         if (typeof headSha === "string") checkRunHeadShas.set(id, headSha);
         return { status: 201, headers: {}, body: { id } };
@@ -242,6 +246,7 @@ async function setup(options: {
     store,
     adapter,
     posts,
+    postUrls,
     patches,
     tokens,
     diagnostics,
@@ -2189,6 +2194,79 @@ test("integration: manual publication reconciles the canonical name before routi
     "manual publication mints the id-scoped metadata token for reconciliation",
   );
   assert.ok(harness.tokens.every((token) => token.repositoryId === REPO_ID));
+});
+
+test("integration: the sole production check publisher construction keys by stable repository id at attempt 1 only", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const harness = await setup({ liveHead: "sha-stable-key" });
+  const { run } = await seedStableRun(harness.store, harness.cwd, {
+    title: "stable-key-production",
+    headSha: "sha-stable-key",
+  });
+
+  await harness.adapter.publishChecksForRun(run.id);
+
+  const sideEffects = new GitHubSideEffectStore(path.join(harness.cwd, ".maswe", "github"));
+  for (const name of MASWE_CHECK_NAMES) {
+    const stableKey = `check-run:${REPO_ID}/9/sha-stable-key/${name}/1`;
+    assert.notEqual(
+      await sideEffects.get(stableKey),
+      undefined,
+      `${name} must be keyed by the stable repository id at production attempt 1`,
+    );
+    const legacyKey = `check-run:owner/repo/9/sha-stable-key/${name}/1`;
+    assert.equal(
+      await sideEffects.get(legacyKey),
+      undefined,
+      `${name} must never be keyed by mutable owner/repo text in production`,
+    );
+  }
+});
+
+test("integration: manual publication routes checks to the reconciled canonical name even when the stable index record is missing", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  const harness = await setup({ liveHead: "sha-index-missing" });
+  // Seed the run's stable association directly, WITHOUT binding a matching
+  // stable index record -- the exact carry-forward scenario from Task 8's
+  // review (adapter.ts:497): `reconcileCanonicalRepository` only refreshes
+  // names it finds by iterating EXISTING index records, so a missing index
+  // record leaves `run.github.repository` unrefreshed by that mechanism.
+  const run = await harness.store.create("index-missing-carry-forward", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-index-missing",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  run.github = {
+    installationId: 44,
+    repositoryId: REPO_ID,
+    repository: "owner/repo",
+    pullRequestNumber: 9,
+    baseSha: "base",
+    headSha: "sha-index-missing",
+    branch: "maswe/run-1",
+    suspended: false,
+  };
+  await harness.store.save(run);
+  harness.setCanonicalName("owner/renamed");
+  const index = new GitHubAssociationIndex(path.join(harness.cwd, ".maswe", "github"));
+  assert.equal(await index.findStable(REPO_ID, 9), undefined, "the index record is deliberately absent");
+
+  const published = await harness.adapter.publishChecksForRun(run.id);
+
+  assert.equal(
+    published.github?.repository,
+    "owner/renamed",
+    "the run's own association must carry the reconciled canonical name, not the stale seeded name",
+  );
+  assert.equal((await index.findStable(REPO_ID, 9))?.repository, "owner/renamed");
+  assert.ok(harness.postUrls.length >= 4);
+  for (const url of harness.postUrls) {
+    assert.match(url, /\/repos\/owner\/renamed\/check-runs$/);
+    assert.doesNotMatch(url, /\/repos\/owner\/repo\/check-runs$/);
+  }
 });
 
 test("integration: a stale pre-rename remote does not invalidate an already stable association", async () => {

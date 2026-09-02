@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
+import { parseOwnerRepo } from "./adapter-identities.ts";
 import type { GitHubHttpClient } from "./http.ts";
 import {
   GitHubPaginationError,
@@ -107,14 +108,38 @@ export function buildCheckConclusions(
   };
 }
 
-function idempotencyKey(
-  owner: string,
-  repo: string,
+/**
+ * Stable check-run idempotency key (design doc §15). Keyed by the stable
+ * numeric repository id, never mutable `owner/repo` text, so the derived
+ * external id -- and therefore check ownership -- remains identical across
+ * any future rename.
+ */
+export function checkRunIdempotencyKey(
+  repositoryId: number,
   pullRequestNumber: number,
   headSha: string,
   checkName: string,
   attempt: number,
 ): string {
+  return `check-run:${repositoryId}/${pullRequestNumber}/${headSha}/${checkName}/${attempt}`;
+}
+
+/**
+ * Reproduces the pre-#34 baseline check-run idempotency key byte-for-byte
+ * (design doc §15.1/§15.2): a mutable-name key with `owner` and `repo`
+ * interpolated as two separate path segments, exactly as the historical
+ * `idempotencyKey` helper produced. Used only to compute the legacy external
+ * id/local record selector during one-time attempt-1 aliasing -- never as an
+ * ongoing identity.
+ */
+export function legacyCheckRunIdempotencyKey(
+  repository: string,
+  pullRequestNumber: number,
+  headSha: string,
+  checkName: string,
+  attempt: number,
+): string {
+  const { owner, repo } = parseOwnerRepo(repository);
   return `check-run:${owner}/${repo}/${pullRequestNumber}/${headSha}/${checkName}/${attempt}`;
 }
 
@@ -169,6 +194,7 @@ export class CheckPublisher {
   private readonly http: GitHubHttpClient;
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly readOnlyChecks: boolean;
+  private readonly repositoryId: number;
   private readonly owner: string;
   private readonly repo: string;
   private readonly pullRequestNumber: number;
@@ -181,6 +207,8 @@ export class CheckPublisher {
     http: GitHubHttpClient;
     sideEffects: GitHubSideEffectStore;
     readOnlyChecks: boolean;
+    /** Stable repository id (design doc §15). Owner/repo remain REST routing only. */
+    repositoryId: number;
     owner: string;
     repo: string;
     pullRequestNumber: number;
@@ -192,6 +220,7 @@ export class CheckPublisher {
     this.http = options.http;
     this.sideEffects = options.sideEffects;
     this.readOnlyChecks = options.readOnlyChecks;
+    this.repositoryId = options.repositoryId;
     this.owner = options.owner;
     this.repo = options.repo;
     this.pullRequestNumber = options.pullRequestNumber;
@@ -227,9 +256,8 @@ export class CheckPublisher {
 
   private async invalidatePreviousSha(previousHeadSha: string): Promise<void> {
     for (const name of MASWE_CHECK_NAMES) {
-      const key = idempotencyKey(
-        this.owner,
-        this.repo,
+      const key = checkRunIdempotencyKey(
+        this.repositoryId,
         this.pullRequestNumber,
         previousHeadSha,
         name,
@@ -258,9 +286,8 @@ export class CheckPublisher {
     headSha: string,
     outcome: CheckOutcome,
   ): Promise<void> {
-    const key = idempotencyKey(
-      this.owner,
-      this.repo,
+    const key = checkRunIdempotencyKey(
+      this.repositoryId,
       this.pullRequestNumber,
       headSha,
       name,
