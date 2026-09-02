@@ -34,6 +34,16 @@ const DIRECTORY_NAME = "repository-identity-migrations";
 /** A checkpoint record is ~250 bytes; anything near this bound is already corrupt. */
 const MAX_CHECKPOINT_BYTES = 4096;
 const FILENAME_PATTERN = /^[0-9a-f]{64}\.json$/;
+/**
+ * The exact shape `writeDurableAtomic` (src/durable-file.ts) stages inside the
+ * target directory before an atomic rename: `.<basename>.<uuid>.tmp`, with
+ * `<basename>` restricted here to a legitimate checkpoint filename. A file
+ * killed mid-rename never reached its durable name and carries no conflict
+ * information a fail-closed scan could act on, so `list()` may skip it -- but
+ * only this precise shape, never a loose `.tmp` suffix test.
+ */
+const DURABLE_TEMP_PATTERN =
+  /^\.[0-9a-f]{64}\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 const REPOSITORY_PATTERN = /^[^/\s]+\/[^/\s]+$/;
 const RECORD_FIELDS = [
   "version",
@@ -45,8 +55,9 @@ const RECORD_FIELDS = [
   "updatedAt",
 ] as const;
 
-function invalid(cause?: unknown): Error {
-  return new Error(`Invalid ${LABEL}`, cause === undefined ? undefined : { cause });
+function invalid(cause?: unknown, detail?: string): Error {
+  const message = detail === undefined ? `Invalid ${LABEL}` : `Invalid ${LABEL}: ${detail}`;
+  return new Error(message, cause === undefined ? undefined : { cause });
 }
 
 function isCanonicalLowercaseRepository(value: unknown): value is string {
@@ -217,7 +228,14 @@ export class RepositoryIdentityMigrationStore {
     }
     const records: RepositoryIdentityMigrationRecord[] = [];
     for (const entry of [...entries].sort()) {
-      if (!FILENAME_PATTERN.test(entry)) throw invalid();
+      // A killed rename's own temp residue was never durably committed under
+      // its final name; it carries no conflict information and must not brick
+      // every later migrate() call. Anything else unrecognized still fails
+      // closed, named so an operator can act.
+      if (DURABLE_TEMP_PATTERN.test(entry)) continue;
+      if (!FILENAME_PATTERN.test(entry)) {
+        throw invalid(undefined, `unrecognized entry ${JSON.stringify(entry)}`);
+      }
       const raw = await readBoundedOrdinaryFile(
         path.join(this.directory, entry),
         LABEL,

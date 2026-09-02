@@ -234,8 +234,10 @@ export class RepositoryIdentityMigrationService {
     repositoryId: number,
     legacyRepository: string,
   ): Promise<RepositoryIdentityMigrationResult> {
-    // Before anything is written -- including journal scaffolding -- prove no other
-    // repository id already claimed this exact normalized selector.
+    // Runs inside the repository-identity journal's scaffolding (already created
+    // by `migrate()`'s `withGitHubJournal` call), but before any run, index, or
+    // checkpoint state is written: prove no other repository id already claimed
+    // this exact normalized selector.
     await this.assertNoConflictingSelector(repositoryId, legacyRepository);
 
     const existing = await this.checkpoints.read(repositoryId, legacyRepository);
@@ -732,8 +734,11 @@ export class RepositoryIdentityMigrationService {
       liveHead,
     );
     const suspended = (github.suspended ?? false) || closed;
+    // Only a genuinely closed PR justifies defaulting to "pull-request-closed":
+    // a run suspended-without-reason on an open PR must carry no reason rather
+    // than inventing one the evidence does not support.
     const suspensionReason: SuspensionReason | undefined = suspended
-      ? github.suspensionReason ?? "pull-request-closed"
+      ? (github.suspensionReason ?? (closed ? "pull-request-closed" : undefined))
       : undefined;
 
     const before = structuredClone(run);

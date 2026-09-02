@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -467,6 +467,37 @@ test("checkpoint store rejects malformed, oversize, and symlinked state", async 
   await assert.rejects(() => store.read(REPO_ID, LEGACY), /ordinary local file/i);
 });
 
+test("checkpoint list skips its own durable temp residue but still fails closed and names other unrecognized entries", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-migration-store-residue-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const root = githubRootOf(cwd);
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const store = new RepositoryIdentityMigrationStore(root);
+  await store.write(checkpointRecord());
+  const checkpointDir = path.join(root, "repository-identity-migrations");
+
+  // The exact `.<basename>.<uuid>.tmp` shape `writeDurableAtomic` stages inside
+  // the target directory before an atomic rename -- residue from a rename
+  // killed mid-flight. It was never durably committed and carries no conflict
+  // information a fail-closed scan could act on.
+  const filename = repositoryIdentityMigrationFilename(REPO_ID, LEGACY);
+  const strayTempPath = path.join(checkpointDir, `.${filename}.${randomUUID()}.tmp`);
+  await writeFile(strayTempPath, "partial write residue from a killed rename", "utf8");
+  assert.deepEqual(await store.list(), [checkpointRecord()]);
+
+  // A genuinely unrecognized entry must still fail closed, and the error must
+  // name it so an operator without a debugger can find and remove it.
+  const mysteryPath = path.join(checkpointDir, "mystery.json.bak");
+  await writeFile(mysteryPath, "not a checkpoint", "utf8");
+  await assert.rejects(
+    () => store.list(),
+    (error: unknown) =>
+      error instanceof Error &&
+      /migration checkpoint/i.test(error.message) &&
+      error.message.includes("mystery.json.bak"),
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Step 2: happy path, rerun no-op, selector conflict
 // ---------------------------------------------------------------------------
@@ -770,6 +801,53 @@ test("a closed pull request migrates and applies the pull-request-closed suspens
   assert.equal(stable?.suspensionReason, "pull-request-closed");
 });
 
+test("a stable record already suspended without a reason on an open pull request gets no fabricated closure reason", async (t) => {
+  const world = createWorld();
+  const harness = await createHarness(t, world);
+  const run = await seedLegacyRun(harness);
+
+  // Model a record that is already stable (repositoryId bound) and already
+  // suspended, but with no reason on record -- e.g. a restart that left the
+  // run mutation durable before any reason was chosen -- and whose canonical
+  // name still needs refreshing so this candidate performs work. The PR is
+  // (and stays) open: findAllLegacyByRepository excludes suspended legacy
+  // records from the candidate universe, so this can only be modelled on the
+  // stable arm, which includes suspended records regardless of state.
+  const stableRun = await harness.store.load(run.id);
+  stableRun.github = { ...stableRun.github!, repositoryId: REPO_ID, repository: LEGACY, suspended: true };
+  await harness.store.save(stableRun);
+  await harness.index.withTransaction(async (transaction) =>
+    transaction.migrateLegacy({
+      legacyRepository: LEGACY,
+      stable: {
+        runId: run.id,
+        installationId: INSTALLATION,
+        repositoryId: REPO_ID,
+        repository: LEGACY,
+        pullRequestNumber: 7,
+        baseSha: "base-sha",
+        headSha: HEAD_A,
+        branch: "maswe/topic",
+        suspended: true,
+      },
+    }));
+
+  const result = await createService(harness).migrate({
+    legacyRepository: LEGACY,
+    repositoryId: REPO_ID,
+  });
+  assert.equal(result.candidates[0]?.suspended, true);
+
+  const migrated = await harness.store.load(run.id);
+  assert.equal(migrated.github?.repository, CANONICAL);
+  assert.equal(migrated.github?.suspended, true);
+  // Must not fabricate "pull-request-closed": the PR was never observed closed.
+  assert.equal(migrated.github?.suspensionReason, undefined);
+  const stable = await harness.index.findStable(REPO_ID, 7);
+  assert.equal(stable?.suspended, true);
+  assert.equal(stable?.suspensionReason, undefined);
+});
+
 test("a second rename during restart reconciles the same id onto the newer canonical name", async (t) => {
   const world = createWorld();
   const harness = await createHarness(t, world);
@@ -1034,7 +1112,12 @@ test("the final rescan catches a stable association bound after the initial scan
 
   const result = await service.migrate({ legacyRepository: LEGACY, repositoryId: REPO_ID });
   assert.equal(bound, true);
-  assert.equal(result.passes >= 2, true);
+  // Exactly 3: the work pass, the late-bind pass that reconciles the record
+  // bound mid-migration, and the clean rescan that proves convergence. This
+  // pins the rescan tightly -- `>= 2` would still pass if it collapsed, and
+  // the rescan is the only mechanism catching an association bound after the
+  // initial scan.
+  assert.equal(result.passes, 3);
   // The record bound mid-pass was reconciled onto the current canonical name.
   assert.equal((await harness.index.findStable(REPO_ID, 9))?.repository, CANONICAL);
   assert.equal((await harness.store.load(late.id)).github?.repository, CANONICAL);

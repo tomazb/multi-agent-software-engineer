@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -21,7 +22,10 @@ import {
   RepositoryIdentityMigrationError,
   type RepositoryIdentityMigrationStep,
 } from "../src/github/repository-identity-migration.ts";
-import { RepositoryIdentityMigrationStore } from "../src/github/repository-identity-migration-store.ts";
+import {
+  RepositoryIdentityMigrationStore,
+  repositoryIdentityMigrationFilename,
+} from "../src/github/repository-identity-migration-store.ts";
 import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
 import { MASWE_CHECK_NAMES } from "../src/github/types.ts";
 import { FileRunStore, type RunStore } from "../src/store.ts";
@@ -302,6 +306,26 @@ test("a failure before the checkpoint leaves no state and restarts cleanly", asy
   assert.notEqual(await harness.index.findLegacy(LEGACY, 7), undefined);
 
   await createService(harness).migrate({ legacyRepository: LEGACY, repositoryId: REPO_ID });
+  await assertConverged(harness);
+});
+
+test("a stray durable temp file left in the checkpoint directory does not block migration", async (t) => {
+  const harness = await createHarness(t);
+  const checkpointDir = path.join(harness.root, "repository-identity-migrations");
+  await mkdir(checkpointDir, { recursive: true, mode: 0o700 });
+
+  // The exact residue a hard kill mid-rename leaves behind: writeDurableAtomic
+  // (src/durable-file.ts) stages its temp file as `.<basename>.<uuid>.tmp`
+  // inside the target directory, then never reaches the rename.
+  const filename = repositoryIdentityMigrationFilename(REPO_ID, LEGACY);
+  const strayTempPath = path.join(checkpointDir, `.${filename}.${randomUUID()}.tmp`);
+  await writeFile(strayTempPath, "partial write residue from a killed rename", "utf8");
+
+  const result = await createService(harness).migrate({
+    legacyRepository: LEGACY,
+    repositoryId: REPO_ID,
+  });
+  assert.equal(result.status, "complete");
   await assertConverged(harness);
 });
 
