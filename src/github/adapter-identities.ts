@@ -17,6 +17,16 @@ export function parseOwnerRepo(repository: string): { owner: string; repo: strin
   return { owner: match[1]!, repo: match[2]! };
 }
 
+/**
+ * NOT an authorization predicate (design doc §3.2).
+ *
+ * Under Issue #34, only `isRepositoryIdAllowed` (backed by
+ * `allowedRepositoryIds`) authorizes anything. `allowedRepositories` is
+ * retained solely for legacy selection/diagnosis and operator display, and
+ * this helper exists to read that field back -- it must never be consulted
+ * for an authorization decision. It currently has no production caller and
+ * must not acquire one for authorization purposes.
+ */
 export function isRepoAllowed(
   config: GitHubAppConfig,
   repository: string | undefined,

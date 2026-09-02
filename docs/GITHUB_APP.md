@@ -437,7 +437,10 @@ bounded pagination across every advertised page; patch a recovered check with th
   failure is never proof of revocation.
 - If a fully traversed listing proves access was revoked and an affected association is
   successfully suspended as `authorization-revoked`, dispatch returns `applied`: the allowed
-  authority-reducing mutation happened and the delivery completes normally.
+  authority-reducing mutation happened and the delivery completes normally. This `applied` case
+  does **not** increment `permanentRepositoryDropsSinceStart`: that counter tracks deliveries
+  consumed for identity/policy reasons without an authority-reducing mutation, not the successful
+  suspension itself.
 - Each permanently consumed repository-scoped delivery increments a process-local
   `permanentRepositoryDropsSinceStart` counter. It saturates at `Number.MAX_SAFE_INTEGER`, resets
   on process restart, is never persisted, is never exposed through `doctor`, and its only reader

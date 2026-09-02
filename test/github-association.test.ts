@@ -148,6 +148,7 @@ test("bindStable persists a record under the exact <repositoryId>#<pr> key with 
   const found = await index.findStable(4242, 3);
   assert.equal(found?.runId, "run-a");
   assert.equal(found?.repository, "owner/repo");
+  assert.equal(found?.suspended, false, "records bind un-suspended by default");
 });
 
 test("findAllStableByRepositoryId returns records addressed by stable id regardless of current name", async (t) => {
