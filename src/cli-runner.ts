@@ -5,6 +5,7 @@ import { parseMasweArgs } from "./cli-args.ts";
 import { loadConfig, writeStarterConfig } from "./config.ts";
 import type { AgentRuntime, MasweConfig, RunRecord } from "./domain.ts";
 import { GitHubAppAdapter } from "./github/adapter.ts";
+import { isGitHubPermanentRepositoryRejectReason } from "./github/dispatch-disposition.ts";
 import {
   createFetchGitHubHttpClient,
   type FetchGitHubHttpClientOptions,
@@ -35,8 +36,46 @@ function safeDiagnosticField(value: unknown, pattern: RegExp, maxLength = 128): 
     : undefined;
 }
 
+/**
+ * Bounded renderer for a permanently consumed repository delivery (design
+ * doc §16). Recognized by its own safe fields and rendered from those fields
+ * alone -- it deliberately never falls through to generic message/cause/detail
+ * rendering, so no arbitrary text can travel out through this shape. The
+ * diagnostic callback is the defined reader of the process-local
+ * `permanentRepositoryDropsSinceStart` counter; it is never persisted.
+ */
+function permanentRepositoryDropDiagnostic(
+  source: Record<string, unknown>,
+): string | undefined {
+  if (source.code !== "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP") return undefined;
+  if (!isGitHubPermanentRepositoryRejectReason(source.reason)) return undefined;
+  return [
+    `code=${source.code}`,
+    `reason=${source.reason}`,
+    safeDiagnosticField(source.deliveryId, /^[A-Za-z0-9._-]+$/)
+      ? `delivery=${String(source.deliveryId)}`
+      : undefined,
+    safeDiagnosticField(source.eventName, /^[A-Za-z0-9._-]+$/)
+      ? `event=${String(source.eventName)}`
+      : undefined,
+    Number.isSafeInteger(source.attempt) && Number(source.attempt) >= 0
+      ? `attempt=${String(source.attempt)}`
+      : undefined,
+    Number.isSafeInteger(source.count) && Number(source.count) > 0
+      ? `count=${String(source.count)}`
+      : undefined,
+  ].filter((value): value is string => value !== undefined).join(" ");
+}
+
 function emitGitHubDiagnostic(error: unknown): void {
   const source = isRecord(error) ? error : {};
+  const permanentDrop = permanentRepositoryDropDiagnostic(source);
+  if (permanentDrop !== undefined) {
+    console.error(
+      sanitizeDiagnostic(permanentDrop, FAILURE_AGGREGATE_MAX_CODE_POINTS).text,
+    );
+    return;
+  }
   const context = [
     safeDiagnosticField(source.code, /^[A-Z0-9_]+$/)
       ? `code=${String(source.code)}`

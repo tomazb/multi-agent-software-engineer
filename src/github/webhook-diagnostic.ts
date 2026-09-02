@@ -3,7 +3,8 @@ export type GitHubWebhookDiagnosticCode =
   | "GITHUB_WEBHOOK_DISPATCH_FAILED"
   | "GITHUB_WEBHOOK_COMPLETION_FAILED"
   | "GITHUB_WEBHOOK_HEARTBEAT_FAILED"
-  | "GITHUB_WEBHOOK_RETRY_FAILED";
+  | "GITHUB_WEBHOOK_RETRY_FAILED"
+  | "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP";
 
 /** Safe local recovery context; the arbitrary cause is never persisted. */
 export class GitHubWebhookDiagnosticError extends Error {

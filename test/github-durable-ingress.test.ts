@@ -90,6 +90,38 @@ function signedRequestMissingRepositoryId(deliveryId: string) {
   };
 }
 
+const FOREIGN_REPO_ID = 909_090_909;
+
+/** A repository that is live but not operator-allowlisted: permanent, never retryable. */
+function signedRequestForForeignRepository(deliveryId: string) {
+  const rawBody = JSON.stringify({
+    action: "synchronize",
+    installation: { id: 44 },
+    repository: { id: FOREIGN_REPO_ID, full_name: "foreign/repo" },
+    pull_request: {
+      number: 11,
+      head: { sha: "sha-foreign", ref: "feature" },
+      base: { sha: "base" },
+    },
+  });
+  return {
+    deliveryId,
+    eventName: "pull_request",
+    signatureHeader: `sha256=${createHmac("sha256", SECRET).update(rawBody).digest("hex")}`,
+    rawBody,
+  };
+}
+
+async function readInboxRecord(cwd: string, deliveryId: string): Promise<{ status?: string }> {
+  const hash = createHash("sha256").update(deliveryId).digest("hex");
+  return JSON.parse(
+    await readFile(
+      path.join(cwd, ".maswe", "github", "inbox", "state", hash.slice(0, 2), hash, "state.json"),
+      "utf8",
+    ),
+  ) as { status?: string };
+}
+
 test("durable ingress acknowledges before a blocked downstream dispatch", async (t) => {
   process.env[SECRET_ENV] = SECRET;
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-durable-ack-"));
@@ -628,4 +660,113 @@ test("inbox.enqueue rejects a legacyRepositories-bearing installation_repositori
     }),
     /Invalid GitHub durable inbox event/,
   );
+});
+
+test("the synchronous seam consumes a permanent repository rejection and counts it", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-permanent-sync-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: {
+      async request(method, url) {
+        throw new Error(`permanent rejection must not touch GitHub: ${method} ${url}`);
+      },
+    },
+    tokenProvider: async () => {
+      throw new Error("permanent rejection must not mint an installation token");
+    },
+    synchronousWebhookDispatch: true,
+    onWebhookDiagnostic: (error) => diagnostics.push(error as Record<string, unknown>),
+  });
+
+  const first = await adapter.handleWebhook(signedRequestForForeignRepository("permanent-sync-1"));
+  const second = await adapter.handleWebhook(signedRequestForForeignRepository("permanent-sync-2"));
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal((await readInboxRecord(cwd, "permanent-sync-1")).status, "completed");
+  assert.equal((await readInboxRecord(cwd, "permanent-sync-2")).status, "completed");
+  assert.equal(diagnostics.length, 2);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => [
+      diagnostic.code,
+      diagnostic.deliveryId,
+      diagnostic.eventName,
+      diagnostic.attempt,
+      diagnostic.reason,
+      diagnostic.count,
+    ]),
+    [
+      [
+        "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP",
+        "permanent-sync-1",
+        "pull_request",
+        1,
+        "repository-not-allowlisted",
+        1,
+      ],
+      [
+        "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP",
+        "permanent-sync-2",
+        "pull_request",
+        1,
+        "repository-not-allowlisted",
+        2,
+      ],
+    ],
+  );
+  assert.equal(diagnostics[0]!.cause, undefined);
+});
+
+test("the worker consumes a permanent repository rejection with the same classification", async (t) => {
+  process.env[SECRET_ENV] = SECRET;
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-permanent-worker-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const diagnostics: Array<Record<string, unknown>> = [];
+  const dropped = deferred();
+  const adapter = new GitHubAppAdapter({
+    cwd,
+    config: config(),
+    store: new FileRunStore(cwd),
+    http: {
+      async request(method, url) {
+        throw new Error(`permanent rejection must not touch GitHub: ${method} ${url}`);
+      },
+    },
+    tokenProvider: async () => {
+      throw new Error("permanent rejection must not mint an installation token");
+    },
+    autoStartWebhookWorker: true,
+    onWebhookDiagnostic: (error) => {
+      const diagnostic = error as Record<string, unknown>;
+      diagnostics.push(diagnostic);
+      if (diagnostic.code === "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP") dropped.resolve();
+    },
+  });
+  t.after(async () => adapter.stopWebhookWorker({ drainMs: 10 }));
+
+  const response = await adapter.handleWebhook(
+    signedRequestForForeignRepository("permanent-worker-1"),
+  );
+  assert.equal(response.status, 202);
+  await withWatchdog(dropped.promise, "permanent repository drop was never reported");
+
+  assert.equal((await readInboxRecord(cwd, "permanent-worker-1")).status, "completed");
+  assert.equal(
+    diagnostics.some(({ code }) => code === "GITHUB_WEBHOOK_DISPATCH_FAILED"),
+    false,
+    "a permanent rejection is not a dispatch failure",
+  );
+  const drop = diagnostics.find(
+    ({ code }) => code === "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP",
+  )!;
+  assert.equal(drop.deliveryId, "permanent-worker-1");
+  assert.equal(drop.eventName, "pull_request");
+  assert.equal(drop.attempt, 1);
+  assert.equal(drop.reason, "repository-not-allowlisted");
+  assert.equal(drop.count, 1);
 });

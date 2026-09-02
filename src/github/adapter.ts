@@ -21,6 +21,13 @@ import {
 export { remoteMatchesRepository } from "./adapter-identities.ts";
 import { CheckPublisher, type GitHubHttpClient } from "./checks.ts";
 import { GitHubDeliveryInbox } from "./delivery-inbox.ts";
+import {
+  type GitHubDispatchResult,
+  type GitHubPermanentRejectContext,
+  GitHubPermanentRepositoryDropDiagnostic,
+  nextPermanentRepositoryDropCount,
+  settleGitHubDispatchResult,
+} from "./dispatch-disposition.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
 import {
   initializeGitHubJournals,
@@ -70,6 +77,15 @@ export class GitHubAppAdapter {
   private readonly synchronousWebhookDispatch: boolean;
   private readonly beforeInboxEnqueue: (() => Promise<void>) | undefined;
   private readonly onWebhookDiagnostic: ((error: unknown) => void) | undefined;
+  /**
+   * Process-local `permanentRepositoryDropsSinceStart` (design doc §16).
+   *
+   * Saturating positive safe integer, reset by process restart, never
+   * persisted and never exposed through `doctor`: its only defined reader is
+   * the listener diagnostic callback. Observability only -- it never changes
+   * dispatch, retry, authorization, or migration behavior.
+   */
+  private permanentRepositoryDropsSinceStart = 0;
 
   constructor(options: {
     cwd: string;
@@ -129,6 +145,7 @@ export class GitHubAppAdapter {
       enabled: options.autoStartWebhookWorker ?? false,
       dispatch: (event) => this.dispatch(event, this.githubApp()),
       onDiagnostic: (error) => this.emitWebhookDiagnostic(error),
+      onPermanentRejectCompleted: (context) => this.recordPermanentRepositoryDrop(context),
       ...(options.onWebhookWorkerSchedule
         ? { onSchedule: options.onWebhookWorkerSchedule }
         : {}),
@@ -262,8 +279,22 @@ export class GitHubAppAdapter {
         return { status: 202, body: { ok: true, duplicate: true } };
       }
       try {
-        await this.dispatch(claimed.record.event, this.githubApp());
-        await this.inbox.complete(claimed.record.deliveryId, claimed.record.leaseId);
+        const result = await this.dispatch(claimed.record.event, this.githubApp());
+        // Same classification and same post-completion ordering as the
+        // background worker (design doc §16).
+        await settleGitHubDispatchResult({
+          result,
+          complete: () =>
+            this.inbox
+              .complete(claimed.record.deliveryId, claimed.record.leaseId)
+              .then(() => undefined),
+          onPermanentRejectCompleted: (reason) => this.recordPermanentRepositoryDrop({
+            deliveryId: claimed.record.deliveryId,
+            eventName: claimed.record.eventName ?? prepared.eventName,
+            attempt: claimed.record.attempt,
+            reason,
+          }),
+        });
         return { status: 200, body: { ok: true } };
       } catch (error) {
         await this.inbox.retry(claimed.record.deliveryId, claimed.record.leaseId);
@@ -283,6 +314,22 @@ export class GitHubAppAdapter {
   async startWebhookWorker(): Promise<void> {
     await this.initialize();
     this.webhookWorker.start();
+  }
+
+  /**
+   * Counts one permanently consumed repository-scoped delivery and emits its
+   * bounded diagnostic. Only ever reached after `inbox.complete()` succeeded,
+   * so a failed completion is never counted and its later successful
+   * completion counts exactly once.
+   */
+  private recordPermanentRepositoryDrop(context: GitHubPermanentRejectContext): void {
+    this.permanentRepositoryDropsSinceStart = nextPermanentRepositoryDropCount(
+      this.permanentRepositoryDropsSinceStart,
+    );
+    this.emitWebhookDiagnostic(new GitHubPermanentRepositoryDropDiagnostic({
+      ...context,
+      count: this.permanentRepositoryDropsSinceStart,
+    }));
   }
 
   private emitWebhookDiagnostic(error: unknown): void {
@@ -628,7 +675,16 @@ export class GitHubAppAdapter {
     });
   }
 
-  private async dispatch(event: GitHubInternalEvent, app: GitHubAppConfig): Promise<void> {
+  /**
+   * Typed dispatch disposition (design doc §16). A permanent identity/policy
+   * rejection is reported so the delivery is durably consumed with zero
+   * authority-increasing mutation; every transient or ambiguous failure is
+   * thrown instead and keeps the existing retry path.
+   */
+  private async dispatch(
+    event: GitHubInternalEvent,
+    app: GitHubAppConfig,
+  ): Promise<GitHubDispatchResult> {
     if (event.type === "installation.deleted") {
       if (event.installationId !== undefined) {
         const associations = await this.associations.findAllByInstallation(
@@ -636,11 +692,11 @@ export class GitHubAppAdapter {
         );
         await this.suspendAssociations(associations);
       }
-      return;
+      return { kind: "applied" };
     }
 
     if (event.type === "installation_repositories.removed") {
-      if (event.installationId === undefined) return;
+      if (event.installationId === undefined) return { kind: "applied" };
       // #34 ingress (Task 2) carries repository names either as new ID/name
       // pairs or, for historical durable records, as a migrated
       // `legacyRepositories` name list; this name-based lookup is unchanged
@@ -673,15 +729,20 @@ export class GitHubAppAdapter {
           `Authorization suspension failed for ${failures.length} repository association operation(s)`,
         );
       }
-      return;
+      // An authority-reducing suspension is an allowed mutation, so the
+      // delivery completes normally and is never a permanent drop.
+      return { kind: "applied" };
     }
 
     if (event.observeOnly) {
-      return;
+      return { kind: "applied" };
     }
 
     if (event.repository && !isRepoAllowed(app, event.repository)) {
-      return;
+      // The repository is not operator-allowlisted: retrying can never make
+      // it allowlisted, so the delivery is permanently consumed instead of
+      // becoming a poison redelivery.
+      return { kind: "permanent-reject", reason: "repository-not-allowlisted" };
     }
 
     if (
@@ -691,12 +752,13 @@ export class GitHubAppAdapter {
       event.headSha
     ) {
       await this.handlePullRequestEvent(event);
-      return;
+      return { kind: "applied" };
     }
 
     if (event.type === "push" && event.repository && event.branch && event.headSha) {
       await this.handlePushEvent(event);
     }
+    return { kind: "applied" };
   }
 
   private async suspendAssociations(

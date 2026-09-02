@@ -9,6 +9,7 @@ import test from "node:test";
 import { runCli } from "../src/cli-runner.ts";
 import { mergeConfigForTest } from "../src/config.ts";
 import type { GitHubAppAdapter } from "../src/github/adapter.ts";
+import { GitHubPermanentRepositoryDropDiagnostic } from "../src/github/dispatch-disposition.ts";
 import { WebhookIngressDeadlineError } from "../src/github/webhook-server.ts";
 import { CANONICAL_NODE_VERSION } from "../src/node-version.ts";
 import { FileRunStore } from "../src/store.ts";
@@ -397,6 +398,56 @@ test("github-webhook wires a sanitized production diagnostic before listener rea
   assert.match(diagnostics[0]!, /handoffStarted=true/);
   assert.match(diagnostics[0]!, /Authorization: Bearer \[REDACTED\]/);
   assert.doesNotMatch(diagnostics[0]!, new RegExp(credential));
+});
+
+test("github-webhook renders only sanitized permanent repository drop fields", async (t) => {
+  const { cwd } = await setupProject();
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const restoreEnvironment = installGitHubEnvironment();
+  t.after(restoreEnvironment);
+  const originalError = console.error;
+  const originalLog = console.log;
+  const diagnostics: string[] = [];
+  console.error = (...values: unknown[]) => diagnostics.push(values.map(String).join(" "));
+  console.log = () => undefined;
+  t.after(() => {
+    console.error = originalError;
+    console.log = originalLog;
+  });
+  const operatorSecret = "operator-private-note-42";
+
+  await runCli({
+    argv: ["github-webhook", "--cwd", cwd],
+    observedNodeVersion: CANONICAL_NODE_VERSION,
+    webhookListener: async (options) => {
+      assert.ok(options.onDiagnostic);
+      options.onDiagnostic(Object.assign(
+        new GitHubPermanentRepositoryDropDiagnostic({
+          deliveryId: "drop-delivery-1",
+          eventName: "pull_request",
+          attempt: 2,
+          reason: "repository-access-revoked",
+          count: 7,
+        }),
+        {
+          // Hostile extras: a renderer that fell through to generic rendering
+          // would leak these; the permanent-drop shape must print six fields only.
+          detail: operatorSecret,
+          cause: new Error(operatorSecret),
+        },
+      ));
+      await options.adapter.stopWebhookWorker();
+      return { url: "http://127.0.0.1:0/github/webhook" };
+    },
+  });
+
+  assert.equal(diagnostics.length, 1);
+  assert.equal(
+    diagnostics[0],
+    "code=GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP reason=repository-access-revoked"
+      + " delivery=drop-delivery-1 event=pull_request attempt=2 count=7",
+  );
+  assert.doesNotMatch(diagnostics[0]!, new RegExp(operatorSecret));
 });
 
 test("github-webhook handles SIGTERM and SIGINT with ordered bounded shutdown", async (t) => {
