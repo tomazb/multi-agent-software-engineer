@@ -475,15 +475,21 @@ export class GitHubAssociationIndex {
       );
   }
 
-  /** Active, id-less legacy associations for a repository name: the explicit migration candidate universe. */
+  /**
+   * All unresolved (id-less) legacy associations for an exact repository name,
+   * regardless of suspension state: the explicit migration candidate universe.
+   *
+   * Suspension is deliberately NOT a filter here, mirroring the stable arm.
+   * A suspension is reversible -- reopening a closed pull request un-suspends
+   * the association -- so excluding suspended records would strand them under
+   * the mutable name forever, with no supported repair once the stable-identity
+   * dispatch gate starts rejecting the reopened pull request.
+   */
   async findAllLegacyByRepository(repository: string): Promise<AssociationRecord[]> {
     const records = await this.readAll();
     return Object.values(records)
       .filter(
-        (record) =>
-          record.repositoryId === undefined &&
-          record.repository === repository &&
-          !record.suspended,
+        (record) => record.repositoryId === undefined && record.repository === repository,
       )
       .map((record) => ({ ...record }))
       .sort(

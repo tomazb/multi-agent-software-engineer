@@ -649,7 +649,7 @@ test("mixed association index rejects inconsistent stable/legacy claims for the 
   );
 });
 
-test("findAllLegacyByRepository enumerates only active, id-less records for exact-name migration candidates", async (t) => {
+test("findAllLegacyByRepository enumerates every id-less record for the exact name, suspended included", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-legacy-enum-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
   const githubRoot = path.join(cwd, ".maswe", "github");
@@ -696,10 +696,15 @@ test("findAllLegacyByRepository enumerates only active, id-less records for exac
   );
 
   const candidates = await index.findAllLegacyByRepository("owner/repo");
+  // Only two exclusions survive: a different name, and a record that already
+  // carries a stable id. Suspension is NOT one of them -- a suspended legacy
+  // record is un-suspendable (reopening its pull request does exactly that), so
+  // excluding it would strand it under the mutable name forever.
   assert.deepEqual(
     candidates.map((record) => record.runId),
-    ["run-legacy-active"],
+    ["run-legacy-active", "run-legacy-suspended"],
   );
+  assert.equal(candidates[1]?.suspended, true);
 });
 
 test("suspendStable and suspendLegacy operate only on their own key namespace", async (t) => {

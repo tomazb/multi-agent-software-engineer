@@ -244,7 +244,11 @@ async function createHarness(
   };
 }
 
-/** Seeds a PR_READY run plus its unresolved legacy `<repository>#<pr>` index record. */
+/**
+ * Seeds a PR_READY run plus its unresolved legacy `<repository>#<pr>` index
+ * record. `withIndexRecord: false` seeds the run only, modelling a publication
+ * still in flight whose index record has not been committed yet.
+ */
 async function seedLegacyRun(
   harness: Harness,
   options: {
@@ -253,6 +257,7 @@ async function seedLegacyRun(
     headSha?: string;
     repository?: string;
     title?: string;
+    withIndexRecord?: boolean;
   } = {},
 ): Promise<RunRecord> {
   const pullRequestNumber = options.pullRequestNumber ?? 7;
@@ -299,15 +304,17 @@ async function seedLegacyRun(
     verification: { headSha, passed: true, at: "2026-08-18T10:01:00.000Z" },
   };
   await harness.store.save(run);
-  await seedLegacyAssociations(githubRootOf(harness.cwd), [{
-    runId: run.id,
-    installationId,
-    repository,
-    pullRequestNumber,
-    baseSha: "base-sha",
-    headSha,
-    branch: "maswe/topic",
-  }]);
+  if (options.withIndexRecord !== false) {
+    await seedLegacyAssociations(githubRootOf(harness.cwd), [{
+      runId: run.id,
+      installationId,
+      repository,
+      pullRequestNumber,
+      baseSha: "base-sha",
+      headSha,
+      branch: "maswe/topic",
+    }]);
+  }
   return harness.store.load(run.id);
 }
 
@@ -801,6 +808,90 @@ test("a closed pull request migrates and applies the pull-request-closed suspens
   assert.equal(stable?.suspensionReason, "pull-request-closed");
 });
 
+test("a legacy association suspended before the cutover is still a migration candidate", async (t) => {
+  const world = createWorld();
+  const harness = await createHarness(t, world);
+  const run = await seedLegacyRun(harness);
+
+  // Pre-#34 closure suspended both halves with `pull-request-closed`. Reopening
+  // the pull request is exactly what un-suspends such a record, so it is never
+  // inert and must not be stranded under the mutable legacy name. The PR is
+  // open again here, so nothing in this pass can re-derive the suspension.
+  const suspendedRun = await harness.store.load(run.id);
+  suspendedRun.github = {
+    ...suspendedRun.github!,
+    suspended: true,
+    suspensionReason: "pull-request-closed",
+  };
+  await harness.store.save(suspendedRun);
+  await seedLegacyAssociations(githubRootOf(harness.cwd), [{
+    runId: run.id,
+    installationId: INSTALLATION,
+    repository: LEGACY,
+    pullRequestNumber: 7,
+    baseSha: "base-sha",
+    headSha: HEAD_A,
+    branch: "maswe/topic",
+    suspended: true,
+    suspensionReason: "pull-request-closed",
+  }]);
+
+  const result = await createService(harness).migrate({
+    legacyRepository: LEGACY,
+    repositoryId: REPO_ID,
+  });
+
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0]?.runId, run.id);
+  assert.equal(result.candidates[0]?.migratedFromLegacy, true);
+  assert.equal(result.candidates[0]?.suspended, true);
+  assert.equal(result.candidates[0]?.revalidationRouted, false);
+
+  // The legacy name no longer keys anything: the stuck state is gone.
+  assert.equal(await harness.index.findLegacy(LEGACY, 7), undefined);
+  const stable = await harness.index.findStable(REPO_ID, 7);
+  assert.equal(stable?.runId, run.id);
+  assert.equal(stable?.repository, CANONICAL);
+  // §12: suspension state and reason survive migration unchanged.
+  assert.equal(stable?.suspended, true);
+  assert.equal(stable?.suspensionReason, "pull-request-closed");
+  const migrated = await harness.store.load(run.id);
+  assert.equal(migrated.github?.repositoryId, REPO_ID);
+  assert.equal(migrated.github?.repository, CANONICAL);
+  assert.equal(migrated.github?.suspended, true);
+  assert.equal(migrated.github?.suspensionReason, "pull-request-closed");
+});
+
+test("a suspended legacy index record whose run is still active stops migration", async (t) => {
+  const world = createWorld();
+  const harness = await createHarness(t, world);
+  const run = await seedLegacyRun(harness);
+  // Only the index half carries the closure. §12 requires run/index agreement on
+  // suspension state for an unresolved legacy candidate, so migration stops
+  // rather than picking one persisted copy as probably correct.
+  await seedLegacyAssociations(githubRootOf(harness.cwd), [{
+    runId: run.id,
+    installationId: INSTALLATION,
+    repository: LEGACY,
+    pullRequestNumber: 7,
+    baseSha: "base-sha",
+    headSha: HEAD_A,
+    branch: "maswe/topic",
+    suspended: true,
+    suspensionReason: "pull-request-closed",
+  }]);
+
+  await assert.rejects(
+    () => createService(harness).migrate({ legacyRepository: LEGACY, repositoryId: REPO_ID }),
+    (error: unknown) =>
+      error instanceof RepositoryIdentityMigrationError &&
+      error.code === "run-index-conflict" &&
+      /suspension state/.test(error.message),
+  );
+  assert.equal((await harness.store.load(run.id)).github?.repositoryId, undefined);
+  assert.equal((await harness.index.findLegacy(LEGACY, 7))?.suspended, true);
+});
+
 test("a stable record already suspended without a reason on an open pull request gets no fabricated closure reason", async (t) => {
   const world = createWorld();
   const harness = await createHarness(t, world);
@@ -810,9 +901,9 @@ test("a stable record already suspended without a reason on an open pull request
   // suspended, but with no reason on record -- e.g. a restart that left the
   // run mutation durable before any reason was chosen -- and whose canonical
   // name still needs refreshing so this candidate performs work. The PR is
-  // (and stays) open: findAllLegacyByRepository excludes suspended legacy
-  // records from the candidate universe, so this can only be modelled on the
-  // stable arm, which includes suspended records regardless of state.
+  // (and stays) open, so no closure can supply a reason. Modelled on the stable
+  // arm because "already stable, already suspended, no reason" is a stable-key
+  // shape; the legacy arm's own suspended candidates are covered separately.
   const stableRun = await harness.store.load(run.id);
   stableRun.github = { ...stableRun.github!, repositoryId: REPO_ID, repository: LEGACY, suspended: true };
   await harness.store.save(stableRun);
@@ -1072,10 +1163,15 @@ test("the final rescan catches a stable association bound after the initial scan
 
   // The repository-identity fence covers publication ENTRY only, so a publication
   // that entered before this migration can still bind a stable association while the
-  // migration owns the fence. Only the §13.2 rescan catches it.
-  const late = await seedLegacyRun(harness, { pullRequestNumber: 9, title: "late" });
-  await harness.index.withTransaction(async (transaction) =>
-    transaction.suspendLegacy(LEGACY, 9, "authorization-revoked"));
+  // migration owns the fence. Only the §13.2 rescan catches it. The in-flight
+  // publication has committed no index record yet, which is what makes it
+  // invisible to the initial scan -- suspension never hides a record from the
+  // candidate universe.
+  const late = await seedLegacyRun(harness, {
+    pullRequestNumber: 9,
+    title: "late",
+    withIndexRecord: false,
+  });
 
   let bound = false;
   const service = createService(harness, {
@@ -1092,20 +1188,17 @@ test("the final rescan catches a stable association bound after the initial scan
       };
       await harness.store.save(lateRun);
       await harness.index.withTransaction(async (transaction) =>
-        transaction.migrateLegacy({
-          legacyRepository: LEGACY,
-          stable: {
-            runId: late.id,
-            installationId: INSTALLATION,
-            repositoryId: REPO_ID,
-            repository: LEGACY,
-            pullRequestNumber: 9,
-            baseSha: "base-sha",
-            headSha: HEAD_A,
-            branch: "maswe/topic",
-            suspended: true,
-            suspensionReason: "authorization-revoked",
-          },
+        transaction.bindStable({
+          runId: late.id,
+          installationId: INSTALLATION,
+          repositoryId: REPO_ID,
+          repository: LEGACY,
+          pullRequestNumber: 9,
+          baseSha: "base-sha",
+          headSha: HEAD_A,
+          branch: "maswe/topic",
+          suspended: true,
+          suspensionReason: "authorization-revoked",
         }));
     },
   });
@@ -1131,9 +1224,13 @@ test("the final rescan fails closed on a concrete conflict bound after the initi
   const world = createWorld({ pullRequests: { 7: {}, 9: {} } });
   const harness = await createHarness(t, world);
   await seedLegacyRun(harness, { pullRequestNumber: 7 });
-  const late = await seedLegacyRun(harness, { pullRequestNumber: 9, title: "late" });
-  await harness.index.withTransaction(async (transaction) =>
-    transaction.suspendLegacy(LEGACY, 9, "authorization-revoked"));
+  // As above, the late publication is invisible to the initial scan because it
+  // has committed no index record yet, not because anything is suspended.
+  const late = await seedLegacyRun(harness, {
+    pullRequestNumber: 9,
+    title: "late",
+    withIndexRecord: false,
+  });
 
   let bound = false;
   const service = createService(harness, {
@@ -1142,20 +1239,17 @@ test("the final rescan fails closed on a concrete conflict bound after the initi
       bound = true;
       // A stable index record appears whose run never agreed with it.
       await harness.index.withTransaction(async (transaction) =>
-        transaction.migrateLegacy({
-          legacyRepository: LEGACY,
-          stable: {
-            runId: late.id,
-            installationId: INSTALLATION,
-            repositoryId: REPO_ID,
-            repository: LEGACY,
-            pullRequestNumber: 9,
-            baseSha: "other-base",
-            headSha: HEAD_A,
-            branch: "maswe/topic",
-            suspended: true,
-            suspensionReason: "authorization-revoked",
-          },
+        transaction.bindStable({
+          runId: late.id,
+          installationId: INSTALLATION,
+          repositoryId: REPO_ID,
+          repository: LEGACY,
+          pullRequestNumber: 9,
+          baseSha: "other-base",
+          headSha: HEAD_A,
+          branch: "maswe/topic",
+          suspended: true,
+          suspensionReason: "authorization-revoked",
         }));
     },
   });

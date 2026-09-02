@@ -383,6 +383,23 @@ every pre-#34 check carries a legacy, name-derived external ID that the stable k
 operator who migrates only renamed repositories silently duplicates every check run on the first
 post-cutover publication of every unmigrated repository.
 
+**The two unmigrated cases fail differently, and not the way intuition suggests.** The dispatch
+gate and the run identity guards look for an unresolved legacy record under the *reconciled current*
+repository name, never under the name the record was keyed with:
+
+- **Unmigrated and never renamed** — the current name still equals the legacy key, so the gate finds
+  the unresolved record and fails closed: the delivery is permanently rejected with
+  `legacy-repository-identity-missing`, consumed rather than retried, and counted in
+  `permanentRepositoryDropsSinceStart`. Loud, safe, and visible.
+- **Unmigrated *and* renamed** — the current name no longer matches the legacy key, so the gate
+  cannot see the unresolved record at all. Nothing fails: publication proceeds under the stable ID
+  and duplicates every check run, because the pre-#34 checks carry name-derived external IDs the
+  stable key cannot find. Silent.
+
+So the renamed repository is the dangerous one, not the safe one. Neither case is a substitute for
+migration; the only signal that the renamed case went wrong is duplicate check runs on the pull
+request.
+
 Run the cutover in exactly this order:
 
 1. Stop every pre-#34 `maswe github-webhook` listener and every manual GitHub publisher. Process
@@ -412,9 +429,26 @@ Run the cutover in exactly this order:
    redeliver every delivery GitHub reports as failed during the maintenance window. MASWE does not
    claim such transport-failed deliveries were durably received.
 
-Suspended pre-#34 legacy associations are deliberately **not** migrated and stay name-keyed
-permanently. They are inert: nothing un-suspends them, they never publish, and they carry no
-authority. Do not expect them in migration output.
+Suspended pre-#34 legacy associations **are** migrated, exactly like active ones. A suspension is
+reversible — reopening a closed pull request un-suspends an association suspended
+`pull-request-closed` — so a suspended record is not inert and must not be stranded under the
+mutable name. Migration carries suspension state and suspension reason through unchanged: a record
+that arrives suspended leaves suspended, under its stable `<repositoryId>#<pr>` key, and appears in
+migration output as a candidate reported `suspended`. Migration never resumes a suspended
+association; only the normal pull-request lifecycle does that, and after migration it can, because
+the reopened pull request now resolves to a stable record instead of being permanently rejected.
+
+Run and index must agree on suspension state for an unresolved legacy candidate. A record suspended
+on one half only stops the migration with `run-index-conflict`; MASWE never picks one persisted
+copy as probably correct. Reconcile the split by hand and rerun.
+
+`no-migration-candidates` means the selector matched **nothing**: no unresolved legacy record is
+keyed under `--from`, and no stable record carries `--repository-id`. It is benign when the
+repository genuinely holds no pre-#34 MASWE GitHub state. It is not reported after a successful
+migration — the migrated records are stable and still carry the ID, so a rerun converges instead of
+reporting an empty universe. If you expected candidates, suspect the selector rather than the state:
+`--from` must be the exact pre-rename `owner/repo` the records were keyed with (it is lowercased
+before use), and `--repository-id` must be the ID those records belong to.
 
 Once migrated state and the new fields are written, downgrade to a pre-#34 binary is unsupported.
 Old binaries are expected to fail closed on exact validation rather than silently ignoring stable
