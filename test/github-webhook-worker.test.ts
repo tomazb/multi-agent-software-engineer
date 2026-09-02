@@ -483,6 +483,152 @@ test("a permanent drop is counted only once, after a completion finally succeeds
   }], "a recovered completion counts the permanent drop exactly once");
 });
 
+test("a completion that returns false does not count a permanent drop", async (t) => {
+  const counted: GitHubPermanentRejectContext[] = [];
+  const retries: Array<[string, string]> = [];
+  let resolveScheduled!: (delayMs: number) => void;
+  const scheduled = new Promise<number>((resolve) => {
+    resolveScheduled = resolve;
+  });
+  let claimCalls = 0;
+  const inbox = {
+    async claimNextPage() {
+      claimCalls += 1;
+      if (claimCalls > 1) return { scanned: 0 };
+      return claimedDelivery("lease-lost-before-completion", 1, "lease-lost");
+    },
+    async heartbeat() {
+      return true;
+    },
+    async complete() {
+      // The lease was lost (e.g. a failed heartbeat) before this delivery
+      // was durably consumed: `complete()` resolves `false` without throwing.
+      return false;
+    },
+    async retry(deliveryId: string, leaseId: string) {
+      retries.push([deliveryId, leaseId]);
+      return true;
+    },
+    async pendingCount() {
+      return 0;
+    },
+  } as unknown as GitHubDeliveryInbox;
+  const worker = new GitHubWebhookWorker({
+    inbox,
+    dispatch: async () => ({
+      kind: "permanent-reject" as const,
+      reason: "repository-not-allowlisted" as const,
+    }),
+    onPermanentRejectCompleted: (context) => counted.push(context),
+    onSchedule: resolveScheduled,
+  });
+  t.after(async () => worker.stop({ drainMs: 0 }));
+
+  worker.start();
+  await withWatchdog(
+    scheduled,
+    1_000,
+    "worker never idled after the lost-lease completion",
+  );
+
+  assert.deepEqual(
+    counted,
+    [],
+    "a completion that never consumed the delivery must not count a permanent drop",
+  );
+  assert.deepEqual(
+    retries,
+    [],
+    "a false completion must not be routed into the retry path",
+  );
+});
+
+test(
+  "a permanent drop that lost its lease before completing counts exactly once after a later success",
+  async (t) => {
+    const counted: GitHubPermanentRejectContext[] = [];
+    const completeResults: boolean[] = [];
+    const firstAttemptSettled = deferred();
+    const releaseSecondClaim = deferred();
+    const countedOnce = deferred();
+    let claimCalls = 0;
+    const inbox = {
+      async claimNextPage() {
+        claimCalls += 1;
+        if (claimCalls === 1) {
+          return claimedDelivery("permanent-lease-lost", 1, "lease-1");
+        }
+        if (claimCalls === 2) {
+          await releaseSecondClaim.promise;
+          return claimedDelivery("permanent-lease-lost", 2, "lease-2");
+        }
+        return { scanned: 0 };
+      },
+      async heartbeat() {
+        return true;
+      },
+      async complete() {
+        const succeeded = completeResults.length > 0;
+        completeResults.push(succeeded);
+        if (!succeeded) firstAttemptSettled.resolve();
+        return succeeded;
+      },
+      async retry() {
+        throw new Error(
+          "a completion that never consumed the delivery must not be retried",
+        );
+      },
+      async pendingCount() {
+        return 0;
+      },
+    } as unknown as GitHubDeliveryInbox;
+    const worker = new GitHubWebhookWorker({
+      inbox,
+      dispatch: async () => ({
+        kind: "permanent-reject" as const,
+        reason: "repository-not-allowlisted" as const,
+      }),
+      onPermanentRejectCompleted: (context) => {
+        counted.push(context);
+        countedOnce.resolve();
+      },
+    });
+    t.after(async () => worker.stop({ drainMs: 0 }));
+
+    worker.start();
+    await withWatchdog(
+      firstAttemptSettled.promise,
+      1_000,
+      "the first (lease-lost) completion never resolved",
+    );
+
+    assert.deepEqual(
+      counted,
+      [],
+      "a completion that never consumed the delivery must not count a drop yet",
+    );
+
+    releaseSecondClaim.resolve();
+    await withWatchdog(
+      countedOnce.promise,
+      1_000,
+      "a permanent drop was never counted after a later successful completion",
+    );
+
+    assert.equal(
+      counted.length,
+      1,
+      "a delivery that lost its lease must count exactly once",
+    );
+    assert.deepEqual(counted, [{
+      deliveryId: "permanent-lease-lost",
+      eventName: "pull_request",
+      attempt: 2,
+      reason: "repository-not-allowlisted",
+    }]);
+  },
+);
+
 test("the permanent drop counter is a saturating positive safe integer", () => {
   assert.equal(nextPermanentRepositoryDropCount(0), 1);
   assert.equal(nextPermanentRepositoryDropCount(41), 42);

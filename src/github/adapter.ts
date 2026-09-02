@@ -285,9 +285,7 @@ export class GitHubAppAdapter {
         await settleGitHubDispatchResult({
           result,
           complete: () =>
-            this.inbox
-              .complete(claimed.record.deliveryId, claimed.record.leaseId)
-              .then(() => undefined),
+            this.inbox.complete(claimed.record.deliveryId, claimed.record.leaseId),
           onPermanentRejectCompleted: (reason) => this.recordPermanentRepositoryDrop({
             deliveryId: claimed.record.deliveryId,
             eventName: claimed.record.eventName ?? prepared.eventName,

@@ -8,6 +8,10 @@ import { mergeConfigForTest } from "../src/config.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
 import { GitHubDeliveryInbox } from "../src/github/delivery-inbox.ts";
+import {
+  type GitHubPermanentRejectContext,
+  settleGitHubDispatchResult,
+} from "../src/github/dispatch-disposition.ts";
 import { FileRunStore } from "../src/store.ts";
 
 const SECRET_ENV = "MASWE_TEST_DURABLE_INGRESS_SECRET";
@@ -721,6 +725,122 @@ test("the synchronous seam consumes a permanent repository rejection and counts 
   );
   assert.equal(diagnostics[0]!.cause, undefined);
 });
+
+async function readInboxRecordAtRoot(
+  githubRoot: string,
+  deliveryId: string,
+): Promise<{ status?: string }> {
+  const hash = createHash("sha256").update(deliveryId).digest("hex");
+  return JSON.parse(
+    await readFile(
+      path.join(githubRoot, "inbox", "state", hash.slice(0, 2), hash, "state.json"),
+      "utf8",
+    ),
+  ) as { status?: string };
+}
+
+test(
+  "the synchronous seam does not count a permanent drop whose completion lost its lease, "
+    + "and counts it exactly once after a later success",
+  async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-permanent-sync-lease-lost-"));
+    t.after(async () => rm(root, { recursive: true, force: true }));
+    // A real durable inbox -- the same `inbox.complete()` the synchronous
+    // seam (adapter.ts) and the worker both call through
+    // `settleGitHubDispatchResult`. A short lease lets the test reproduce
+    // the exact race Finding 1 fixes: the lease is lost (e.g. a failed
+    // heartbeat) and the delivery is reclaimed before the first dispatch's
+    // completion lands.
+    const inbox = new GitHubDeliveryInbox(root, { leaseMs: 10 });
+    await inbox.enqueue({
+      deliveryId: "permanent-sync-lease-lost",
+      eventName: "pull_request",
+      receivedAt: "2026-08-11T00:00:00.000Z",
+      rawBodyDigest: `sha256:${"a".repeat(64)}`,
+      event: {
+        eventId: "permanent-sync-lease-lost",
+        type: "pull_request.synchronize",
+        repository: "foreign/repo",
+        repositoryId: FOREIGN_REPO_ID,
+        installationId: 44,
+        pullRequestNumber: 11,
+        headSha: "sha-foreign",
+        baseSha: "base",
+        branch: "feature",
+        rawAction: "synchronize",
+        receivedAt: "2026-08-11T00:00:00.000Z",
+      },
+    });
+
+    const firstClaim = await inbox.claimNext();
+    assert.ok(firstClaim, "the first claim must succeed");
+    const staleLeaseId = firstClaim!.record.leaseId;
+    const staleAttempt = firstClaim!.record.attempt;
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const secondClaim = await inbox.claimNext();
+    assert.ok(secondClaim, "the delivery must be reclaimable once its lease expires");
+    assert.notEqual(
+      secondClaim!.record.leaseId,
+      staleLeaseId,
+      "the reclaim must mint a fresh lease",
+    );
+
+    // The synchronous seam's own permanent-reject completion, using its
+    // now-stale lease -- the exact composition adapter.ts uses (same
+    // helper, same `inbox.complete()` seam).
+    const staleCounted: GitHubPermanentRejectContext[] = [];
+    await settleGitHubDispatchResult({
+      result: { kind: "permanent-reject", reason: "repository-not-allowlisted" },
+      complete: () => inbox.complete("permanent-sync-lease-lost", staleLeaseId),
+      onPermanentRejectCompleted: (reason) => staleCounted.push({
+        deliveryId: "permanent-sync-lease-lost",
+        eventName: "pull_request",
+        attempt: staleAttempt,
+        reason,
+      }),
+    });
+    assert.deepEqual(
+      staleCounted,
+      [],
+      "a completion that lost its lease must not count a permanent drop",
+    );
+    assert.equal(
+      (await readInboxRecordAtRoot(root, "permanent-sync-lease-lost")).status,
+      "processing",
+      "a lost-lease completion must not mark the delivery completed",
+    );
+
+    // The later successful completion of the same delivery, using the
+    // reclaimed lease, must count exactly once.
+    const laterCounted: GitHubPermanentRejectContext[] = [];
+    await settleGitHubDispatchResult({
+      result: { kind: "permanent-reject", reason: "repository-not-allowlisted" },
+      complete: () => inbox.complete("permanent-sync-lease-lost", secondClaim!.record.leaseId),
+      onPermanentRejectCompleted: (reason) => laterCounted.push({
+        deliveryId: "permanent-sync-lease-lost",
+        eventName: "pull_request",
+        attempt: secondClaim!.record.attempt,
+        reason,
+      }),
+    });
+    assert.equal(
+      laterCounted.length,
+      1,
+      "a later successful completion must count the drop exactly once",
+    );
+    assert.deepEqual(laterCounted, [{
+      deliveryId: "permanent-sync-lease-lost",
+      eventName: "pull_request",
+      attempt: secondClaim!.record.attempt,
+      reason: "repository-not-allowlisted",
+    }]);
+    assert.equal(
+      (await readInboxRecordAtRoot(root, "permanent-sync-lease-lost")).status,
+      "completed",
+    );
+  },
+);
 
 test("the worker consumes a permanent repository rejection with the same classification", async (t) => {
   process.env[SECRET_ENV] = SECRET;

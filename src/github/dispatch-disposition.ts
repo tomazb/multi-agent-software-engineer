@@ -21,6 +21,17 @@
  * order post-completion observability identically.
  */
 
+import type { GitHubWebhookDiagnosticCode } from "./webhook-diagnostic.ts";
+
+/**
+ * Single source of truth for the permanent-drop diagnostic's `code` field.
+ * Typed against `GitHubWebhookDiagnosticCode` so renaming or removing the
+ * union member fails this declaration at compile time instead of silently
+ * breaking the renderer match in `cli-runner.ts`.
+ */
+export const GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP_CODE: GitHubWebhookDiagnosticCode =
+  "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP";
+
 /**
  * Reason vocabulary for a permanently consumed repository-scoped delivery.
  *
@@ -81,7 +92,7 @@ export function nextPermanentRepositoryDropCount(current: number): number {
  * so nothing arbitrary can travel with it to a renderer.
  */
 export class GitHubPermanentRepositoryDropDiagnostic extends Error {
-  readonly code = "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP";
+  readonly code: GitHubWebhookDiagnosticCode = GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP_CODE;
   readonly deliveryId: string;
   readonly eventName: string;
   readonly attempt: number;
@@ -103,18 +114,24 @@ export class GitHubPermanentRepositoryDropDiagnostic extends Error {
  * Durable settlement shared by the worker and the synchronous dispatch seam.
  *
  * A permanent rejection is completed, never retried, and the post-completion
- * observability callback runs ONLY after `complete()` resolves. A completion
- * failure propagates to the caller's existing completion-recovery path with
- * the callback un-invoked, so a later successful completion counts the drop
- * exactly once. The callback itself can never alter durable disposition.
+ * observability callback runs ONLY once `complete()` resolves `true`. A
+ * completion that throws (e.g. a durable I/O failure) propagates to the
+ * caller's existing completion-recovery path with the callback un-invoked. A
+ * completion that resolves `false` -- the durable lease was lost (a failed
+ * heartbeat, an expired lease reclaimed by another claimer) before this
+ * dispatch could consume the delivery -- also leaves the callback
+ * un-invoked, without being routed into retry: the delivery is simply left
+ * for its new owner. Either way, a later successful completion of the same
+ * delivery counts the drop exactly once. The callback itself can never alter
+ * durable disposition.
  */
 export async function settleGitHubDispatchResult(options: {
   result: GitHubDispatchResult;
-  complete: () => Promise<void>;
+  complete: () => Promise<boolean>;
   onPermanentRejectCompleted?: (reason: GitHubPermanentRepositoryRejectReason) => void;
 }): Promise<void> {
-  await options.complete();
-  if (options.result.kind !== "permanent-reject") return;
+  const completed = await options.complete();
+  if (options.result.kind !== "permanent-reject" || !completed) return;
   const { reason } = options.result;
   try {
     options.onPermanentRejectCompleted?.(reason);

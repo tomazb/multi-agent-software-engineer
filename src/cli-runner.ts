@@ -5,7 +5,10 @@ import { parseMasweArgs } from "./cli-args.ts";
 import { loadConfig, writeStarterConfig } from "./config.ts";
 import type { AgentRuntime, MasweConfig, RunRecord } from "./domain.ts";
 import { GitHubAppAdapter } from "./github/adapter.ts";
-import { isGitHubPermanentRepositoryRejectReason } from "./github/dispatch-disposition.ts";
+import {
+  GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP_CODE,
+  isGitHubPermanentRepositoryRejectReason,
+} from "./github/dispatch-disposition.ts";
 import {
   createFetchGitHubHttpClient,
   type FetchGitHubHttpClientOptions,
@@ -47,7 +50,7 @@ function safeDiagnosticField(value: unknown, pattern: RegExp, maxLength = 128): 
 function permanentRepositoryDropDiagnostic(
   source: Record<string, unknown>,
 ): string | undefined {
-  if (source.code !== "GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP") return undefined;
+  if (source.code !== GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP_CODE) return undefined;
   if (!isGitHubPermanentRepositoryRejectReason(source.reason)) return undefined;
   return [
     `code=${source.code}`,

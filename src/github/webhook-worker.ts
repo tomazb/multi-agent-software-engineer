@@ -154,7 +154,7 @@ export class GitHubWebhookWorker {
           // reach the retry path below (design doc §16).
           await settleGitHubDispatchResult({
             result,
-            complete: () => this.inbox.complete(deliveryId, leaseId).then(() => undefined),
+            complete: () => this.inbox.complete(deliveryId, leaseId),
             onPermanentRejectCompleted: (reason) =>
               this.onPermanentRejectCompleted?.({ ...context, reason }),
           });
