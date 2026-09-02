@@ -14,7 +14,10 @@ import {
   type FetchGitHubHttpClientOptions,
   type GitHubHttpClient,
 } from "./github/http.ts";
-import { createInstallationAccessToken } from "./github/token.ts";
+import {
+  createInstallationAccessToken,
+  createRepositoryInstallationAccessToken,
+} from "./github/token.ts";
 import {
   listenWebhookServer,
   type WebhookServerOptions,
@@ -229,6 +232,27 @@ function githubAdapterForCommand(
         installationId,
         http,
         repository,
+        readOnlyChecks: githubApp.readOnlyChecks,
+      });
+    },
+    // Every stable operational path mints its credential here, scoped by the
+    // stable repository ID with the exact least-privilege permission set for
+    // its purpose (design doc §4). The name-scoped `tokenProvider` above is a
+    // transitional compile seam that Issue #34 Task 11 removes.
+    repositoryTokenProvider: async (installationId, repositoryId, purpose) => {
+      const githubApp = config.githubApp!;
+      const appId = process.env[githubApp.appIdEnv];
+      const privateKey = process.env[githubApp.privateKeyEnv];
+      if (!appId || !privateKey) {
+        throw new Error("GitHub App id or private key environment variables are missing");
+      }
+      return createRepositoryInstallationAccessToken({
+        appId,
+        privateKeyPem: privateKey,
+        installationId,
+        repositoryId,
+        purpose,
+        http,
         readOnlyChecks: githubApp.readOnlyChecks,
       });
     },

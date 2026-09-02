@@ -11,6 +11,33 @@ import { FileRunStore } from "../src/store.ts";
 
 const SECRET = "delivery-semantics-secret";
 const SECRET_ENV = "MASWE_TEST_GITHUB_WEBHOOK_DELIVERY_SECRET";
+const REPO_ID = 1308655205;
+
+/** Live installation-repository listing proving the allowlisted stable id is present. */
+function canonicalListing() {
+  return {
+    status: 200,
+    headers: {},
+    body: { repositories: [{ id: REPO_ID, full_name: "owner/repo" }] },
+  };
+}
+
+/** Full live pull request snapshot proving `base.repo.id`. */
+function livePullRequest(headSha = "sha-new") {
+  return {
+    status: 200,
+    headers: {},
+    body: {
+      state: "open",
+      head: { sha: headSha, ref: "feature" },
+      base: {
+        sha: "sha-base",
+        ref: "main",
+        repo: { id: REPO_ID, full_name: "owner/repo" },
+      },
+    },
+  };
+}
 
 function config() {
   return mergeConfigForTest({
@@ -22,6 +49,7 @@ function config() {
       webhookSecretEnv: SECRET_ENV,
       appIdEnv: "MASWE_TEST_GITHUB_APP_ID",
       privateKeyEnv: "MASWE_TEST_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositoryIds: [REPO_ID],
       allowedRepositories: ["owner/repo"],
     },
   });
@@ -41,7 +69,7 @@ function pullRequest(headSha = "sha-new") {
   return {
     action: "synchronize",
     installation: { id: 44 },
-    repository: { id: 1308655205, full_name: "owner/repo" },
+    repository: { id: REPO_ID, full_name: "owner/repo" },
     pull_request: {
       number: 9,
       head: { sha: headSha, ref: "feature" },
@@ -60,14 +88,17 @@ async function setup(t: test.TestContext, http?: GitHubHttpClient) {
     store: new FileRunStore(cwd),
     http: http ?? {
       async request(method, url) {
+        if (method === "GET" && url.includes("/installation/repositories")) {
+          return canonicalListing();
+        }
         if (method === "GET" && url.includes("/pulls/")) {
-          return { status: 200, headers: {}, body: { head: { sha: "sha-new" }, state: "open" } };
+          return livePullRequest();
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         return { status: 201, headers: {}, body: { id: 1 } };
       },
     },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
   return { adapter, cwd };
 }
@@ -77,8 +108,11 @@ test("supported delivery is acknowledged only after durable enqueue", async (t) 
   const { adapter } = await setup(t, {
     async request(method, url) {
       requests += 1;
+      if (method === "GET" && url.includes("/installation/repositories")) {
+        return canonicalListing();
+      }
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: "sha-new" }, state: "open" } };
+        return livePullRequest();
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       return { status: 201, headers: {}, body: { id: requests } };
@@ -101,8 +135,11 @@ test("queued and completed duplicates use 202 then 200 without redispatch", asyn
   let posts = 0;
   const { adapter } = await setup(t, {
     async request(method, url) {
+      if (method === "GET" && url.includes("/installation/repositories")) {
+        return canonicalListing();
+      }
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: "sha-new" }, state: "open" } };
+        return livePullRequest();
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       posts += 1;

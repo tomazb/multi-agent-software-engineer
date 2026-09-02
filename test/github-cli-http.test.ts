@@ -18,6 +18,7 @@ const WEBHOOK_SECRET_ENV = "MASWE_TEST_CLI_HTTP_WEBHOOK_SECRET";
 const APP_ID_ENV = "MASWE_TEST_CLI_HTTP_APP_ID";
 const PRIVATE_KEY_ENV = "MASWE_TEST_CLI_HTTP_PRIVATE_KEY";
 const WEBHOOK_SECRET = "cli-http-secret";
+const REPO_ID = 1308655205;
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const PRIVATE_KEY = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
@@ -32,6 +33,7 @@ function testConfig() {
       webhookSecretEnv: WEBHOOK_SECRET_ENV,
       appIdEnv: APP_ID_ENV,
       privateKeyEnv: PRIVATE_KEY_ENV,
+      allowedRepositoryIds: [REPO_ID],
       allowedRepositories: ["owner/repo"],
     },
   });
@@ -57,7 +59,7 @@ function pullRequestBody(headSha: string): string {
   return JSON.stringify({
     action: "synchronize",
     installation: { id: 44 },
-    repository: { id: 1308655205, full_name: "owner/repo" },
+    repository: { id: REPO_ID, full_name: "owner/repo" },
     pull_request: {
       number: 9,
       head: { sha: headSha, ref: "feature" },
@@ -83,11 +85,25 @@ function recordingFetch(liveHead = "sha-new") {
         headers: { "content-type": "application/json" },
       });
     }
+    if (method === "GET" && url.includes("/installation/repositories")) {
+      return new Response(
+        JSON.stringify({ repositories: [{ id: REPO_ID, full_name: "owner/repo" }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
     if (method === "GET" && url.includes("/pulls/9")) {
-      return new Response(JSON.stringify({ head: { sha: currentLiveHead }, state: "open" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          state: "open",
+          head: { sha: currentLiveHead, ref: "feature" },
+          base: {
+            sha: "base-sha",
+            ref: "main",
+            repo: { id: REPO_ID, full_name: "owner/repo" },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
     }
     if (method === "GET" && url.includes("/check-runs")) {
       return new Response(JSON.stringify({ check_runs: [] }), {
@@ -209,6 +225,7 @@ test("github-publish-checks uses the command's shared bounded client", async () 
     const run = await store.create("manual", "request", config);
     run.github = {
       installationId: 44,
+      repositoryId: REPO_ID,
       repository: "owner/repo",
       pullRequestNumber: 9,
       baseSha: "base-sha",

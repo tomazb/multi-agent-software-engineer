@@ -11,6 +11,33 @@ import type { GitHubInternalEvent } from "../src/github/types.ts";
 import { FileRunStore } from "../src/store.ts";
 
 const SECRET_ENV = "MASWE_TEST_INBOX_MIGRATION_SECRET";
+const REPO_ID = 1308655205;
+
+/** Live installation-repository listing proving the allowlisted stable id is present. */
+function canonicalListing() {
+  return {
+    status: 200,
+    headers: {},
+    body: { repositories: [{ id: REPO_ID, full_name: "owner/repo" }] },
+  };
+}
+
+/** Full live pull request snapshot proving `base.repo.id`. */
+function livePullRequest(headSha: string) {
+  return {
+    status: 200,
+    headers: {},
+    body: {
+      state: "open",
+      head: { sha: headSha, ref: "feature" },
+      base: {
+        sha: "base",
+        ref: "main",
+        repo: { id: REPO_ID, full_name: "owner/repo" },
+      },
+    },
+  };
+}
 const SECRET = "inbox-migration-secret";
 
 function config() {
@@ -23,6 +50,7 @@ function config() {
       webhookSecretEnv: SECRET_ENV,
       appIdEnv: "MASWE_TEST_APP_ID",
       privateKeyEnv: "MASWE_TEST_PRIVATE_KEY",
+      allowedRepositoryIds: [REPO_ID],
       allowedRepositories: ["owner/repo"],
     },
   });
@@ -32,7 +60,7 @@ function request(deliveryId: string, headSha: string) {
   const rawBody = JSON.stringify({
     action: "synchronize",
     installation: { id: 44 },
-    repository: { id: 1308655205, full_name: "owner/repo" },
+    repository: { id: REPO_ID, full_name: "owner/repo" },
     pull_request: {
       number: 9,
       head: { sha: headSha, ref: "feature" },
@@ -83,15 +111,18 @@ test("startup migration turns v1 processing into awaiting-redelivery", async (t)
     store: new FileRunStore(cwd),
     http: {
       async request(method, url) {
+        if (method === "GET" && url.includes("/installation/repositories")) {
+          return canonicalListing();
+        }
         if (method === "GET" && url.includes("/pulls/")) {
-          return { status: 200, headers: {}, body: { head: { sha: "sha-legacy" }, state: "open" } };
+          return livePullRequest("sha-legacy");
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         posts += 1;
         return { status: 201, headers: {}, body: { id: posts } };
       },
     },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   await adapter.initialize();
@@ -136,7 +167,7 @@ test("startup migration preserves v1 completed as terminal legacy", async (t) =>
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { requests += 1; return { status: 500, headers: {}, body: {} }; } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   await adapter.initialize();
@@ -170,7 +201,7 @@ test("startup migration fails closed instead of overwriting conflicting retained
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("migration must fail before API work"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   await assert.rejects(adapter.initialize(), /conflicting legacy delivery evidence/i);

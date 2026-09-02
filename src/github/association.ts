@@ -535,6 +535,23 @@ export class GitHubAssociationIndex {
     return records[stableAssociationKey(repositoryId, pullRequestNumber)];
   }
 
+  /**
+   * Explicit unresolved-legacy read for the exact `<repository>#<pr>` key.
+   *
+   * Operational callers use this only to *detect* an unmigrated record and fail
+   * closed; it never resolves a stable identity and a name read here never
+   * authorizes anything. The generic `find()` remains for untouched transitional
+   * callers until Task 11 removes it.
+   */
+  async findLegacy(
+    repository: string,
+    pullRequestNumber: number,
+  ): Promise<AssociationRecord | undefined> {
+    const records = await this.readAll();
+    const record = records[associationKey(repository, pullRequestNumber)];
+    return record?.repositoryId === undefined ? record : undefined;
+  }
+
   /** All stable-keyed associations for a repository id, regardless of suspension state. */
   async findAllStableByRepositoryId(repositoryId: number): Promise<AssociationRecord[]> {
     const records = await this.readAll();

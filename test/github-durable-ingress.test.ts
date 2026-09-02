@@ -15,6 +15,33 @@ import {
 import { FileRunStore } from "../src/store.ts";
 
 const SECRET_ENV = "MASWE_TEST_DURABLE_INGRESS_SECRET";
+const DURABLE_INGRESS_REPO_ID = 1308655205;
+
+/** Live installation-repository listing proving the allowlisted stable id is present. */
+function canonicalListing() {
+  return {
+    status: 200,
+    headers: {},
+    body: { repositories: [{ id: DURABLE_INGRESS_REPO_ID, full_name: "owner/repo" }] },
+  };
+}
+
+/** Full live pull request snapshot proving `base.repo.id`. */
+function livePullRequest(headSha = "sha-durable", state: "open" | "closed" = "open") {
+  return {
+    status: 200,
+    headers: {},
+    body: {
+      state,
+      head: { sha: headSha, ref: "feature" },
+      base: {
+        sha: "base",
+        ref: "main",
+        repo: { id: DURABLE_INGRESS_REPO_ID, full_name: "owner/repo" },
+      },
+    },
+  };
+}
 const SECRET = "durable-ingress-secret";
 
 function config() {
@@ -27,6 +54,7 @@ function config() {
       webhookSecretEnv: SECRET_ENV,
       appIdEnv: "MASWE_TEST_GITHUB_APP_ID",
       privateKeyEnv: "MASWE_TEST_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositoryIds: [DURABLE_INGRESS_REPO_ID],
       allowedRepositories: ["owner/repo"],
     },
   });
@@ -53,8 +81,6 @@ async function withWatchdog<T>(promise: Promise<T>, message: string): Promise<T>
     if (timer !== undefined) clearTimeout(timer);
   }
 }
-
-const DURABLE_INGRESS_REPO_ID = 1308655205;
 
 function signedRequest(deliveryId: string, headSha = "sha-durable") {
   const rawBody = JSON.stringify({
@@ -134,10 +160,13 @@ test("durable ingress acknowledges before a blocked downstream dispatch", async 
   const releaseDispatch = deferred();
   const http: GitHubHttpClient = {
     async request(method, url) {
+      if (method === "GET" && url.includes("/installation/repositories")) {
+        return canonicalListing();
+      }
       if (method === "GET" && url.includes("/pulls/")) {
         dispatchReached.resolve();
         await releaseDispatch.promise;
-        return { status: 200, headers: {}, body: { head: { sha: "sha-durable" }, state: "open" } };
+        return livePullRequest();
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       return { status: 201, headers: {}, body: { id: 1 } };
@@ -148,7 +177,7 @@ test("durable ingress acknowledges before a blocked downstream dispatch", async 
     config: config(),
     store: new FileRunStore(cwd),
     http,
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
     autoStartWebhookWorker: true,
   });
 
@@ -182,8 +211,11 @@ test("durable ingress resumes an acknowledged queued event after restart", async
   let posts = 0;
   const http: GitHubHttpClient = {
     async request(method, url) {
+      if (method === "GET" && url.includes("/installation/repositories")) {
+        return canonicalListing();
+      }
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: "sha-durable" }, state: "open" } };
+        return livePullRequest();
       }
       if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
       posts += 1;
@@ -196,7 +228,7 @@ test("durable ingress resumes an acknowledged queued event after restart", async
       config: config(),
       store: new FileRunStore(cwd),
       http,
-      tokenProvider: async () => "token",
+      repositoryTokenProvider: async () => "token",
     });
   const firstProcess = makeAdapter();
   const accepted = await firstProcess.handleWebhook(signedRequest("durable-restart"));
@@ -226,19 +258,18 @@ test("an idle worker sleeps until due and a new enqueue wakes it immediately", a
     store: new FileRunStore(cwd),
     http: {
       async request(method, url) {
+        if (method === "GET" && url.includes("/installation/repositories")) {
+          return canonicalListing();
+        }
         if (method === "GET" && url.includes("/pulls/")) {
           dispatchReached.resolve();
-          return {
-            status: 200,
-            headers: {},
-            body: { head: { sha: "sha-durable" }, state: "open" },
-          };
+          return livePullRequest();
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         return { status: 201, headers: {}, body: { id: 1 } };
       },
     },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
     onWebhookWorkerSchedule: (delayMs) => scheduled.resolve(delayMs),
   });
   await adapter.startWebhookWorker();
@@ -266,7 +297,7 @@ test("queued duplicates are acknowledged and conflicting delivery bytes are reje
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("worker must not run"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   assert.equal((await adapter.handleWebhook(signedRequest("durable-duplicate"))).status, 202);
@@ -301,7 +332,7 @@ test("signed invalid UTF-8 authenticates exact bytes but is rejected without enq
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("invalid input must not dispatch"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
   const rawBody = Buffer.from([0x7b, 0xff, 0x7d]);
   const response = await adapter.handleWebhook({
@@ -328,7 +359,7 @@ test("signed direct adapter ingress rejects unsafe delivery ids without durable 
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("invalid input must not dispatch"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   const response = await adapter.handleWebhook(signedRequest("unsafe/id"));
@@ -349,7 +380,7 @@ test("a new payload missing repository.id is rejected before durable enqueue", a
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("malformed identity must not dispatch"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   const response = await adapter.handleWebhook(
@@ -379,16 +410,19 @@ test("worker stop bounds drain while preserving active durable work", async (t) 
     store: new FileRunStore(cwd),
     http: {
       async request(method, url) {
+        if (method === "GET" && url.includes("/installation/repositories")) {
+          return canonicalListing();
+        }
         if (method === "GET" && url.includes("/pulls/")) {
           dispatchReached.resolve();
           await releaseDispatch.promise;
-          return { status: 200, headers: {}, body: { head: { sha: "sha-durable" }, state: "open" } };
+          return livePullRequest();
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         return { status: 201, headers: {}, body: { id: 1 } };
       },
     },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
     autoStartWebhookWorker: true,
   });
 
@@ -410,7 +444,7 @@ test("manual publication preflight does not recover an active webhook lease", as
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("manual preflight must not call GitHub"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   } satisfies ConstructorParameters<typeof GitHubAppAdapter>[0];
   const ingress = new GitHubAppAdapter(options);
   assert.equal((await ingress.handleWebhook(signedRequest("manual-active-lease"))).status, 202);
@@ -456,7 +490,7 @@ test("durable handoff failures emit a local diagnostic before returning 503", as
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("failed handoff must not dispatch"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
     beforeInboxEnqueue: async () => { throw failure; },
     onWebhookDiagnostic: (error) => diagnostics.push(error),
   });
@@ -496,13 +530,16 @@ test("worker failures emit bounded delivery context for recovery", async (t) => 
     store: new FileRunStore(cwd),
     http: {
       async request(method, url) {
+        if (method === "GET" && url.includes("/installation/repositories")) {
+          return canonicalListing();
+        }
         if (method === "GET" && url.includes("/pulls/")) {
           return { status: 500, headers: {}, body: {} };
         }
         throw new Error("unexpected worker request");
       },
     },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
     onWebhookDiagnostic: (error) => {
       diagnostics.push(error);
       if ((error as { code?: unknown }).code === "GITHUB_WEBHOOK_DISPATCH_FAILED") {
@@ -540,14 +577,18 @@ test("synchronous dispatch failure schedules retry from the failure time", async
         return { status: 500, headers: {}, body: {} };
       },
     },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
     synchronousWebhookDispatch: true,
   });
   const retryStartedAt = Date.now();
 
   await assert.rejects(
     adapter.handleWebhook(signedRequest("sync-retry-clock")),
-    /Failed to resolve current PR head.*HTTP 500/,
+    // Pre-#34 the first live GitHub read on this path was the name-scoped PR
+    // head lookup. The stable path reaches the bounded canonical repository
+    // lookup first; its typed upstream error is likewise transient, so the
+    // delivery is still retried and still scheduled from the failure time.
+    /GitHub installation repository lookup failed: HTTP 500/,
   );
 
   const hash = createHash("sha256").update("sync-retry-clock").digest("hex");
@@ -680,7 +721,7 @@ test("the synchronous seam consumes a permanent repository rejection and counts 
         throw new Error(`permanent rejection must not touch GitHub: ${method} ${url}`);
       },
     },
-    tokenProvider: async () => {
+    repositoryTokenProvider: async () => {
       throw new Error("permanent rejection must not mint an installation token");
     },
     synchronousWebhookDispatch: true,
@@ -857,7 +898,7 @@ test("the worker consumes a permanent repository rejection with the same classif
         throw new Error(`permanent rejection must not touch GitHub: ${method} ${url}`);
       },
     },
-    tokenProvider: async () => {
+    repositoryTokenProvider: async () => {
       throw new Error("permanent rejection must not mint an installation token");
     },
     autoStartWebhookWorker: true,
