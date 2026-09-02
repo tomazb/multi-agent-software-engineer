@@ -1,4 +1,8 @@
-import type { GitHubAppConfig } from "../domain.ts";
+import type {
+  GitHubAppConfig,
+  RunGitHubAssociation,
+  StableRunGitHubAssociation,
+} from "../domain.ts";
 import path from "node:path";
 
 const MAX_PENDING_CANCELLATION_HEADS = 64;
@@ -19,6 +23,51 @@ export function isRepoAllowed(
 ): boolean {
   if (!repository) return false;
   return config.allowedRepositories.includes(repository);
+}
+
+/**
+ * Operational repository authorization (design doc §3.2).
+ *
+ * Consults `allowedRepositoryIds` only. A mutable `owner/repo` name is
+ * routing/display/candidate metadata and must never authorize anything, so a
+ * name present in `allowedRepositories` grants nothing here.
+ */
+export function isRepositoryIdAllowed(
+  config: GitHubAppConfig,
+  repositoryId: number | undefined,
+): boolean {
+  if (repositoryId === undefined) return false;
+  return config.allowedRepositoryIds.includes(repositoryId);
+}
+
+/**
+ * Rejects unresolved legacy state before any stable repository/PR publication
+ * fence is acquired (design doc §8).
+ *
+ * An ID-less (or malformed-ID) association is a historical record that has not
+ * been migrated yet. It is never silently upgraded here -- resolving it needs
+ * live installation proof -- so this fails closed with an explicit
+ * migration-required error that names the legacy selector.
+ */
+export function requireStableGitHubAssociation(
+  association: RunGitHubAssociation | undefined,
+): StableRunGitHubAssociation {
+  if (association === undefined) {
+    throw new Error(
+      "GitHub association is missing its stable repository id; explicit migration is required",
+    );
+  }
+  const { repositoryId } = association;
+  if (
+    typeof repositoryId !== "number" ||
+    !Number.isSafeInteger(repositoryId) ||
+    repositoryId <= 0
+  ) {
+    throw new Error(
+      `GitHub association ${association.repository}#${association.pullRequestNumber} is missing its stable repository id; explicit migration is required`,
+    );
+  }
+  return association as StableRunGitHubAssociation;
 }
 
 export function pendingCancellationHeads(

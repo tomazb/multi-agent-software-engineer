@@ -1,5 +1,4 @@
 import type { GitHubAppConfig, MasweConfig, RunRecord } from "../domain.ts";
-import { containsDurableAtomicWriteOutcomeUnknown } from "../durable-file.ts";
 import { invalidateStaleEvidence } from "../git-workspace.ts";
 import {
   requiresSameTargetEvidenceRecovery,
@@ -11,6 +10,7 @@ import {
   GitHubAssociationIndex,
   type GitHubAssociationTransaction,
 } from "./association.ts";
+import { saveGitHubAssociationMutation } from "./association-mutation.ts";
 import {
   isRepoAllowed,
   githubStateRoot,
@@ -40,27 +40,6 @@ export {
   GitHubWebhookDiagnosticError,
   type GitHubWebhookDiagnosticCode,
 } from "./webhook-diagnostic.ts";
-
-function eventHistoryIdentity(events: RunRecord["events"]): string {
-  return JSON.stringify(events.map((event) => ({
-    id: event.id,
-    at: event.at,
-    type: event.type,
-    actor: event.actor,
-    from: event.from,
-    to: event.to,
-    details: event.details,
-  })));
-}
-
-function associationRollbackInvariant(run: RunRecord): string {
-  const record = structuredClone(run) as unknown as Record<string, unknown>;
-  delete record.version;
-  delete record.updatedAt;
-  delete record.github;
-  delete record.evidence;
-  return JSON.stringify(record);
-}
 
 type AssociationRoutingIdentity = Pick<
   AssociationRecord,
@@ -482,63 +461,17 @@ export class GitHubAppAdapter {
     );
   }
 
-  private async rollbackRunMutation(
-    before: RunRecord,
-    attempted: RunRecord,
-  ): Promise<void> {
-    const current = await this.store.load(before.id);
-    if (current.version === before.version) return;
-    if (current.version !== attempted.version) {
-      throw new Error(
-        `Run ${before.id} changed before association rollback: expected ${attempted.version}, on disk ${current.version}`,
-      );
-    }
-    if (
-      eventHistoryIdentity(current.events) !== eventHistoryIdentity(attempted.events) ||
-      associationRollbackInvariant(current) !== associationRollbackInvariant(attempted)
-    ) {
-      throw new Error(
-        `Run ${before.id} changed before association rollback: attempted snapshot no longer matches`,
-      );
-    }
-    const rollback = structuredClone(current);
-    if (before.github === undefined) delete rollback.github;
-    else rollback.github = structuredClone(before.github);
-    if (before.evidence === undefined) delete rollback.evidence;
-    else rollback.evidence = structuredClone(before.evidence);
-    await this.store.save(rollback);
-  }
-
   private async saveAssociationMutation(
     before: RunRecord,
     run: RunRecord,
     transaction: GitHubAssociationTransaction,
   ): Promise<void> {
-    if (
-      eventHistoryIdentity(run.events) !== eventHistoryIdentity(before.events) ||
-      associationRollbackInvariant(run) !== associationRollbackInvariant(before)
-    ) {
-      throw new Error(
-        `Run ${before.id} association transaction changed fields outside github/evidence`,
-      );
-    }
-    try {
-      await this.store.save(run);
-    } catch (error) {
-      if (containsDurableAtomicWriteOutcomeUnknown(error)) throw error;
-      try {
-        await this.rollbackRunMutation(before, run);
-      } catch (rollbackError) {
-        throw new AggregateError(
-          [error, rollbackError],
-          error instanceof Error ? error.message : "Run save failed",
-          { cause: error },
-        );
-      }
-      throw error;
-    }
-    const attempted = structuredClone(run);
-    transaction.onRollback(() => this.rollbackRunMutation(before, attempted));
+    await saveGitHubAssociationMutation({
+      store: this.store,
+      transaction,
+      before,
+      candidate: run,
+    });
   }
 
   private async routeAssociationHead(

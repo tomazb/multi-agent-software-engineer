@@ -5,7 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
-import { writeDurableAtomic } from "../src/durable-file.ts";
+import {
+  DurableAtomicWriteOutcomeUnknownError,
+  writeDurableAtomic,
+} from "../src/durable-file.ts";
 import { GitHubAppAdapter, type WebhookHandleResult } from "../src/github/adapter.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
@@ -1533,6 +1536,64 @@ test("integration: a rejected run save that reached disk is reconciled before bi
       9,
     ),
     undefined,
+  );
+});
+
+test("integration: an outcome-unknown run save is never rolled back", async () => {
+  process.env[SECRET_ENV] = SECRET;
+  let raiseOutcomeUnknown = true;
+  const { adapter, store, cwd } = await setup({
+    liveHead: "sha-save-outcome-unknown",
+    wrapStore: (base) => ({
+      create: base.create.bind(base),
+      load: base.load.bind(base),
+      list: base.list.bind(base),
+      applyEvent: base.applyEvent.bind(base),
+      writeArtifact: base.writeArtifact.bind(base),
+      readArtifact: base.readArtifact.bind(base),
+      async save(run) {
+        await base.save(run);
+        if (raiseOutcomeUnknown) {
+          raiseOutcomeUnknown = false;
+          throw new DurableAtomicWriteOutcomeUnknownError("Run record", new Error("sync failed"));
+        }
+      },
+    }),
+  });
+  const run = await store.create("association-save-outcome-unknown", "req", testConfig());
+  run.workspace = {
+    baseSha: "base",
+    headSha: "sha-save-outcome-unknown",
+    branch: "maswe/run-1",
+    fingerprint: "fp",
+    remote: "https://github.com/owner/repo.git",
+  };
+  await store.save(run);
+  const rawBody = JSON.stringify(prPayload("sha-save-outcome-unknown", 9, "opened"));
+
+  await assert.rejects(
+    adapter.handleWebhook({
+      deliveryId: "del-association-save-outcome-unknown",
+      eventName: "pull_request",
+      signatureHeader: sign(rawBody),
+      rawBody,
+    }),
+    DurableAtomicWriteOutcomeUnknownError,
+  );
+
+  // The write reached disk with an unknown outcome, so it must be re-read and
+  // reconciled by a later delivery -- never blindly compensated away.
+  const afterOutcomeUnknown = await store.load(run.id);
+  assert.equal(afterOutcomeUnknown.github?.repository, "owner/repo");
+  assert.equal(afterOutcomeUnknown.github?.pullRequestNumber, 9);
+  assert.equal(afterOutcomeUnknown.github?.headSha, "sha-save-outcome-unknown");
+  assert.equal(
+    await new GitHubAssociationIndex(path.join(cwd, ".maswe", "github")).find(
+      "owner/repo",
+      9,
+    ),
+    undefined,
+    "the association index is only bound after the run mutation is certain",
   );
 });
 
