@@ -27,6 +27,7 @@ import { MASWE_CHECK_NAMES } from "../src/github/types.ts";
 import { FileRunStore, type RunStore } from "../src/store.ts";
 import type { MasweConfig } from "../src/domain.ts";
 import type { GitHubInstallationTokenPurpose } from "../src/github/token.ts";
+import { seedLegacyAssociations } from "./fixtures/github-legacy-associations.ts";
 
 const SECRET = "integration-webhook-secret";
 const SECRET_ENV = "MASWE_TEST_GITHUB_WEBHOOK_SECRET";
@@ -887,7 +888,7 @@ test("integration: pull request close suspends the index and run association", a
     (await store.load(run.id)).github?.suspensionReason,
     "pull-request-closed",
   );
-  assert.deepEqual(await index.findAllByRepositoryBranch("owner/repo", "maswe/run-1"), []);
+  assert.deepEqual(await index.findAllStableByRepositoryBranch(REPO_ID, "maswe/run-1"), []);
   assert.equal(posts.length, 0);
 });
 
@@ -2691,8 +2692,9 @@ test("integration: an unresolved legacy association cannot enter stable publicat
     suspended: false,
   };
   await harness.store.save(run);
-  const index = new GitHubAssociationIndex(path.join(harness.cwd, ".maswe", "github"));
-  await index.bind({
+  const githubRoot = path.join(harness.cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
+  await seedLegacyAssociations(githubRoot, [{
     runId: run.id,
     installationId: 44,
     repository: "owner/repo",
@@ -2700,7 +2702,7 @@ test("integration: an unresolved legacy association cannot enter stable publicat
     baseSha: "base",
     headSha: "sha-legacy-block",
     branch: "maswe/run-1",
-  });
+  }]);
   const before = await harness.store.load(run.id);
 
   const body = JSON.stringify(prPayload("sha-legacy-block"));

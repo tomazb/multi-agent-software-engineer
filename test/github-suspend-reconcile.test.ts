@@ -19,6 +19,7 @@ import {
   type StableAssociationBindInput,
 } from "../src/github/association.ts";
 import { FileRunStore } from "../src/store.ts";
+import { seedLegacyAssociations } from "./fixtures/github-legacy-associations.ts";
 import type { RunStore } from "../src/store.ts";
 import type { RunRecord } from "../src/domain.ts";
 
@@ -371,7 +372,8 @@ async function fencedIdentityCount(
 
 async function seedMixedInstallation(cwd: string, store: FileRunStore) {
   const config = fanoutConfig();
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
 
   const stableRun = await store.create("stable-record", "req", config);
   stableRun.github = {
@@ -408,7 +410,7 @@ async function seedMixedInstallation(cwd: string, store: FileRunStore) {
     suspended: false,
   };
   await store.save(legacyRun);
-  await index.bind({
+  await seedLegacyAssociations(githubRoot, [{
     runId: legacyRun.id,
     installationId: 44,
     repository: "owner/legacy",
@@ -416,7 +418,7 @@ async function seedMixedInstallation(cwd: string, store: FileRunStore) {
     baseSha: "b",
     headSha: "h",
     branch: "a",
-  });
+  }]);
 
   return { config, index, stableRun, legacyRun };
 }
@@ -551,7 +553,7 @@ test("legacy-only authority reduction never fences a repository identity", async
     suspended: false,
   };
   await store.save(run);
-  await index.bind({
+  await seedLegacyAssociations(githubRoot, [{
     runId: run.id,
     installationId: 44,
     repository: "owner/legacy",
@@ -559,7 +561,7 @@ test("legacy-only authority reduction never fences a repository identity", async
     baseSha: "b",
     headSha: "h",
     branch: "a",
-  });
+  }]);
   const adapter = new GitHubAppAdapter({
     cwd,
     config,

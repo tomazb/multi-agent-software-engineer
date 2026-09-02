@@ -23,6 +23,7 @@ test("file and directory sync failures prevent durable acknowledgement", async (
       webhookSecretEnv: SECRET_ENV,
       appIdEnv: "MASWE_TEST_APP_ID",
       privateKeyEnv: "MASWE_TEST_PRIVATE_KEY",
+      allowedRepositoryIds: [1308655205],
       allowedRepositories: ["owner/repo"],
     },
   });
@@ -42,7 +43,7 @@ test("file and directory sync failures prevent durable acknowledgement", async (
         config,
         store: new FileRunStore(cwd),
         http: { async request() { throw new Error("must not dispatch"); } },
-        tokenProvider: async () => "token",
+        repositoryTokenProvider: async () => "token",
         inboxOptions: {
           syncFile: async (handle, filePath) => {
             const parts = filePath.split(path.sep);

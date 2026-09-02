@@ -84,16 +84,6 @@ export class GitHubAppAdapter {
   private readonly config: MasweConfig;
   private readonly store: RunStore;
   private readonly http: GitHubHttpClient;
-  /**
-   * Transitional compile seam only (design doc §4, §9.1 cutover step 6).
-   *
-   * No stable operational path in this adapter reads it: every repository
-   * credential is minted through {@link repositoryTokenProvider}, scoped by
-   * stable repository ID. Kept so untouched callers still typecheck until
-   * Issue #34 Task 11 deletes it.
-   */
-  private readonly tokenProvider:
-    ((installationId: number, repository: string) => Promise<string>) | undefined;
   /** The only credential source for stable repository operations; no name fallback exists. */
   private readonly repositoryTokenProvider: GitHubRepositoryTokenProvider | undefined;
   private readonly inbox: GitHubDeliveryInbox;
@@ -129,11 +119,6 @@ export class GitHubAppAdapter {
     config: MasweConfig;
     store: RunStore;
     http: GitHubHttpClient;
-    /**
-     * Transitional name-scoped token seam. Accepted so untouched callers keep
-     * compiling; never consulted by a stable operational path. Task 11 removes it.
-     */
-    tokenProvider?: (installationId: number, repository: string) => Promise<string>;
     /** Stable operational credential source: `(installationId, repositoryId, purpose)`. */
     repositoryTokenProvider?: GitHubRepositoryTokenProvider;
     /** Test/embedded seam; the CLI starts recovery explicitly before listening. */
@@ -163,7 +148,6 @@ export class GitHubAppAdapter {
     this.config = options.config;
     this.store = options.store;
     this.http = options.http;
-    this.tokenProvider = options.tokenProvider;
     this.repositoryTokenProvider = options.repositoryTokenProvider;
     this.afterManualRunLoaded = options.afterManualRunLoaded;
     this.beforeAssociationTransaction = options.beforeAssociationTransaction;
@@ -601,8 +585,8 @@ export class GitHubAppAdapter {
   }
 
   /**
-   * Mints an ID-scoped installation credential. There is deliberately no
-   * fallback to the transitional name-scoped `tokenProvider`: a stable
+   * Mints an ID-scoped installation credential. It is the adapter's only
+   * credential source: no name-scoped provider exists any more, so a stable
    * operation without the ID provider fails closed here, before any GitHub
    * request, and the failure is thrown (retryable) rather than classified as
    * a permanent identity rejection -- a missing provider is a deployment

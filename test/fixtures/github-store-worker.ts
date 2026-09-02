@@ -37,23 +37,7 @@ try {
   await send({ type: "READY", actor, pid: process.pid });
   await waitForBarrier(barrierPath);
 
-  if (mode === "association") {
-    // Explicit legacy fixture: baseline name-primary bind, unchanged since before #34.
-    const pullRequestNumber = Number(process.env.MASWE_GITHUB_PULL_REQUEST_NUMBER);
-    if (!Number.isSafeInteger(pullRequestNumber)) {
-      throw new Error("association worker requires a pull request number");
-    }
-    const index = new GitHubAssociationIndex(githubRoot);
-    await index.bind({
-      runId: `run-${actor}`,
-      installationId: 41,
-      repository: "owner/repo",
-      pullRequestNumber,
-      baseSha: "base",
-      headSha: `head-${actor}`,
-      branch: `branch-${actor}`,
-    });
-  } else if (mode === "association-stable") {
+  if (mode === "association-stable") {
     const pullRequestNumber = Number(process.env.MASWE_GITHUB_PULL_REQUEST_NUMBER);
     if (!Number.isSafeInteger(pullRequestNumber)) {
       throw new Error("association-stable worker requires a pull request number");

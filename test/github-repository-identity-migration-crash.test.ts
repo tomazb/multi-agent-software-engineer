@@ -29,6 +29,7 @@ import {
 import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
 import { MASWE_CHECK_NAMES } from "../src/github/types.ts";
 import { FileRunStore, type RunStore } from "../src/store.ts";
+import { seedLegacyAssociations } from "./fixtures/github-legacy-associations.ts";
 
 const REPO_ID = 4242;
 const LEGACY = "owner/legacy";
@@ -204,16 +205,15 @@ async function createHarness(t: {
     suspended: false,
   };
   await store.save(run);
-  await index.withTransaction(async (transaction) =>
-    transaction.bind({
-      runId: run.id,
-      installationId: INSTALLATION,
-      repository: LEGACY,
-      pullRequestNumber: 7,
-      baseSha: "base-sha",
-      headSha: HEAD_A,
-      branch: "maswe/topic",
-    }));
+  await seedLegacyAssociations(githubRootOf(cwd), [{
+    runId: run.id,
+    installationId: INSTALLATION,
+    repository: LEGACY,
+    pullRequestNumber: 7,
+    baseSha: "base-sha",
+    headSha: HEAD_A,
+    branch: "maswe/topic",
+  }]);
 
   const checkName = MASWE_CHECK_NAMES[0];
   const legacyKey = legacyCheckRunIdempotencyKey(LEGACY, 7, HEAD_A, checkName, 1);

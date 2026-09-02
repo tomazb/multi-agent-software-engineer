@@ -169,10 +169,6 @@ function assertUniqueStablePrIdentity(
   }
 }
 
-type AssociationBindInput = Omit<AssociationRecord, "repositoryId" | "suspended" | "updatedAt"> & {
-  suspended?: boolean;
-};
-
 /** Bind input for a stable, ID-primary association. Carries both the stable ID and the mutable name. */
 export type StableAssociationBindInput = Omit<
   AssociationRecord,
@@ -182,17 +178,14 @@ export type StableAssociationBindInput = Omit<
   suspended?: boolean;
 };
 
+/**
+ * Every method names the key namespace it addresses. There is deliberately no
+ * generic name-primary `find`/`bind`/`suspend`: a mutable `owner/repo` never
+ * resolves or establishes identity, so a caller must say explicitly whether it
+ * means the stable `<repositoryId>#<pr>` key or an unresolved pre-#34
+ * `<repository>#<pr>` record.
+ */
 export interface GitHubAssociationTransaction {
-  // Transitional baseline methods retained through Task 10:
-  find(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
-  bind(input: AssociationBindInput): AssociationRecord;
-  suspend(
-    repository: string,
-    pullRequestNumber: number,
-    reason: SuspensionReason,
-  ): AssociationRecord | undefined;
-
-  // New explicit stable/legacy APIs:
   findStable(repositoryId: number, pullRequestNumber: number): AssociationRecord | undefined;
   findLegacy(repository: string, pullRequestNumber: number): AssociationRecord | undefined;
   bindStable(input: StableAssociationBindInput): AssociationRecord;
@@ -290,48 +283,6 @@ export class GitHubAssociationIndex {
       let dirty = false;
       const rollbacks: Array<() => Promise<void>> = [];
       const transaction: GitHubAssociationTransaction = {
-        find(repository, pullRequestNumber) {
-          const record = records[associationKey(repository, pullRequestNumber)];
-          return record ? { ...record } : undefined;
-        },
-        bind(input) {
-          const key = associationKey(input.repository, input.pullRequestNumber);
-          const suspended = input.suspended ?? false;
-          assertUniqueActiveRun(records, key, input.runId, suspended);
-          const record: AssociationRecord = {
-            runId: input.runId,
-            installationId: input.installationId,
-            repository: input.repository,
-            pullRequestNumber: input.pullRequestNumber,
-            baseSha: input.baseSha,
-            headSha: input.headSha,
-            branch: input.branch,
-            suspended,
-            ...(input.suspensionReason !== undefined
-              ? { suspensionReason: input.suspensionReason }
-              : {}),
-            updatedAt: new Date().toISOString(),
-          };
-          parseAssociationRecords(`${JSON.stringify({ [key]: record })}\n`);
-          records[key] = record;
-          dirty = true;
-          return { ...record };
-        },
-        suspend(repository, pullRequestNumber, reason) {
-          const record = records[associationKey(repository, pullRequestNumber)];
-          if (!record) return undefined;
-          if (!record.suspended) {
-            record.suspended = true;
-            record.suspensionReason = reason;
-            record.updatedAt = new Date().toISOString();
-            dirty = true;
-          } else if (record.suspensionReason !== reason) {
-            record.suspensionReason = reason;
-            record.updatedAt = new Date().toISOString();
-            dirty = true;
-          }
-          return { ...record };
-        },
         findStable(repositoryId, pullRequestNumber) {
           const record = records[stableAssociationKey(repositoryId, pullRequestNumber)];
           return record ? { ...record } : undefined;
@@ -488,45 +439,6 @@ export class GitHubAssociationIndex {
     });
   }
 
-  async bind(
-    input: AssociationBindInput,
-  ): Promise<AssociationRecord> {
-    return this.withTransaction(async (transaction) => transaction.bind(input));
-  }
-
-  async find(
-    repository: string,
-    pullRequestNumber: number,
-  ): Promise<AssociationRecord | undefined> {
-    const records = await this.readAll();
-    return records[associationKey(repository, pullRequestNumber)];
-  }
-
-  async findAllByRepositoryBranch(
-    repository: string,
-    branch: string,
-  ): Promise<AssociationRecord[]> {
-    const records = await this.readAll();
-    return Object.values(records)
-      .filter(
-        (record) =>
-          // Excludes stable (repositoryId-keyed) records: this name-primary lookup is the
-          // legacy enumeration path, and letting a mutable name resolve a stable record's
-          // identity here is exactly the identity confusion Issue #34 removes. This filter
-          // is behaviorally invisible on all pre-#34 data, because no legacy record ever
-          // carries a repositoryId, so it preserves this method's pre-#34 behavior exactly.
-          record.repositoryId === undefined &&
-          record.repository === repository &&
-          record.branch === branch &&
-          !record.suspended,
-      )
-      .map((record) => ({ ...record }))
-      .sort(
-        (left, right) =>
-          left.pullRequestNumber - right.pullRequestNumber || left.runId.localeCompare(right.runId),
-      );
-  }
-
   async findStable(
     repositoryId: number,
     pullRequestNumber: number,
@@ -540,8 +452,7 @@ export class GitHubAssociationIndex {
    *
    * Operational callers use this only to *detect* an unmigrated record and fail
    * closed; it never resolves a stable identity and a name read here never
-   * authorizes anything. The generic `find()` remains for untouched transitional
-   * callers until Task 11 removes it.
+   * authorizes anything.
    */
   async findLegacy(
     repository: string,
@@ -616,30 +527,6 @@ export class GitHubAssociationIndex {
           left.pullRequestNumber - right.pullRequestNumber ||
           left.runId.localeCompare(right.runId),
       );
-  }
-
-  async suspend(
-    repository: string,
-    pullRequestNumber: number,
-    reason: "pull-request-closed" | "authorization-revoked" = "authorization-revoked",
-  ): Promise<AssociationRecord | undefined> {
-    return this.withLock(async () => {
-      const records = await this.readAll();
-      const key = associationKey(repository, pullRequestNumber);
-      const record = records[key];
-      if (!record) return undefined;
-      if (!record.suspended) {
-        record.suspended = true;
-        record.suspensionReason = reason;
-        record.updatedAt = new Date().toISOString();
-        await this.writeAll(records);
-      } else if (record.suspensionReason !== reason) {
-        record.suspensionReason = reason;
-        record.updatedAt = new Date().toISOString();
-        await this.writeAll(records);
-      }
-      return { ...record };
-    });
   }
 
   async suspendInstallation(installationId: number): Promise<AssociationRecord[]> {

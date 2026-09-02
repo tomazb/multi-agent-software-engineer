@@ -10,6 +10,8 @@ const ARG_OPTIONS = {
   "request-file": { type: "string" },
   text: { type: "string" },
   file: { type: "string" },
+  from: { type: "string" },
+  "repository-id": { type: "string" },
 } as const;
 
 const GLOBAL_OPTIONS = new Set<MasweOptionName>(["config", "cwd"]);
@@ -53,6 +55,11 @@ const COMMAND_SPECS = {
     maxPositionals: 1,
     options: ["json"],
   },
+  "github-migrate-repository": {
+    minPositionals: 0,
+    maxPositionals: 0,
+    options: ["from", "repository-id", "json"],
+  },
 } as const satisfies Record<string, CommandSpec>;
 
 export type MasweCommand = keyof typeof COMMAND_SPECS;
@@ -68,6 +75,8 @@ export interface MasweOptions {
   "request-file"?: string;
   text?: string;
   file?: string;
+  from?: string;
+  "repository-id"?: string;
 }
 
 export interface ParsedMasweArgs {
@@ -145,6 +154,14 @@ export function parseMasweArgs(argv: string[]): ParsedMasweArgs {
     optionCount(options, ["text", "file"]) !== 1
   ) {
     throw new Error("review-comment requires exactly one comment source");
+  }
+  if (
+    commandValue === "github-migrate-repository" &&
+    optionCount(options, ["from", "repository-id"]) !== 2
+  ) {
+    throw new Error(
+      "github-migrate-repository requires --from <owner/repo> and --repository-id <positive safe integer>",
+    );
   }
 
   return {

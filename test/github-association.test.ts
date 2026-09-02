@@ -6,32 +6,13 @@ import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
 import { FileRunStore } from "../src/store.ts";
-
-test("association index binds and finds a run by repository and PR", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-"));
-  const store = new FileRunStore(cwd);
-  const run = await store.create("assoc", "request", DEFAULT_CONFIG);
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-
-  await index.bind({
-    runId: run.id,
-    installationId: 10,
-    repository: "owner/repo",
-    pullRequestNumber: 3,
-    baseSha: "base",
-    headSha: "head",
-    branch: "maswe/x",
-  });
-
-  const found = await index.find("owner/repo", 3);
-  assert.equal(found?.runId, run.id);
-  assert.equal(found?.suspended, false);
-});
+import { seedLegacyAssociations } from "./fixtures/github-legacy-associations.ts";
 
 test("association index suspends all entries for an installation", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-suspend-"));
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-a",
     installationId: 77,
     repository: "owner/repo",
@@ -39,8 +20,8 @@ test("association index suspends all entries for an installation", async () => {
     baseSha: "b",
     headSha: "h",
     branch: "feature",
-  });
-  await index.bind({
+  }]);
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-b",
     installationId: 88,
     repository: "owner/other",
@@ -48,58 +29,11 @@ test("association index suspends all entries for an installation", async () => {
     baseSha: "b",
     headSha: "h",
     branch: "feature",
-  });
+  }]);
 
   await index.suspendInstallation(77);
-  assert.equal((await index.find("owner/repo", 1))?.suspended, true);
-  assert.equal((await index.find("owner/other", 2))?.suspended, false);
-});
-
-test("association index finds all non-suspended branch associations in PR order", async () => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-branch-assoc-"));
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
-    runId: "run-five",
-    installationId: 10,
-    repository: "owner/repo",
-    pullRequestNumber: 5,
-    baseSha: "base",
-    headSha: "head-five",
-    branch: "maswe/shared",
-  });
-  await index.bind({
-    runId: "run-two",
-    installationId: 10,
-    repository: "owner/repo",
-    pullRequestNumber: 2,
-    baseSha: "base",
-    headSha: "head-two",
-    branch: "maswe/shared",
-  });
-  await index.bind({
-    runId: "run-suspended",
-    installationId: 10,
-    repository: "owner/repo",
-    pullRequestNumber: 7,
-    baseSha: "base",
-    headSha: "head-suspended",
-    branch: "maswe/shared",
-    suspended: true,
-  });
-
-  const matches = await index.findAllByRepositoryBranch("owner/repo", "maswe/shared");
-
-  assert.deepEqual(
-    matches.map((record) => [record.pullRequestNumber, record.runId]),
-    [
-      [2, "run-two"],
-      [5, "run-five"],
-    ],
-  );
-  const firstMatch = matches[0];
-  assert.ok(firstMatch);
-  firstMatch.headSha = "mutated-snapshot";
-  assert.equal((await index.find("owner/repo", 2))?.headSha, "head-two");
+  assert.equal((await index.findLegacy("owner/repo", 1))?.suspended, true);
+  assert.equal((await index.findLegacy("owner/other", 2))?.suspended, false);
 });
 
 test("association index rejects two active PRs owning the same run id", async (t) => {
@@ -109,15 +43,20 @@ test("association index rejects two active PRs owning the same run id", async (t
   const base = {
     runId: "run-unique",
     installationId: 10,
+    repositoryId: 5150,
     repository: "owner/repo",
     baseSha: "base",
     headSha: "head",
     branch: "maswe/shared",
   };
-  await index.bind({ ...base, pullRequestNumber: 1 });
+  await index.withTransaction(async (transaction) =>
+    transaction.bindStable({ ...base, pullRequestNumber: 1 }),
+  );
 
   await assert.rejects(
-    index.bind({ ...base, pullRequestNumber: 2 }),
+    index.withTransaction(async (transaction) =>
+      transaction.bindStable({ ...base, pullRequestNumber: 2 }),
+    ),
     /already associated|duplicate active run/i,
   );
 });
@@ -153,7 +92,7 @@ test("association index fails closed on malformed or duplicate persisted records
     );
 
     await assert.rejects(
-      new GitHubAssociationIndex(githubRoot).find("owner/repo", 1),
+      new GitHubAssociationIndex(githubRoot).findLegacy("owner/repo", 1),
       /Invalid GitHub association index|duplicate active run/i,
     );
   }
@@ -302,6 +241,11 @@ test("findAllStableByRepositoryBranch mirrors the name-primary branch lookup but
       [5, "run-branch-five"],
     ],
   );
+  // Results are snapshot copies: mutating one must not reach the durable index.
+  const firstMatch = matches[0];
+  assert.ok(firstMatch);
+  firstMatch.headSha = "mutated-snapshot";
+  assert.equal((await index.findStable(700, 2))?.headSha, "head-two");
 });
 
 test("refreshCanonicalRepository updates the mutable name in place without changing the stable key or id", async (t) => {
@@ -442,7 +386,7 @@ test("migrateLegacy removes the exact legacy key and inserts the exact stable ke
   t.after(async () => rm(cwd, { recursive: true, force: true }));
   const githubRoot = path.join(cwd, ".maswe", "github");
   const index = new GitHubAssociationIndex(githubRoot);
-  await index.bind({
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-migrate",
     installationId: 10,
     repository: "owner/repo",
@@ -450,7 +394,7 @@ test("migrateLegacy removes the exact legacy key and inserts the exact stable ke
     baseSha: "base",
     headSha: "head",
     branch: "maswe/migrate",
-  });
+  }]);
 
   const migrated = await index.withTransaction(async (transaction) =>
     transaction.migrateLegacy({
@@ -469,7 +413,7 @@ test("migrateLegacy removes the exact legacy key and inserts the exact stable ke
   );
 
   assert.equal(migrated.repositoryId, 2468);
-  assert.equal(await index.find("owner/repo", 8), undefined);
+  assert.equal(await index.findLegacy("owner/repo", 8), undefined);
   assert.equal((await index.findStable(2468, 8))?.runId, "run-migrate");
 
   const raw = JSON.parse(
@@ -483,7 +427,7 @@ test("migrateLegacy that throws on invalid input leaves the durable index exactl
   t.after(async () => rm(cwd, { recursive: true, force: true }));
   const githubRoot = path.join(cwd, ".maswe", "github");
   const index = new GitHubAssociationIndex(githubRoot);
-  await index.bind({
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-migrate-fail",
     installationId: 10,
     repository: "owner/repo",
@@ -491,7 +435,7 @@ test("migrateLegacy that throws on invalid input leaves the durable index exactl
     baseSha: "base",
     headSha: "head",
     branch: "maswe/migrate",
-  });
+  }]);
 
   await index.withTransaction(async (transaction) => {
     // An unrelated valid mutation in the same transaction sets `dirty`, so the
@@ -540,7 +484,7 @@ test("migrateLegacy that throws on invalid input leaves the durable index exactl
     Object.hasOwn(raw, "111#1"),
     "the unrelated valid mutation in the same transaction must still commit",
   );
-  assert.equal((await index.find("owner/repo", 8))?.runId, "run-migrate-fail");
+  assert.equal((await index.findLegacy("owner/repo", 8))?.runId, "run-migrate-fail");
 });
 
 // --- Step 2: failing mixed-parser tests ---
@@ -571,7 +515,7 @@ test("mixed association index accepts exact legacy and exact stable records in o
   );
 
   const index = new GitHubAssociationIndex(githubRoot);
-  assert.equal((await index.find("owner/legacy", 1))?.runId, "run-legacy");
+  assert.equal((await index.findLegacy("owner/legacy", 1))?.runId, "run-legacy");
   assert.equal((await index.findStable(999, 2))?.runId, "run-mixed-stable");
 });
 
@@ -626,7 +570,7 @@ test("mixed association index rejects malformed keys, mismatches, and unknown fi
     );
 
     await assert.rejects(
-      new GitHubAssociationIndex(githubRoot).find("owner/repo", 1),
+      new GitHubAssociationIndex(githubRoot).findLegacy("owner/repo", 1),
       /Invalid GitHub association index/i,
       label,
     );
@@ -659,7 +603,7 @@ test("mixed association index rejects a duplicate active run id across legacy an
   );
 
   await assert.rejects(
-    new GitHubAssociationIndex(githubRoot).find("owner/repo", 1),
+    new GitHubAssociationIndex(githubRoot).findLegacy("owner/repo", 1),
     /duplicate active run/i,
   );
 });
@@ -699,7 +643,7 @@ test("mixed association index rejects inconsistent stable/legacy claims for the 
   );
 
   await assert.rejects(
-    new GitHubAssociationIndex(githubRoot).find("owner/repo", 1),
+    new GitHubAssociationIndex(githubRoot).findLegacy("owner/repo", 1),
     /inconsistent/i,
   );
 });
@@ -707,8 +651,9 @@ test("mixed association index rejects inconsistent stable/legacy claims for the 
 test("findAllLegacyByRepository enumerates only active, id-less records for exact-name migration candidates", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-legacy-enum-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-legacy-active",
     installationId: 10,
     repository: "owner/repo",
@@ -716,8 +661,8 @@ test("findAllLegacyByRepository enumerates only active, id-less records for exac
     baseSha: "base",
     headSha: "head",
     branch: "b",
-  });
-  await index.bind({
+  }]);
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-legacy-suspended",
     installationId: 10,
     repository: "owner/repo",
@@ -726,8 +671,8 @@ test("findAllLegacyByRepository enumerates only active, id-less records for exac
     headSha: "head",
     branch: "b",
     suspended: true,
-  });
-  await index.bind({
+  }]);
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-legacy-other-repo",
     installationId: 10,
     repository: "owner/other",
@@ -735,7 +680,7 @@ test("findAllLegacyByRepository enumerates only active, id-less records for exac
     baseSha: "base",
     headSha: "head",
     branch: "b",
-  });
+  }]);
   await index.withTransaction(async (transaction) =>
     transaction.bindStable({
       runId: "run-already-stable",
@@ -759,8 +704,9 @@ test("findAllLegacyByRepository enumerates only active, id-less records for exac
 test("suspendStable and suspendLegacy operate only on their own key namespace", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-suspend-split-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-legacy-suspend",
     installationId: 10,
     repository: "owner/repo",
@@ -768,7 +714,7 @@ test("suspendStable and suspendLegacy operate only on their own key namespace", 
     baseSha: "base",
     headSha: "head",
     branch: "b",
-  });
+  }]);
   await index.withTransaction(async (transaction) =>
     transaction.bindStable({
       runId: "run-stable-suspend",
@@ -786,7 +732,7 @@ test("suspendStable and suspendLegacy operate only on their own key namespace", 
     transaction.suspendStable(4321, 1, "authorization-revoked"),
   );
   assert.equal(suspendedStable?.suspended, true);
-  assert.equal((await index.find("owner/repo", 1))?.suspended, false);
+  assert.equal((await index.findLegacy("owner/repo", 1))?.suspended, false);
 
   const suspendedLegacy = await index.withTransaction(async (transaction) =>
     transaction.suspendLegacy("owner/repo", 1, "pull-request-closed"),
@@ -798,8 +744,9 @@ test("suspendStable and suspendLegacy operate only on their own key namespace", 
 test("findAllByInstallation returns both legacy and stable records for the same installation, sorted by name/pr/run", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-installation-mixed-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-legacy-mixed",
     installationId: 55,
     repository: "owner/legacy",
@@ -807,7 +754,7 @@ test("findAllByInstallation returns both legacy and stable records for the same 
     baseSha: "base",
     headSha: "head",
     branch: "b",
-  });
+  }]);
   await index.withTransaction(async (transaction) =>
     transaction.bindStable({
       runId: "run-stable-mixed",
@@ -821,7 +768,7 @@ test("findAllByInstallation returns both legacy and stable records for the same 
     }),
   );
   // Different installation: must not appear in results.
-  await index.bind({
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-other-installation",
     installationId: 56,
     repository: "owner/other",
@@ -829,7 +776,7 @@ test("findAllByInstallation returns both legacy and stable records for the same 
     baseSha: "base",
     headSha: "head",
     branch: "b",
-  });
+  }]);
 
   const all = await index.findAllByInstallation(55);
   assert.deepEqual(
@@ -852,12 +799,13 @@ test("findAllByInstallation returns both legacy and stable records for the same 
 
 // --- Step 4: explicit compatibility test ---
 
-test("a baseline name-keyed record stays reachable only through generic methods and a stable record only through explicit stable methods", async (t) => {
+test("an unmigrated name-keyed record stays reachable only through the explicit legacy methods and a stable record only through the stable methods", async (t) => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-compat-"));
   t.after(async () => rm(cwd, { recursive: true, force: true }));
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const index = new GitHubAssociationIndex(githubRoot);
 
-  await index.bind({
+  await seedLegacyAssociations(githubRoot, [{
     runId: "run-baseline",
     installationId: 10,
     repository: "owner/legacy-repo",
@@ -865,7 +813,7 @@ test("a baseline name-keyed record stays reachable only through generic methods 
     baseSha: "base",
     headSha: "head",
     branch: "maswe/baseline",
-  });
+  }]);
   await index.withTransaction(async (transaction) =>
     transaction.bindStable({
       runId: "run-stable-only",
@@ -879,23 +827,20 @@ test("a baseline name-keyed record stays reachable only through generic methods 
     }),
   );
 
-  // Baseline generic surface still sees the legacy record exactly as before #34.
-  assert.equal((await index.find("owner/legacy-repo", 4))?.runId, "run-baseline");
-  const legacyBranchMatches = await index.findAllByRepositoryBranch(
-    "owner/legacy-repo",
-    "maswe/baseline",
-  );
+  // The explicit legacy surface still sees an unmigrated pre-#34 record.
+  assert.equal((await index.findLegacy("owner/legacy-repo", 4))?.runId, "run-baseline");
+  const legacyBranchMatches = await index.findAllLegacyByRepository("owner/legacy-repo");
   assert.deepEqual(
     legacyBranchMatches.map((record) => record.runId),
     ["run-baseline"],
   );
 
-  // The stable record is invisible to the generic point lookup (`find`) under its real
-  // name. This test uses a different name AND branch than the legacy record above, so it
-  // does not by itself exercise `findAllByRepositoryBranch`'s name/branch filter against a
-  // same-name, same-branch stable record — that leak-closure is covered by the dedicated
-  // "findAllByRepositoryBranch (generic) excludes stable records" test below.
-  assert.equal(await index.find("owner/stable-repo", 4), undefined);
+  // A stable record is invisible to the legacy point lookup under its real name: a
+  // mutable name never resolves stable identity. The same-name leak closure on the
+  // legacy enumeration path is covered by the dedicated "findAllLegacyByRepository
+  // enumerates only active, id-less records" test above, which seeds a legacy and a
+  // stable record sharing both name and branch.
+  assert.equal(await index.findLegacy("owner/stable-repo", 4), undefined);
   // ...and reachable only through the explicit stable methods.
   assert.equal((await index.findStable(77_001, 4))?.runId, "run-stable-only");
   const stableBranchMatches = await index.findAllStableByRepositoryBranch(
@@ -905,41 +850,5 @@ test("a baseline name-keyed record stays reachable only through generic methods 
   assert.deepEqual(
     stableBranchMatches.map((record) => record.runId),
     ["run-stable-only"],
-  );
-});
-
-test("findAllByRepositoryBranch (generic) excludes stable records sharing the same name and branch as a legacy record", async (t) => {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-branch-leak-"));
-  t.after(async () => rm(cwd, { recursive: true, force: true }));
-  const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-
-  await index.bind({
-    runId: "run-legacy-shared",
-    installationId: 10,
-    repository: "owner/repo",
-    pullRequestNumber: 1,
-    baseSha: "base",
-    headSha: "head",
-    branch: "shared-branch",
-  });
-  await index.withTransaction(async (transaction) =>
-    transaction.bindStable({
-      runId: "run-stable-shared",
-      installationId: 10,
-      repositoryId: 9999,
-      repository: "owner/repo",
-      pullRequestNumber: 2,
-      baseSha: "base",
-      headSha: "head",
-      branch: "shared-branch",
-    }),
-  );
-
-  // Same repository name AND same branch on both records: only the difference between a
-  // legacy record (no repositoryId) and a stable record (has repositoryId) is exercised.
-  const matches = await index.findAllByRepositoryBranch("owner/repo", "shared-branch");
-  assert.deepEqual(
-    matches.map((record) => record.runId),
-    ["run-legacy-shared"],
   );
 });

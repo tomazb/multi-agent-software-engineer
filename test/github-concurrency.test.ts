@@ -32,7 +32,7 @@ function spawnStoreWorker(
   githubRoot: string,
   barrierPath: string,
   actor: string,
-  mode: "association" | "association-stable" | "check-create",
+  mode: "association-stable" | "check-create",
   extraEnv: Record<string, string>,
 ): { child: ChildProcess; next(type: WorkerMessage["type"]): Promise<WorkerMessage> } {
   const child = fork(workerPath, [], {
@@ -193,29 +193,6 @@ test("concurrent check publishers serialize creates for the same key", async (t)
   assert.equal(posts, 4);
 });
 
-test("separate processes concurrently binding two PRs preserve both association records", async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-lock-"));
-  const barrierPath = path.join(root, "association.start");
-  const first = spawnStoreWorker(root, barrierPath, "one", "association", {
-    MASWE_GITHUB_PULL_REQUEST_NUMBER: "1",
-  });
-  const second = spawnStoreWorker(root, barrierPath, "two", "association", {
-    MASWE_GITHUB_PULL_REQUEST_NUMBER: "2",
-  });
-  t.after(async () => {
-    await terminateWorkers([first.child, second.child]);
-    await rm(root, { recursive: true, force: true });
-  });
-  await Promise.all([first.next("READY"), second.next("READY")]);
-  await writeFile(barrierPath, "start\n", "utf8");
-  await Promise.all([expectCompleted(first), expectCompleted(second)]);
-  await waitForWorkers([first.child, second.child]);
-
-  const index = new GitHubAssociationIndex(root);
-  assert.equal((await index.find("owner/repo", 1))?.runId, "run-one");
-  assert.equal((await index.find("owner/repo", 2))?.runId, "run-two");
-});
-
 test("separate processes concurrently binding two stable PRs preserve both stable association records", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-stable-lock-"));
   const barrierPath = path.join(root, "association-stable.start");
@@ -277,15 +254,18 @@ test("association binding migrates the exact legacy associations.lock path", asy
     `${JSON.stringify({ pid: 999_999_999, token: "dead", at: "2026-08-09T10:00:00.000Z" })}\n`,
   );
 
-  await new GitHubAssociationIndex(root).bind({
-    runId: "run-migrated",
-    installationId: 41,
-    repository: "owner/repo",
-    pullRequestNumber: 3,
-    baseSha: "base",
-    headSha: "head",
-    branch: "migration",
-  });
+  await new GitHubAssociationIndex(root).withTransaction(async (transaction) =>
+    transaction.bindStable({
+      runId: "run-migrated",
+      installationId: 41,
+      repositoryId: 9090,
+      repository: "owner/repo",
+      pullRequestNumber: 3,
+      baseSha: "base",
+      headSha: "head",
+      branch: "migration",
+    }),
+  );
 
   assert.equal((await lstat(legacyPath)).isDirectory(), true);
   assert.equal(

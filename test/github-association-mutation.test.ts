@@ -44,9 +44,6 @@ function transactionDouble(): {
     throw new Error(`transaction.${name} must not be used by saveGitHubAssociationMutation`);
   };
   const transaction: GitHubAssociationTransaction = {
-    find: unsupported("find"),
-    bind: unsupported("bind"),
-    suspend: unsupported("suspend"),
     findStable: unsupported("findStable"),
     findLegacy: unsupported("findLegacy"),
     bindStable: unsupported("bindStable"),
