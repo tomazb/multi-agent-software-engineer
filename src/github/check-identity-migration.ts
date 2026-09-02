@@ -63,6 +63,17 @@ async function verifyLegacyCheckRun(options: {
     head_sha?: unknown;
     external_id?: unknown;
   };
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    typeof body.name !== "string" ||
+    typeof body.head_sha !== "string" ||
+    typeof body.external_id !== "string"
+  ) {
+    throw new Error(
+      "GitHub check-run alias verification response body is malformed",
+    );
+  }
   return (
     body.name === options.checkName &&
     body.head_sha === options.headSha &&
@@ -76,7 +87,11 @@ async function verifyLegacyCheckRun(options: {
  * Bounded/URL-safe pagination mirrors `checks.ts`'s reconciliation loop.
  * Duplicate rows for the same id (possible on pagination drift) collapse to
  * one match; genuinely distinct ids sharing the same external id are the
- * ambiguous-ownership conflict the caller must reject (step 6).
+ * ambiguous-ownership conflict the caller must reject (step 6). A row whose
+ * `external_id` matches but whose `id` is not a number is a malformed
+ * response and throws rather than being silently dropped -- dropping it
+ * could collapse a genuine multi-match conflict into a false single-match
+ * alias, consistent with the `check_runs` container check above.
  */
 async function listMatchingLegacyCheckRuns(options: {
   http: GitHubHttpClient;
@@ -114,9 +129,16 @@ async function listMatchingLegacyCheckRuns(options: {
       throw new Error("GitHub check-run alias listing response check_runs is malformed");
     }
     for (const run of checkRuns) {
-      if (run.external_id === options.legacyExternalId && typeof run.id === "number") {
-        matches.add(run.id);
+      if (run.external_id !== options.legacyExternalId) continue;
+      if (typeof run.id !== "number") {
+        // A matching row with a non-number id must never be silently
+        // dropped: that would collapse what could be a genuine two-match
+        // conflict into a false single-match alias.
+        throw new Error(
+          "GitHub check-run alias listing response check_runs entry is malformed",
+        );
       }
+      matches.add(run.id);
     }
 
     const nextLink = nextGitHubLink(response.headers);

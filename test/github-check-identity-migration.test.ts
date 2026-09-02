@@ -541,3 +541,185 @@ test("an outcome-unknown alias write is re-read and the alias continues once the
     kind: "check-run",
   });
 });
+
+test("a malformed legacy check-run verification response throws instead of silently producing no alias", async () => {
+  const sideEffects = await freshSideEffects();
+  const checkName = "MASWE / specification compliance";
+  await sideEffects.put(legacyKeyFor(checkName), { resourceId: 42, kind: "check-run" });
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET" && url.includes("/check-runs/42")) {
+        // external_id is missing entirely: a malformed 2xx body, not a
+        // legitimate wrong-owner mismatch.
+        return {
+          status: 200,
+          headers: {},
+          body: { name: checkName, head_sha: HEAD_SHA },
+        };
+      }
+      if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
+      throw new Error(`Unexpected ${method} ${url}`);
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      aliasLegacyAttemptOneChecks({
+        repositoryId: REPOSITORY_ID,
+        legacyRepository: LEGACY_REPOSITORY,
+        repository: REPOSITORY,
+        pullRequestNumber: PULL_REQUEST_NUMBER,
+        headShas: [HEAD_SHA],
+        token: "token",
+        http,
+        sideEffects,
+      }),
+    /malformed/i,
+  );
+
+  assert.equal(
+    await sideEffects.get(stableKeyFor(checkName)),
+    undefined,
+    "a malformed verification response must never be treated as absence and must never alias",
+  );
+});
+
+test("a matching legacy-listing row with a non-number id is a malformed response, not a silent drop that collapses a conflict into a false alias", async () => {
+  const sideEffects = await freshSideEffects();
+  const checkName = "MASWE / specification compliance";
+  const matchingExternalId = legacyExternalIdFor(checkName);
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET" && url.includes("check_name=")) {
+        const name = new URL(url).searchParams.get("check_name")!;
+        if (name === checkName) {
+          return {
+            status: 200,
+            headers: {},
+            body: {
+              check_runs: [
+                { id: 31, external_id: matchingExternalId },
+                // A second row that also matches the legacy external id but
+                // carries a non-number id: this must never silently drop out
+                // of the match set and collapse a two-match conflict into a
+                // false single-match alias.
+                { id: "not-a-number", external_id: matchingExternalId },
+              ],
+            },
+          };
+        }
+        return { status: 200, headers: {}, body: { check_runs: [] } };
+      }
+      throw new Error(`Unexpected ${method} ${url}`);
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      aliasLegacyAttemptOneChecks({
+        repositoryId: REPOSITORY_ID,
+        legacyRepository: LEGACY_REPOSITORY,
+        repository: REPOSITORY,
+        pullRequestNumber: PULL_REQUEST_NUMBER,
+        headShas: [HEAD_SHA],
+        token: "token",
+        http,
+        sideEffects,
+      }),
+    /malformed/i,
+  );
+
+  assert.equal(
+    await sideEffects.get(stableKeyFor(checkName)),
+    undefined,
+    "a malformed matching row must never collapse a would-be conflict into a false single-match alias",
+  );
+});
+
+test("an outcome-unknown alias write whose re-read disagrees rethrows the original error", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-check-alias-outcome-unknown-mismatch-"));
+  const checkName = "MASWE / specification compliance";
+  const stableKey = stableKeyFor(checkName);
+  await new GitHubSideEffectStore(root).put(legacyKeyFor(checkName), {
+    resourceId: 71,
+    kind: "check-run",
+  });
+
+  let failSyncOnce = true;
+
+  // GitHubSideEffectStore.get/put are public, so a subclass overriding get
+  // to disagree with what was just (attempted-)written is a real, available
+  // seam for exercising the outcome-unknown re-read's negative branch --
+  // without this override the real store's atomic-rename design makes that
+  // branch effectively unreachable.
+  class MismatchingReReadStore extends GitHubSideEffectStore {
+    private readonly interceptedKey: string;
+    private stableKeyGetCalls = 0;
+
+    constructor(interceptedKey: string) {
+      super(root, {
+        syncDirectory: async () => {
+          if (failSyncOnce) {
+            failSyncOnce = false;
+            throw new Error("simulated directory sync failure");
+          }
+        },
+      });
+      this.interceptedKey = interceptedKey;
+    }
+
+    override async get(idempotencyKey: string) {
+      if (idempotencyKey === this.interceptedKey) {
+        this.stableKeyGetCalls += 1;
+        // The first get(stableKey) is aliasOneCheck's "already migrated?"
+        // guard, which must see nothing yet so the alias attempt proceeds.
+        // Only the second call -- the outcome-unknown re-read -- disagrees.
+        if (this.stableKeyGetCalls > 1) {
+          return { resourceId: 999999, kind: "check-run" as const };
+        }
+      }
+      return super.get(idempotencyKey);
+    }
+  }
+
+  const sideEffects = new MismatchingReReadStore(stableKey);
+  const http: GitHubHttpClient = {
+    async request(method, url) {
+      if (method === "GET" && url.includes("/check-runs/71")) {
+        return {
+          status: 200,
+          headers: {},
+          body: { name: checkName, head_sha: HEAD_SHA, external_id: legacyExternalIdFor(checkName) },
+        };
+      }
+      if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
+      throw new Error(`Unexpected ${method} ${url}`);
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      aliasLegacyAttemptOneChecks({
+        repositoryId: REPOSITORY_ID,
+        legacyRepository: LEGACY_REPOSITORY,
+        repository: REPOSITORY,
+        pullRequestNumber: PULL_REQUEST_NUMBER,
+        headShas: [HEAD_SHA],
+        token: "token",
+        http,
+        sideEffects,
+      }),
+    (error: unknown) => {
+      // The original outcome-unknown error itself must be rethrown -- never
+      // swallowed, and never replaced by a different error about the
+      // mismatch.
+      assert.ok(error instanceof Error);
+      assert.equal((error as Error).name, "DurableAtomicWriteOutcomeUnknownError");
+      assert.match((error as Error).message, /directory sync failed/);
+      assert.match(String((error as Error).cause), /simulated directory sync failure/);
+      return true;
+    },
+    "the original write error must be rethrown, never swallowed or replaced, when the re-read disagrees",
+  );
+  assert.equal(failSyncOnce, false, "the injected directory-sync failure must have fired exactly once");
+});
