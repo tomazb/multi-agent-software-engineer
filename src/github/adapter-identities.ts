@@ -41,6 +41,17 @@ export function isRepositoryIdAllowed(
 }
 
 /**
+ * The single validity predicate for a stable repository id: a positive safe
+ * integer. Every guard that decides whether a record/association is stable
+ * must delegate here so their strictness cannot drift apart.
+ */
+export function isStableRepositoryId(repositoryId: number | undefined): repositoryId is number {
+  return (
+    typeof repositoryId === "number" && Number.isSafeInteger(repositoryId) && repositoryId > 0
+  );
+}
+
+/**
  * Rejects unresolved legacy state before any stable repository/PR publication
  * fence is acquired (design doc §8).
  *
@@ -57,12 +68,7 @@ export function requireStableGitHubAssociation(
       "GitHub association is missing its stable repository id; explicit migration is required",
     );
   }
-  const { repositoryId } = association;
-  if (
-    typeof repositoryId !== "number" ||
-    !Number.isSafeInteger(repositoryId) ||
-    repositoryId <= 0
-  ) {
+  if (!isStableRepositoryId(association.repositoryId)) {
     throw new Error(
       `GitHub association ${association.repository}#${association.pullRequestNumber} is missing its stable repository id; explicit migration is required`,
     );

@@ -14,6 +14,7 @@ import { saveGitHubAssociationMutation } from "./association-mutation.ts";
 import {
   githubStateRoot,
   isRepositoryIdAllowed,
+  isStableRepositoryId,
   parseOwnerRepo,
   pendingCancellationHeads,
   remoteMatchesRepository,
@@ -65,7 +66,7 @@ type AssociationRoutingIdentity = Pick<
 type StableAssociationRecord = AssociationRecord & { repositoryId: number };
 
 function requireStableAssociationRecord(record: AssociationRecord): StableAssociationRecord {
-  if (record.repositoryId === undefined) {
+  if (!isStableRepositoryId(record.repositoryId)) {
     throw new Error(
       `GitHub association ${record.repository}#${record.pullRequestNumber} is missing its stable repository id; explicit migration is required`,
     );
@@ -781,7 +782,6 @@ export class GitHubAppAdapter {
     });
   }
 
-
   /**
    * Typed dispatch disposition (design doc §16). A permanent identity/policy
    * rejection is reported so the delivery is durably consumed with zero
@@ -1075,8 +1075,8 @@ export class GitHubAppAdapter {
    *
    * A new ID-bearing event selects stable records BY stable id. A historical
    * ID-less event selects ONLY unresolved legacy records by exact installation
-   * plus normalized legacy name (design doc §6.2): it can neither assign an id,
-   * refresh a canonical name, nor touch a stable-ID association by name.
+   * plus exact legacy name match (design doc §6.2): it can neither assign an
+   * id, refresh a canonical name, nor touch a stable-ID association by name.
    */
   private async suspendRemovedRepositories(
     event: GitHubInternalEvent,
@@ -1268,8 +1268,9 @@ export class GitHubAppAdapter {
 
   /**
    * Push fan-out. Targets are selected by stable id and branch, never by the
-   * mutable repository name. Runs under the already-held repository-identity
-   * fence with the reconciled canonical name.
+   * mutable repository name. Runs after the `repository-identity` entry fence
+   * has been released, with the reconciled canonical name; it must not assume
+   * repository-wide serialization.
    */
   private async handlePushEvent(
     event: GitHubInternalEvent,
@@ -1327,11 +1328,12 @@ export class GitHubAppAdapter {
   }
 
   /**
-   * Stable pull request handling. Runs under the already-held
-   * `repository-identity(repositoryId)` fence with the reconciled canonical
-   * name, and acquires `publication(repositoryId#pr)` ->
-   * `association-identity(repositoryId#pr)` -> run target fence -> global
-   * association transaction, in exactly that order.
+   * Stable pull request handling. Runs after the `repository-identity` entry
+   * fence has been released, with the reconciled canonical name; it must not
+   * assume repository-wide serialization. Acquires
+   * `publication(repositoryId#pr)` -> `association-identity(repositoryId#pr)`
+   * -> run target fence -> global association transaction, in exactly that
+   * order.
    */
   private async handlePullRequestEvent(
     event: GitHubInternalEvent,
