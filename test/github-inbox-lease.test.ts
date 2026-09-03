@@ -15,6 +15,7 @@ function event(deliveryId: string): GitHubInternalEvent {
   return {
     eventId: deliveryId,
     type: "push",
+    repositoryId: 1308655205,
     repository: "owner/repo",
     installationId: 44,
     headSha: "sha",

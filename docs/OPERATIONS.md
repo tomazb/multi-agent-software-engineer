@@ -35,9 +35,10 @@ git fetch origin --prune
 ```
 
 Review external CI, Cursor Cloud projects, GitHub App allowlists, webhook deployments, bookmarks,
-and scripts that may store the former full repository name. Issue #34 tracks stable repository
-identity and governed rename reconciliation for persisted MASWE GitHub associations. Do not
-hand-edit `.maswe` run records, association indexes, or immutable journals.
+and scripts that may store the former full repository name. MASWE itself keys GitHub authorization,
+association, locking, credential scope, and check ownership on the immutable numeric repository ID;
+see "GitHub stable repository identity cutover" below for the required migration. Do not hand-edit
+`.maswe` run records, association indexes, or immutable journals.
 
 With another environment manager, select a supported Node binary and run the same npm commands. Normal installation and repository scripts reject unsupported versions through package engines, `engine-strict`, and the dependency-free guard. Direct CLI execution applies the same policy before repository or durable-state actions.
 
@@ -248,11 +249,20 @@ Cursor CLI assistant extraction and terminal markers:
 
 ### GitHub App Phase A operations
 
-When `githubApp.enabled` is true, `readOnlyChecks` must be true and
-`allowedRepositories` must contain at least one `owner/repo`. A disabled configuration may retain
-an empty list.
+When `githubApp.enabled` is true, `readOnlyChecks` must be true and at least one of
+`allowedRepositoryIds` or `allowedRepositories` must be non-empty, so a historical name-only
+project configuration still loads for offline inspection and migration preparation. A disabled
+configuration may retain empty lists.
 
-`maswe github-webhook` probes all required journals, enumerates every exact retained legacy
+Only `allowedRepositoryIds` authorizes anything. Every repository-scoped association,
+reconciliation, credential mint, workflow mutation, and check publication requires a non-empty live
+`allowedRepositoryIds` containing the exact target ID. `allowedRepositories` survives solely to
+load historical configuration during migration, to select and diagnose unresolved legacy records,
+and to display operator context; a name in that list grants nothing. Obtain each ID once with an
+authenticated request such as `gh api repos/<owner>/<repo> --jq .id`.
+
+`maswe github-webhook` refuses to reach listener readiness while `allowedRepositoryIds` is empty.
+It then probes all required journals, enumerates every exact retained legacy
 per-check lock, migrates the legacy flat delivery directory,
 recovers interrupted queue leases, and starts one worker before the listener becomes ready.
 `maswe github-publish-checks <run-id>` probes association, check-create, and per-PR publication
@@ -327,6 +337,143 @@ After the new listener acknowledges traffic, rollback to an old binary or restor
 pre-upgrade backup can strand accepted work. Stop traffic and roll forward with the complete state
 tree. Archive the whole tree only after permanent endpoint disablement and webhook-secret
 rotation/revocation.
+
+### GitHub journals and lock order
+
+`.maswe/github/journals/` holds one immutable journal per kind. Beyond `association`,
+`check-create`, and `delivery`, three kinds are keyed by stable repository identity:
+
+| Kind | Key | Serializes |
+|---|---|---|
+| `repository-identity` | `<repositoryId>` | Legacy identity migration, canonical-name reconciliation, repository authorization suspension/recovery, repository-scoped publication entry |
+| `publication` | `<repositoryId>#<pullRequestNumber>` | Per-PR check publication |
+| `association-identity` | `<repositoryId>#<pullRequestNumber>` | Per-PR association identity |
+
+Every stable operational path takes locks in exactly this order:
+
+```text
+repository-identity(repositoryId)
+  -> publication / association-identity(repositoryId#pullRequestNumber)
+    -> run target mutation fence(runId)
+      -> global association transaction
+```
+
+Authority-reducing removal of an unresolved pre-#34 legacy association (an association with no
+`repositoryId`, for example under `installation.deleted`) is the one legacy-only path. It uses the
+common suffix only:
+
+```text
+run target mutation fence(runId)
+  -> global association transaction
+```
+
+That branch never acquires a name-keyed publication or association-identity fence and never
+invents a repository-ID fence for a record that has no ID. No code path may invert
+`association transaction -> run target fence`. Do not prune any journal directory.
+
+### GitHub stable repository identity cutover
+
+Repository authorization, association keys, publication and association-identity fences,
+installation-token scope, and check idempotency keys are all derived from the immutable numeric
+repository ID. Pre-#34 state is keyed by the mutable `owner/repo` name and must be migrated.
+
+**Migration is required for every repository that holds pre-#34 MASWE GitHub state, not only
+repositories that were renamed.** Check ownership is keyed by repository ID, so after the cutover
+every pre-#34 check carries a legacy, name-derived external ID that the stable key cannot find. An
+operator who migrates only renamed repositories silently duplicates every check run on the first
+post-cutover publication of every unmigrated repository.
+
+**The two unmigrated cases fail differently, and not the way intuition suggests.** The dispatch
+gate and the run identity guards look for an unresolved legacy record under the *reconciled current*
+repository name, never under the name the record was keyed with:
+
+- **Unmigrated and never renamed** — the current name still equals the legacy key, so the gate finds
+  the unresolved record and fails closed: the delivery is permanently rejected with
+  `legacy-repository-identity-missing`, consumed rather than retried, and counted in
+  `permanentRepositoryDropsSinceStart`. Loud, safe, and visible.
+- **Unmigrated *and* renamed** — the current name no longer matches the legacy key, so the gate
+  cannot see the unresolved record at all. Nothing fails: publication proceeds under the stable ID
+  and duplicates every check run, because the pre-#34 checks carry name-derived external IDs the
+  stable key cannot find. Silent.
+
+So the renamed repository is the dangerous one, not the safe one. Neither case is a substitute for
+migration; the only signal that the renamed case went wrong is duplicate check runs on the pull
+request.
+
+Run the cutover in exactly this order:
+
+1. Stop every pre-#34 `maswe github-webhook` listener and every manual GitHub publisher. Process
+   quiescence of all old binaries is a hard precondition, not merely a lock observation: a pre-#34
+   name-keyed lock and a #34 ID-keyed lock are different lock identities and do not exclude each
+   other.
+2. Install the new binary and put the approved `allowedRepositoryIds` into the live configuration
+   **before starting any new listener**.
+3. With listeners and manual publishers still stopped, run the migration. It performs a read-only
+   legacy-journal ownership preflight and refuses to proceed while a live legacy name-keyed
+   publication or association-identity owner is observed.
+4. Finish the required migrations for every repository holding pre-#34 state:
+
+   ```bash
+   maswe github-migrate-repository --from <legacy-owner/repo> --repository-id <id> [--json]
+   ```
+
+   `--from` is a local selector only and never identity proof: it selects unresolved legacy records
+   and derives pre-#34 lock and check keys, and it is normalized to lowercase before use. The
+   supplied `--repository-id` is the sole identity anchor and is proved live on every invocation.
+   The command requires GitHub App credentials and a live allowlist containing the ID, holds the
+   `repository-identity` fence, and never starts a listener or worker. It is restartable: rerunning
+   it after an interruption resumes from its durable checkpoint.
+5. Only after migration completes, start the new `maswe github-webhook` listener and resume manual
+   publication.
+6. Inspect the GitHub App delivery history for the deliberate listener outage and explicitly
+   redeliver every delivery GitHub reports as failed during the maintenance window. MASWE does not
+   claim such transport-failed deliveries were durably received.
+
+Suspended pre-#34 legacy associations **are** migrated, exactly like active ones. A suspension is
+reversible — reopening a closed pull request un-suspends an association suspended
+`pull-request-closed` — so a suspended record is not inert and must not be stranded under the
+mutable name. Migration carries suspension state and suspension reason through unchanged: a record
+that arrives suspended leaves suspended, under its stable `<repositoryId>#<pr>` key, and appears in
+migration output as a candidate reported `suspended`. Migration never resumes a suspended
+association; only the normal pull-request lifecycle does that, and after migration it can, because
+the reopened pull request now resolves to a stable record instead of being permanently rejected.
+
+Run and index must agree on suspension state for an unresolved legacy candidate. A record suspended
+on one half only stops the migration with `run-index-conflict`; MASWE never picks one persisted
+copy as probably correct. Reconcile the split by hand and rerun.
+
+`no-migration-candidates` means the selector matched **nothing**: no unresolved legacy record is
+keyed under `--from`, and no stable record carries `--repository-id`. It is benign when the
+repository genuinely holds no pre-#34 MASWE GitHub state. It is not reported after a successful
+migration — the migrated records are stable and still carry the ID, so a rerun converges instead of
+reporting an empty universe. If you expected candidates, suspect the selector rather than the state:
+`--from` must be the exact pre-rename `owner/repo` the records were keyed with (it is lowercased
+before use), and `--repository-id` must be the ID those records belong to.
+
+Once migrated state and the new fields are written, downgrade to a pre-#34 binary is unsupported.
+Old binaries are expected to fail closed on exact validation rather than silently ignoring stable
+identity and resuming name-authoritative behavior. Roll forward with the complete state tree
+instead of restoring an older binary.
+
+Migration checkpoints live under `.maswe/github/`. A stray durable `.tmp` residue file left by an
+interrupted checkpoint write is skipped rather than treated as fatal. Any *other* unrecognized file
+in the checkpoint directory still fails closed, and the error names the exact file: remove exactly
+the named file and rerun, and do not clear the directory wholesale.
+
+If a listener was started against name-only configuration in violation of this order, signed
+ingress may still be durably accepted, but repository-scoped dispatch receives a permanent
+`stable-repository-authorization-required` disposition, cannot mutate authority, and is counted in
+the process-local `permanentRepositoryDropsSinceStart` diagnostic counter. That counter saturates
+at `Number.MAX_SAFE_INTEGER`, resets on process restart, is never persisted, and is emitted only
+through the listener diagnostic callback. A non-zero count means deliveries were permanently
+consumed for identity or policy reasons; fix configuration and migration state rather than
+redelivering blindly. Correctness never depends on replaying such deliveries: migration and later
+manual publication re-read authoritative live repository and PR state.
+
+Canonical-name lookup traverses at most 100 bounded `per_page=100` pages, so an installation with
+more than 10,000 repositories reports `traversal-limit-exceeded`. That is an ambiguous failure, not
+proof that the repository is absent or that access was revoked. Narrow the installation's
+repository scope and retry.
 
 GitHub association publication is event-free and rollback-capable; workflow request and retarget
 events publish only after association commit and are never rolled back. If association processing

@@ -1,5 +1,4 @@
 import type { GitHubAppConfig, MasweConfig, RunRecord } from "../domain.ts";
-import { containsDurableAtomicWriteOutcomeUnknown } from "../durable-file.ts";
 import { invalidateStaleEvidence } from "../git-workspace.ts";
 import {
   requiresSameTargetEvidenceRecovery,
@@ -11,16 +10,33 @@ import {
   GitHubAssociationIndex,
   type GitHubAssociationTransaction,
 } from "./association.ts";
+import { saveGitHubAssociationMutation } from "./association-mutation.ts";
 import {
-  isRepoAllowed,
   githubStateRoot,
+  isRepositoryIdAllowed,
+  isStableRepositoryId,
   parseOwnerRepo,
   pendingCancellationHeads,
   remoteMatchesRepository,
+  requireStableGitHubAssociation,
 } from "./adapter-identities.ts";
 export { remoteMatchesRepository } from "./adapter-identities.ts";
 import { CheckPublisher, type GitHubHttpClient } from "./checks.ts";
+import { readGitHubPullRequestSnapshot } from "./pull-request.ts";
+import { lookupCanonicalGitHubRepository } from "./repository-identity.ts";
+import type {
+  GitHubInstallationTokenPurpose,
+  GitHubRepositoryTokenProvider,
+} from "./token.ts";
 import { GitHubDeliveryInbox } from "./delivery-inbox.ts";
+import {
+  type GitHubDispatchResult,
+  type GitHubPermanentRejectContext,
+  type GitHubPermanentRepositoryRejectReason,
+  GitHubPermanentRepositoryDropDiagnostic,
+  nextPermanentRepositoryDropCount,
+  settleGitHubDispatchResult,
+} from "./dispatch-disposition.ts";
 import { GitHubSideEffectStore } from "./side-effect-store.ts";
 import {
   initializeGitHubJournals,
@@ -41,38 +57,35 @@ export {
   type GitHubWebhookDiagnosticCode,
 } from "./webhook-diagnostic.ts";
 
-function eventHistoryIdentity(events: RunRecord["events"]): string {
-  return JSON.stringify(events.map((event) => ({
-    id: event.id,
-    at: event.at,
-    type: event.type,
-    actor: event.actor,
-    from: event.from,
-    to: event.to,
-    details: event.details,
-  })));
-}
-
-function associationRollbackInvariant(run: RunRecord): string {
-  const record = structuredClone(run) as unknown as Record<string, unknown>;
-  delete record.version;
-  delete record.updatedAt;
-  delete record.github;
-  delete record.evidence;
-  return JSON.stringify(record);
-}
-
 type AssociationRoutingIdentity = Pick<
   AssociationRecord,
   "runId" | "installationId" | "repository" | "pullRequestNumber" | "headSha"
->;
+> & { repositoryId: number };
+
+/** A stable association record whose `repositoryId` is proven present. */
+type StableAssociationRecord = AssociationRecord & { repositoryId: number };
+
+function requireStableAssociationRecord(record: AssociationRecord): StableAssociationRecord {
+  if (!isStableRepositoryId(record.repositoryId)) {
+    throw new Error(
+      `GitHub association ${record.repository}#${record.pullRequestNumber} is missing its stable repository id; explicit migration is required`,
+    );
+  }
+  return record as StableAssociationRecord;
+}
+
+/** Outcome of the live canonical-name reconciliation described in design doc §10. */
+type CanonicalReconciliation =
+  | { kind: "reconciled"; repository: string }
+  | { kind: "absent" };
 
 export class GitHubAppAdapter {
   private readonly cwd: string;
   private readonly config: MasweConfig;
   private readonly store: RunStore;
   private readonly http: GitHubHttpClient;
-  private readonly tokenProvider: (installationId: number, repository: string) => Promise<string>;
+  /** The only credential source for stable repository operations; no name fallback exists. */
+  private readonly repositoryTokenProvider: GitHubRepositoryTokenProvider | undefined;
   private readonly inbox: GitHubDeliveryInbox;
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly associations: GitHubAssociationIndex;
@@ -91,13 +104,23 @@ export class GitHubAppAdapter {
   private readonly synchronousWebhookDispatch: boolean;
   private readonly beforeInboxEnqueue: (() => Promise<void>) | undefined;
   private readonly onWebhookDiagnostic: ((error: unknown) => void) | undefined;
+  /**
+   * Process-local `permanentRepositoryDropsSinceStart` (design doc §16).
+   *
+   * Saturating positive safe integer, reset by process restart, never
+   * persisted and never exposed through `doctor`: its only defined reader is
+   * the listener diagnostic callback. Observability only -- it never changes
+   * dispatch, retry, authorization, or migration behavior.
+   */
+  private permanentRepositoryDropsSinceStart = 0;
 
   constructor(options: {
     cwd: string;
     config: MasweConfig;
     store: RunStore;
     http: GitHubHttpClient;
-    tokenProvider: (installationId: number, repository: string) => Promise<string>;
+    /** Stable operational credential source: `(installationId, repositoryId, purpose)`. */
+    repositoryTokenProvider?: GitHubRepositoryTokenProvider;
     /** Test/embedded seam; the CLI starts recovery explicitly before listening. */
     autoStartWebhookWorker?: boolean;
     /** Deterministic legacy-dispatch seam used only by focused adapter tests. */
@@ -125,7 +148,7 @@ export class GitHubAppAdapter {
     this.config = options.config;
     this.store = options.store;
     this.http = options.http;
-    this.tokenProvider = options.tokenProvider;
+    this.repositoryTokenProvider = options.repositoryTokenProvider;
     this.afterManualRunLoaded = options.afterManualRunLoaded;
     this.beforeAssociationTransaction = options.beforeAssociationTransaction;
     this.afterAssociationCommitBeforeRouting = options.afterAssociationCommitBeforeRouting;
@@ -150,6 +173,7 @@ export class GitHubAppAdapter {
       enabled: options.autoStartWebhookWorker ?? false,
       dispatch: (event) => this.dispatch(event, this.githubApp()),
       onDiagnostic: (error) => this.emitWebhookDiagnostic(error),
+      onPermanentRejectCompleted: (context) => this.recordPermanentRepositoryDrop(context),
       ...(options.onWebhookWorkerSchedule
         ? { onSchedule: options.onWebhookWorkerSchedule }
         : {}),
@@ -283,8 +307,20 @@ export class GitHubAppAdapter {
         return { status: 202, body: { ok: true, duplicate: true } };
       }
       try {
-        await this.dispatch(claimed.record.event, this.githubApp());
-        await this.inbox.complete(claimed.record.deliveryId, claimed.record.leaseId);
+        const result = await this.dispatch(claimed.record.event, this.githubApp());
+        // Same classification and same post-completion ordering as the
+        // background worker (design doc §16).
+        await settleGitHubDispatchResult({
+          result,
+          complete: () =>
+            this.inbox.complete(claimed.record.deliveryId, claimed.record.leaseId),
+          onPermanentRejectCompleted: (reason) => this.recordPermanentRepositoryDrop({
+            deliveryId: claimed.record.deliveryId,
+            eventName: claimed.record.eventName ?? prepared.eventName,
+            attempt: claimed.record.attempt,
+            reason,
+          }),
+        });
         return { status: 200, body: { ok: true } };
       } catch (error) {
         await this.inbox.retry(claimed.record.deliveryId, claimed.record.leaseId);
@@ -306,6 +342,22 @@ export class GitHubAppAdapter {
     this.webhookWorker.start();
   }
 
+  /**
+   * Counts one permanently consumed repository-scoped delivery and emits its
+   * bounded diagnostic. Only ever reached after `inbox.complete()` succeeded,
+   * so a failed completion is never counted and its later successful
+   * completion counts exactly once.
+   */
+  private recordPermanentRepositoryDrop(context: GitHubPermanentRejectContext): void {
+    this.permanentRepositoryDropsSinceStart = nextPermanentRepositoryDropCount(
+      this.permanentRepositoryDropsSinceStart,
+    );
+    this.emitWebhookDiagnostic(new GitHubPermanentRepositoryDropDiagnostic({
+      ...context,
+      count: this.permanentRepositoryDropsSinceStart,
+    }));
+  }
+
   private emitWebhookDiagnostic(error: unknown): void {
     try {
       this.onWebhookDiagnostic?.(error);
@@ -322,6 +374,14 @@ export class GitHubAppAdapter {
     return this.webhookWorker.stop(options);
   }
 
+  /**
+   * Manual publication after rename (design doc §17).
+   *
+   * Load run -> require a stable association -> require the stable ID live
+   * allowlisted -> stable repository fence -> canonical-name reconciliation ->
+   * PR/publication fence -> reload/re-prove -> ID-scoped PR read proving
+   * `base.repo.id` -> stale-head invalidation -> publish.
+   */
   async publishChecksForRun(runId: string): Promise<RunRecord> {
     await this.initializeManualPublisher();
     const app = this.githubApp();
@@ -329,138 +389,221 @@ export class GitHubAppAdapter {
     if (!initial.github) {
       throw new Error(`Run ${runId} has no github association`);
     }
+    const stable = requireStableGitHubAssociation(initial.github);
+    const { repositoryId, pullRequestNumber, installationId } = stable;
+    if (!isRepositoryIdAllowed(app, repositoryId)) {
+      throw new Error(`Repository id ${repositoryId} is not allowlisted`);
+    }
     await this.afterManualRunLoaded?.(runId);
-    return this.withPublicationFence(
-      initial.github.repository,
-      initial.github.pullRequestNumber,
-      async () => {
-        const beforeLiveHead = await this.store.load(runId);
-        if (!beforeLiveHead.github) {
-          throw new Error(`Run ${runId} has no github association`);
-        }
-        if (
-          beforeLiveHead.github.repository !== initial.github!.repository ||
-          beforeLiveHead.github.pullRequestNumber !== initial.github!.pullRequestNumber
-        ) {
-          throw new Error(`Run ${runId} github association changed during publication`);
-        }
-        if (beforeLiveHead.github.suspended) {
-          throw new Error(`Run ${runId} github association is suspended`);
-        }
-        if (!isRepoAllowed(app, beforeLiveHead.github.repository)) {
-          throw new Error(`Repository ${beforeLiveHead.github.repository} is not allowlisted`);
-        }
-        const livePullRequest = await this.currentPullRequest(
-          beforeLiveHead.github.repository,
-          beforeLiveHead.github.pullRequestNumber,
-          beforeLiveHead.github.installationId,
+    // §9/§17: the repository-identity fence covers publication ENTRY -- the
+    // canonical-name reconciliation -- and is released before the per-pull-request
+    // publication fence, so unrelated pull requests in the same repository stay
+    // independent while the acquisition order stays exact.
+    const reconciliation = await this.withRepositoryIdentityFence(repositoryId, () =>
+      this.reconcileCanonicalRepository(repositoryId, installationId));
+    if (reconciliation.kind === "absent") {
+      throw new Error(
+        `Repository id ${repositoryId} is no longer accessible to installation ${installationId}`,
+      );
+    }
+    const repository = reconciliation.repository;
+    return this.withPublicationFence(repositoryId, pullRequestNumber, async () => {
+      const beforeLiveHead = await this.store.load(runId);
+      if (!beforeLiveHead.github) {
+        throw new Error(`Run ${runId} has no github association`);
+      }
+      const reloaded = requireStableGitHubAssociation(beforeLiveHead.github);
+      if (
+        reloaded.repositoryId !== repositoryId ||
+        reloaded.pullRequestNumber !== pullRequestNumber
+      ) {
+        throw new Error(`Run ${runId} github association changed during publication`);
+      }
+      if (reloaded.suspended) {
+        throw new Error(`Run ${runId} github association is suspended`);
+      }
+      if (!isRepositoryIdAllowed(app, reloaded.repositoryId)) {
+        throw new Error(`Repository id ${reloaded.repositoryId} is not allowlisted`);
+      }
+      const readToken = await this.repositoryToken(
+        installationId,
+        repositoryId,
+        "pull-request-read",
+      );
+      const snapshot = await readGitHubPullRequestSnapshot({
+        http: this.http,
+        token: readToken,
+        repository,
+        pullRequestNumber,
+      });
+      if (snapshot.baseRepositoryId !== repositoryId) {
+        throw new Error(
+          `Pull request ${repository}#${pullRequestNumber} targets repository id ${snapshot.baseRepositoryId}, not ${repositoryId}`,
         );
-        if (livePullRequest.state !== "open") {
-          throw new Error(`Pull request ${beforeLiveHead.github.repository}#${beforeLiveHead.github.pullRequestNumber} is not open`);
-        }
-        const liveHead = livePullRequest.headSha;
-        const publication = await this.withAssociationIdentityFence(
-          beforeLiveHead.github.repository,
-          beforeLiveHead.github.pullRequestNumber,
-          () =>
-            this.withRunTargetMutationFence(runId, () =>
-              this.associations.withTransaction(async (transaction) => {
-                const indexed = transaction.find(
-                  beforeLiveHead.github!.repository,
-                  beforeLiveHead.github!.pullRequestNumber,
+      }
+      if (snapshot.state !== "open") {
+        throw new Error(`Pull request ${repository}#${pullRequestNumber} is not open`);
+      }
+      const liveHead = snapshot.headSha;
+      const publication = await this.withAssociationIdentityFence(
+        repositoryId,
+        pullRequestNumber,
+        () =>
+          this.withRunTargetMutationFence(runId, () =>
+            this.associations.withTransaction(async (transaction) => {
+              const indexed = transaction.findStable(repositoryId, pullRequestNumber);
+              if (
+                indexed?.suspended === true &&
+                indexed.suspensionReason === "authorization-revoked"
+              ) {
+                throw new Error(
+                  `GitHub association ${indexed.repository}#${indexed.pullRequestNumber} is suspended because authorization was revoked`,
                 );
-                if (
-                  indexed?.suspended === true &&
-                  indexed.suspensionReason === "authorization-revoked"
-                ) {
-                  throw new Error(
-                    `GitHub association ${indexed.repository}#${indexed.pullRequestNumber} is suspended because authorization was revoked`,
-                  );
-                }
-                const run = await this.store.load(runId);
-                if (!run.github) {
-                  throw new Error(`Run ${runId} has no github association`);
-                }
-                if (
-                  run.github.repository !== beforeLiveHead.github!.repository ||
-                  run.github.pullRequestNumber !== beforeLiveHead.github!.pullRequestNumber
-                ) {
-                  throw new Error(`Run ${runId} github association changed during publication`);
-                }
-                if (run.github.suspended) {
-                  throw new Error(`Run ${runId} github association is suspended`);
-                }
-                const previousHeadSha = run.github.headSha || run.workspace?.headSha;
-                if (!previousHeadSha) {
-                  throw new Error(`Run ${runId} has no head SHA for checks`);
-                }
-                const pendingHeadShas = pendingCancellationHeads(
-                  run.github.pendingCancellationHeadShas,
-                  previousHeadSha,
-                  liveHead,
-                );
-                if (liveHead !== previousHeadSha) {
-                  const before = structuredClone(run);
-                  invalidateStaleEvidence(run, liveHead);
-                  run.github = {
-                    ...run.github,
-                    headSha: liveHead,
-                    ...(pendingHeadShas.length > 0
-                      ? { pendingCancellationHeadShas: pendingHeadShas }
-                      : {}),
-                  };
-                  if (pendingHeadShas.length === 0) {
-                    delete run.github.pendingCancellationHeadShas;
-                  }
-                  await this.saveAssociationMutation(before, run, transaction);
-                }
-                const committedAssociation = transaction.bind({
-                  runId: run.id,
-                  installationId: run.github.installationId,
-                  repository: run.github.repository,
-                  pullRequestNumber: run.github.pullRequestNumber,
-                  baseSha: run.github.baseSha,
+              }
+              const run = await this.store.load(runId);
+              if (!run.github) {
+                throw new Error(`Run ${runId} has no github association`);
+              }
+              const current = requireStableGitHubAssociation(run.github);
+              if (
+                current.repositoryId !== repositoryId ||
+                current.pullRequestNumber !== pullRequestNumber
+              ) {
+                throw new Error(`Run ${runId} github association changed during publication`);
+              }
+              if (current.suspended) {
+                throw new Error(`Run ${runId} github association is suspended`);
+              }
+              const previousHeadSha = run.github.headSha || run.workspace?.headSha;
+              if (!previousHeadSha) {
+                throw new Error(`Run ${runId} has no head SHA for checks`);
+              }
+              const pendingHeadShas = pendingCancellationHeads(
+                run.github.pendingCancellationHeadShas,
+                previousHeadSha,
+                liveHead,
+              );
+              if (liveHead !== previousHeadSha) {
+                const before = structuredClone(run);
+                invalidateStaleEvidence(run, liveHead);
+                run.github = {
+                  ...run.github,
                   headSha: liveHead,
-                  branch: run.github.branch,
-                });
-                return { run, previousHeadSha, pendingHeadShas, committedAssociation };
-              }),
-            ),
-        );
-        return this.publishCommittedAssociation(
-          publication.committedAssociation,
-          publication.pendingHeadShas,
-        );
-      },
+                  repository,
+                  ...(pendingHeadShas.length > 0
+                    ? { pendingCancellationHeadShas: pendingHeadShas }
+                    : {}),
+                };
+                if (pendingHeadShas.length === 0) {
+                  delete run.github.pendingCancellationHeadShas;
+                }
+                await this.saveAssociationMutation(before, run, transaction);
+              } else if (run.github.repository !== repository) {
+                // §10/carry-forward from Task 8 (adapter.ts, review of 6ed112a):
+                // `reconcileCanonicalRepository` above only refreshes names it
+                // finds by iterating EXISTING index records, so a missing
+                // index record leaves `run.github.repository` stale even
+                // though the live canonical name was just proven. Sync it here
+                // -- unconditionally on the reconciled name, never on stale
+                // event/remote text -- so the association bound below, and
+                // therefore `publishChecks` routing, never carries a stale
+                // slug forward.
+                const before = structuredClone(run);
+                run.github = { ...run.github, repository };
+                await this.saveAssociationMutation(before, run, transaction);
+              }
+              const committedAssociation = transaction.bindStable({
+                runId: run.id,
+                installationId: run.github.installationId,
+                repositoryId,
+                repository,
+                pullRequestNumber: run.github.pullRequestNumber,
+                baseSha: run.github.baseSha,
+                headSha: liveHead,
+                branch: run.github.branch,
+              });
+              return {
+                run,
+                previousHeadSha,
+                pendingHeadShas,
+                committedAssociation: requireStableAssociationRecord(committedAssociation),
+              };
+            }),
+          ),
+      );
+      return this.publishCommittedAssociation(
+        publication.committedAssociation,
+        publication.pendingHeadShas,
+      );
+    });
+  }
+
+  /**
+   * Outermost stable fence (design doc §9). Keyed by the stable repository ID
+   * only; a mutable name never keys an operational fence after #34. Helpers
+   * that already run under this fence must not reacquire it.
+   */
+  private async withRepositoryIdentityFence<T>(
+    repositoryId: number,
+    callback: () => Promise<T>,
+  ): Promise<T> {
+    return withGitHubJournal(
+      this.root,
+      "repository-identity",
+      String(repositoryId),
+      callback,
+      { timeoutMs: 60_000 },
     );
   }
 
   private async withPublicationFence<T>(
-    repository: string,
+    repositoryId: number,
     pullRequestNumber: number,
     callback: () => Promise<T>,
   ): Promise<T> {
     return withGitHubJournal(
       this.root,
       "publication",
-      `${repository.toLowerCase()}#${pullRequestNumber}`,
+      `${repositoryId}#${pullRequestNumber}`,
       callback,
       { timeoutMs: 60_000 },
     );
   }
 
   private async withAssociationIdentityFence<T>(
-    repository: string,
+    repositoryId: number,
     pullRequestNumber: number,
     callback: () => Promise<T>,
   ): Promise<T> {
     return withGitHubJournal(
       this.root,
       "association-identity",
-      `${repository.toLowerCase()}#${pullRequestNumber}`,
+      `${repositoryId}#${pullRequestNumber}`,
       callback,
       { timeoutMs: 60_000 },
     );
+  }
+
+  /**
+   * Mints an ID-scoped installation credential. It is the adapter's only
+   * credential source: no name-scoped provider exists any more, so a stable
+   * operation without the ID provider fails closed here, before any GitHub
+   * request, and the failure is thrown (retryable) rather than classified as
+   * a permanent identity rejection -- a missing provider is a deployment
+   * misconfiguration, never evidence about repository identity.
+   */
+  private async repositoryToken(
+    installationId: number,
+    repositoryId: number,
+    purpose: GitHubInstallationTokenPurpose,
+  ): Promise<string> {
+    const provider = this.repositoryTokenProvider;
+    if (!provider) {
+      throw new Error(
+        "GitHub stable repository operations require a repository-id-scoped token provider",
+      );
+    }
+    return provider(installationId, repositoryId, purpose);
   }
 
   private async withRunTargetMutationFence<T>(
@@ -482,63 +625,17 @@ export class GitHubAppAdapter {
     );
   }
 
-  private async rollbackRunMutation(
-    before: RunRecord,
-    attempted: RunRecord,
-  ): Promise<void> {
-    const current = await this.store.load(before.id);
-    if (current.version === before.version) return;
-    if (current.version !== attempted.version) {
-      throw new Error(
-        `Run ${before.id} changed before association rollback: expected ${attempted.version}, on disk ${current.version}`,
-      );
-    }
-    if (
-      eventHistoryIdentity(current.events) !== eventHistoryIdentity(attempted.events) ||
-      associationRollbackInvariant(current) !== associationRollbackInvariant(attempted)
-    ) {
-      throw new Error(
-        `Run ${before.id} changed before association rollback: attempted snapshot no longer matches`,
-      );
-    }
-    const rollback = structuredClone(current);
-    if (before.github === undefined) delete rollback.github;
-    else rollback.github = structuredClone(before.github);
-    if (before.evidence === undefined) delete rollback.evidence;
-    else rollback.evidence = structuredClone(before.evidence);
-    await this.store.save(rollback);
-  }
-
   private async saveAssociationMutation(
     before: RunRecord,
     run: RunRecord,
     transaction: GitHubAssociationTransaction,
   ): Promise<void> {
-    if (
-      eventHistoryIdentity(run.events) !== eventHistoryIdentity(before.events) ||
-      associationRollbackInvariant(run) !== associationRollbackInvariant(before)
-    ) {
-      throw new Error(
-        `Run ${before.id} association transaction changed fields outside github/evidence`,
-      );
-    }
-    try {
-      await this.store.save(run);
-    } catch (error) {
-      if (containsDurableAtomicWriteOutcomeUnknown(error)) throw error;
-      try {
-        await this.rollbackRunMutation(before, run);
-      } catch (rollbackError) {
-        throw new AggregateError(
-          [error, rollbackError],
-          error instanceof Error ? error.message : "Run save failed",
-          { cause: error },
-        );
-      }
-      throw error;
-    }
-    const attempted = structuredClone(run);
-    transaction.onRollback(() => this.rollbackRunMutation(before, attempted));
+    await saveGitHubAssociationMutation({
+      store: this.store,
+      transaction,
+      before,
+      candidate: run,
+    });
   }
 
   private async routeAssociationHead(
@@ -590,26 +687,13 @@ export class GitHubAppAdapter {
     await this.loadActiveCommittedAssociation(expected);
     await this.afterAssociationValidatedBeforeRouting?.(expected.runId);
     return this.withAssociationIdentityFence(
-      expected.repository,
+      expected.repositoryId,
       expected.pullRequestNumber,
       async () => {
         const routed = await this.routeAssociationHead(expected);
         await this.afterAssociationRoutedBeforeChecks?.(expected.runId);
-        await this.publishChecks(
-          routed,
-          expected.repository,
-          expected.pullRequestNumber,
-          expected.headSha,
-          expected.installationId,
-          pendingHeadShas,
-        );
-        return this.clearPublishedCancellationHeads(
-          expected.runId,
-          expected.repository,
-          expected.pullRequestNumber,
-          expected.headSha,
-          pendingHeadShas,
-        );
+        await this.publishChecks(routed, expected, pendingHeadShas);
+        return this.clearPublishedCancellationHeads(expected, pendingHeadShas);
       },
     );
   }
@@ -623,6 +707,7 @@ export class GitHubAppAdapter {
       !github ||
       github.suspended === true ||
       github.installationId !== expected.installationId ||
+      github.repositoryId !== expected.repositoryId ||
       github.repository !== expected.repository ||
       github.pullRequestNumber !== expected.pullRequestNumber ||
       github.headSha !== expected.headSha
@@ -631,8 +716,8 @@ export class GitHubAppAdapter {
         `Run ${expected.runId} GitHub association changed before routing`,
       );
     }
-    const indexed = await this.associations.find(
-      expected.repository,
+    const indexed = await this.associations.findStable(
+      expected.repositoryId,
       expected.pullRequestNumber,
     );
     if (
@@ -640,6 +725,7 @@ export class GitHubAppAdapter {
       indexed.suspended ||
       indexed.runId !== expected.runId ||
       indexed.installationId !== expected.installationId ||
+      indexed.repositoryId !== expected.repositoryId ||
       indexed.repository !== expected.repository ||
       indexed.pullRequestNumber !== expected.pullRequestNumber ||
       indexed.headSha !== expected.headSha
@@ -652,21 +738,19 @@ export class GitHubAppAdapter {
   }
 
   private async clearPublishedCancellationHeads(
-    runId: string,
-    repository: string,
-    pullRequestNumber: number,
-    publishedHeadSha: string,
+    expected: AssociationRoutingIdentity,
     cancelledHeadShas: readonly string[],
   ): Promise<RunRecord> {
+    const runId = expected.runId;
     if (cancelledHeadShas.length === 0) return this.store.load(runId);
     const cancelled = new Set(cancelledHeadShas);
     return this.associations.withTransaction(async (transaction) => {
       const run = await this.store.load(runId);
       if (
         !run.github ||
-        run.github.repository !== repository ||
-        run.github.pullRequestNumber !== pullRequestNumber ||
-        run.github.headSha !== publishedHeadSha
+        run.github.repositoryId !== expected.repositoryId ||
+        run.github.pullRequestNumber !== expected.pullRequestNumber ||
+        run.github.headSha !== expected.headSha
       ) {
         throw new Error(`Run ${runId} github association changed during publication`);
       }
@@ -681,9 +765,10 @@ export class GitHubAppAdapter {
         if (remaining.length === 0) delete run.github.pendingCancellationHeadShas;
         await this.saveAssociationMutation(before, run, transaction);
       }
-      transaction.bind({
+      transaction.bindStable({
         runId: run.id,
         installationId: run.github.installationId,
+        repositoryId: expected.repositoryId,
         repository: run.github.repository,
         pullRequestNumber: run.github.pullRequestNumber,
         baseSha: run.github.baseSha,
@@ -695,93 +780,282 @@ export class GitHubAppAdapter {
     });
   }
 
-  private async dispatch(event: GitHubInternalEvent, app: GitHubAppConfig): Promise<void> {
+  /**
+   * Typed dispatch disposition (design doc §16). A permanent identity/policy
+   * rejection is reported so the delivery is durably consumed with zero
+   * authority-increasing mutation; every transient or ambiguous failure is
+   * thrown instead and keeps the existing retry path.
+   *
+   * Operational authorization is stable-ID only (§3.2): a mutable `owner/repo`
+   * name is routing/display/candidate metadata and never authorizes anything.
+   */
+  private async dispatch(
+    event: GitHubInternalEvent,
+    app: GitHubAppConfig,
+  ): Promise<GitHubDispatchResult> {
     if (event.type === "installation.deleted") {
+      // §3.2: installation deletion may reduce authority by persisted
+      // `installationId` alone -- including for unresolved legacy associations
+      // -- so it deliberately runs before the stable authorization gate and
+      // never establishes repository identity.
       if (event.installationId !== undefined) {
-        const associations = await this.associations.findAllByInstallation(
-          event.installationId,
-        );
-        await this.suspendAssociations(associations);
+        await this.suspendInstallationAssociations(event.installationId);
       }
-      return;
+      return { kind: "applied" };
     }
 
     if (event.type === "installation_repositories.removed") {
-      if (event.installationId === undefined) return;
-      const repositories =
-        event.repositories && event.repositories.length > 0
-          ? event.repositories
-          : event.repository
-            ? [event.repository]
-            : [];
-      const failures: unknown[] = [];
-      for (const repository of repositories) {
-        try {
-          const associations = await this.associations.findAllByInstallation(
-            event.installationId,
-            repository,
-          );
-          await this.suspendAssociations(associations);
-        } catch (error) {
-          if (error instanceof AggregateError) failures.push(...error.errors);
-          else failures.push(error);
-        }
-      }
-      if (failures.length > 0) {
-        throw new AggregateError(
-          failures,
-          `Authorization suspension failed for ${failures.length} repository association operation(s)`,
-        );
-      }
-      return;
+      if (event.installationId === undefined) return { kind: "applied" };
+      await this.suspendRemovedRepositories(event, event.installationId);
+      // An authority-reducing suspension is an allowed mutation, so the
+      // delivery completes normally and is never a permanent drop.
+      return { kind: "applied" };
+    }
+
+    if (event.type === "installation_repositories.added") {
+      // §6.2: an add event -- historical name-only or new ID-bearing -- never
+      // grants or restores authority here, so it is consumed with zero change.
+      return { kind: "applied" };
     }
 
     if (event.observeOnly) {
-      return;
+      return { kind: "applied" };
     }
 
-    if (event.repository && !isRepoAllowed(app, event.repository)) {
-      return;
+    if (event.type !== "push" && !event.type.startsWith("pull_request.")) {
+      return { kind: "applied" };
     }
+
+    // §3.2 operational authorization: a non-empty live `allowedRepositoryIds`
+    // AND the exact target id in it. Checked in that order so a cutover-order
+    // violation is reported as a configuration fault rather than as a
+    // repository-specific policy decision.
+    if (app.allowedRepositoryIds.length === 0) {
+      return {
+        kind: "permanent-reject",
+        reason: "stable-repository-authorization-required",
+      };
+    }
+    if (event.repositoryId === undefined) {
+      // §6.1 historical ID-less durable event: identity is never upgraded from
+      // a name, so this is permanently consumed rather than retried forever.
+      return { kind: "permanent-reject", reason: "legacy-repository-identity-missing" };
+    }
+    if (!isRepositoryIdAllowed(app, event.repositoryId)) {
+      // Retrying can never make the id allowlisted, so the delivery is
+      // permanently consumed instead of becoming a poison redelivery.
+      return { kind: "permanent-reject", reason: "repository-not-allowlisted" };
+    }
+    const installationId = event.installationId;
+    if (installationId === undefined || installationId <= 0) {
+      throw new Error(`${event.type} event missing installation id`);
+    }
+    const repositoryId = event.repositoryId;
+
+    // §9: the repository-identity fence serializes repository-scoped
+    // publication ENTRY -- canonical reconciliation and repository-wide
+    // authority reduction -- and is released before the per-pull-request
+    // fences, so an unrelated pull request in the same repository is never
+    // stalled behind another pull request's publication. The acquisition order
+    // repository-identity -> publication/association-identity -> run target
+    // fence -> global association transaction is still exact and is never
+    // inverted.
+    const entry = await this.withRepositoryIdentityFence(repositoryId, async () => {
+      const reconciliation = await this.reconcileCanonicalRepository(
+        repositoryId,
+        installationId,
+      );
+      if (reconciliation.kind === "absent") {
+        return {
+          kind: "settled" as const,
+          result: await this.applyProvenRepositoryAbsence(repositoryId, installationId),
+        };
+      }
+      return { kind: "route" as const, repository: reconciliation.repository };
+    });
+    if (entry.kind === "settled") return entry.result;
+    const repository = entry.repository;
 
     if (
       event.type.startsWith("pull_request.") &&
-      event.repository &&
       event.pullRequestNumber !== undefined &&
       event.headSha
     ) {
-      await this.handlePullRequestEvent(event);
-      return;
+      return this.handlePullRequestEvent(event, {
+        repositoryId,
+        repository,
+        installationId,
+        pullRequestNumber: event.pullRequestNumber,
+        headSha: event.headSha,
+      });
     }
-
-    if (event.type === "push" && event.repository && event.branch && event.headSha) {
-      await this.handlePushEvent(event);
+    if (event.type === "push" && event.branch && event.headSha) {
+      return this.handlePushEvent(event, {
+        repositoryId,
+        repository,
+        installationId,
+        branch: event.branch,
+        headSha: event.headSha,
+      });
     }
+    return { kind: "applied" };
   }
 
-  private async suspendAssociations(
-    associations: readonly AssociationRecord[],
+  /**
+   * Live canonical-name reconciliation (design doc §10).
+   *
+   * Must be called with `repository-identity(repositoryId)` already held; it
+   * never reacquires that journal. The caller has already proven the id is
+   * live-allowlisted; this then mints an ID-scoped metadata token, performs the
+   * bounded authenticated canonical lookup, and recoverably synchronizes every
+   * stale run/index canonical name for that id. An ambiguous lookup failure
+   * throws (retryable) and can never be read as absence.
+   */
+  private async reconcileCanonicalRepository(
+    repositoryId: number,
+    installationId: number,
+  ): Promise<CanonicalReconciliation> {
+    const token = await this.repositoryToken(
+      installationId,
+      repositoryId,
+      "metadata-reconcile",
+    );
+    const lookup = await lookupCanonicalGitHubRepository({
+      http: this.http,
+      token,
+      repositoryId,
+    });
+    if (lookup.kind === "not-found") return { kind: "absent" };
+    const repository = lookup.repository;
+    const stale = (await this.associations.findAllStableByRepositoryId(repositoryId)).filter(
+      (record) => record.repository !== repository,
+    );
+    for (const record of stale) {
+      await this.refreshCanonicalRepositoryName(
+        requireStableAssociationRecord(record),
+        repository,
+      );
+    }
+    return { kind: "reconciled", repository };
+  }
+
+  /**
+   * Recoverable run/index canonical-name synchronization for one stable
+   * association. An old-name replay cannot roll a name backward here: the name
+   * written is always the one the live authenticated lookup just returned for
+   * this exact repository id.
+   */
+  private async refreshCanonicalRepositoryName(
+    record: StableAssociationRecord,
+    repository: string,
   ): Promise<void> {
+    await this.withAssociationIdentityFence(
+      record.repositoryId,
+      record.pullRequestNumber,
+      async () => {
+        const apply = () =>
+          this.associations.withTransaction(async (transaction) => {
+            const current = transaction.findStable(
+              record.repositoryId,
+              record.pullRequestNumber,
+            );
+            if (!current || current.repository === repository) return;
+            const run = await this.loadRunIfPresent(current.runId);
+            if (
+              run?.github &&
+              run.github.repositoryId === current.repositoryId &&
+              run.github.pullRequestNumber === current.pullRequestNumber &&
+              run.github.repository !== repository
+            ) {
+              const before = structuredClone(run);
+              run.github = { ...run.github, repository };
+              await this.saveAssociationMutation(before, run, transaction);
+            }
+            transaction.refreshCanonicalRepository(
+              record.repositoryId,
+              current.pullRequestNumber,
+              repository,
+            );
+          });
+        // The run target fence is always acquired OUTSIDE the global
+        // association transaction. A truly missing run reconciles only the
+        // index; it never invents a run.
+        if ((await this.loadRunIfPresent(record.runId)) === undefined) {
+          await apply();
+          return;
+        }
+        await this.withRunTargetMutationFence(record.runId, () => apply());
+      },
+    );
+  }
+
+  /**
+   * Positive authorization-loss evidence (design doc §16). A fully and safely
+   * traversed installation listing that reached its terminal page without the
+   * target id is the only input to this method; ambiguous failures throw
+   * upstream and never arrive here.
+   *
+   * Case A -- at least one stable association exists for the id under this
+   * installation: reduce each to `authorization-revoked` and report `applied`,
+   * so the permanent-drop counter does not move. Case B -- nothing can be
+   * authority-reduced: permanently consume as `repository-access-revoked`.
+   *
+   * Runs under the already-held `repository-identity` fence.
+   */
+  private async applyProvenRepositoryAbsence(
+    repositoryId: number,
+    installationId: number,
+  ): Promise<GitHubDispatchResult> {
+    const affected = (await this.associations.findAllStableByRepositoryId(repositoryId)).filter(
+      (record) => record.installationId === installationId,
+    );
+    if (affected.length === 0) {
+      return { kind: "permanent-reject", reason: "repository-access-revoked" };
+    }
     const failures: unknown[] = [];
-    for (const expected of associations) {
+    for (const record of affected) {
       try {
-        await this.withAssociationIdentityFence(
-          expected.repository,
-          expected.pullRequestNumber,
-          async () => {
-            const association = await this.associations.find(
-              expected.repository,
-              expected.pullRequestNumber,
-            );
-            if (!association || association.installationId !== expected.installationId) return;
-            const suspended = await this.associations.suspend(
-              association.repository,
-              association.pullRequestNumber,
-              "authorization-revoked",
-            );
-            if (suspended) await this.suspendRunRecord(suspended);
-          },
+        await this.suspendStableAssociationUnderIdentity(
+          requireStableAssociationRecord(record),
         );
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Authorization suspension failed for ${failures.length} association(s)`,
+      );
+    }
+    return { kind: "applied" };
+  }
+
+  /**
+   * `installation.deleted` mixed fan-out.
+   *
+   * Every affected record is classified FIRST -- stable (`repositoryId`
+   * present) versus unresolved legacy -- and only then chooses its lock path.
+   * A failure on one record never skips a later record; all attempts are
+   * aggregated afterwards.
+   */
+  private async suspendInstallationAssociations(installationId: number): Promise<void> {
+    const associations = await this.associations.findAllByInstallation(installationId);
+    const classified = associations.map((record) => ({
+      record,
+      stable: record.repositoryId !== undefined,
+    }));
+    const failures: unknown[] = [];
+    for (const { record, stable } of classified) {
+      try {
+        if (stable) {
+          await this.suspendStableAssociation(requireStableAssociationRecord(record));
+        } else {
+          await this.suspendLegacyAssociation(record, {
+            installationId: record.installationId,
+            repository: record.repository,
+          });
+        }
       } catch (error) {
         failures.push(error);
       }
@@ -794,57 +1068,247 @@ export class GitHubAppAdapter {
     }
   }
 
-  private async suspendRunRecord(association: AssociationRecord): Promise<void> {
-    const runId = association.runId;
-    let run: RunRecord;
-    try {
-      run = await this.store.load(runId);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") return;
-      throw error;
+  /**
+   * `installation_repositories.removed` fan-out.
+   *
+   * A new ID-bearing event selects stable records BY stable id. A historical
+   * ID-less event selects ONLY unresolved legacy records by exact installation
+   * plus exact legacy name match (design doc §6.2): it can neither assign an
+   * id, refresh a canonical name, nor touch a stable-ID association by name.
+   */
+  private async suspendRemovedRepositories(
+    event: GitHubInternalEvent,
+    installationId: number,
+  ): Promise<void> {
+    const failures: unknown[] = [];
+    const identities = event.repositories ?? [];
+    if (identities.length > 0) {
+      for (const identity of identities) {
+        try {
+          const records = (
+            await this.associations.findAllStableByRepositoryId(identity.repositoryId)
+          ).filter((record) => record.installationId === installationId);
+          for (const record of records) {
+            try {
+              await this.suspendStableAssociation(requireStableAssociationRecord(record));
+            } catch (error) {
+              failures.push(error);
+            }
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+    } else {
+      const legacyNames =
+        event.legacyRepositories && event.legacyRepositories.length > 0
+          ? event.legacyRepositories
+          : event.repository
+            ? [event.repository]
+            : [];
+      for (const repository of legacyNames) {
+        try {
+          const records = (
+            await this.associations.findAllLegacyByRepository(repository)
+          ).filter((record) => record.installationId === installationId);
+          for (const record of records) {
+            try {
+              await this.suspendLegacyAssociation(record, { installationId, repository });
+            } catch (error) {
+              failures.push(error);
+            }
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+      }
     }
-    if (!run.github) return;
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `Authorization suspension failed for ${failures.length} repository association operation(s)`,
+      );
+    }
+  }
+
+  /** Full stable chain: repository-identity -> PR identity -> run fence -> transaction. */
+  private async suspendStableAssociation(record: StableAssociationRecord): Promise<void> {
+    await this.withRepositoryIdentityFence(record.repositoryId, () =>
+      this.suspendStableAssociationUnderIdentity(record));
+  }
+
+  /**
+   * The stable chain below an already-held `repository-identity` fence, so a
+   * caller that already owns the repository id never reacquires that journal.
+   */
+  private async suspendStableAssociationUnderIdentity(
+    record: StableAssociationRecord,
+  ): Promise<void> {
+    await this.withAssociationIdentityFence(
+      record.repositoryId,
+      record.pullRequestNumber,
+      async () => {
+        const apply = () =>
+          this.associations.withTransaction(async (transaction) => {
+            const current = transaction.findStable(
+              record.repositoryId,
+              record.pullRequestNumber,
+            );
+            if (!current || current.installationId !== record.installationId) return;
+            const run = await this.loadRunIfPresent(current.runId);
+            if (run) await this.suspendAssociatedRun(run, current, transaction);
+            transaction.suspendStable(
+              record.repositoryId,
+              record.pullRequestNumber,
+              "authorization-revoked",
+            );
+          });
+        if ((await this.loadRunIfPresent(record.runId)) === undefined) {
+          // An index record pointing at a truly missing run reconciles only the
+          // authority-reducing index suspension, under the global association
+          // transaction. No run and no repository id is ever invented.
+          await apply();
+          return;
+        }
+        await this.withRunTargetMutationFence(record.runId, () => apply());
+      },
+    );
+  }
+
+  /**
+   * Legacy ID-less authority reduction (design doc §6.2, §9).
+   *
+   * Acquires ONLY the common suffix `run target fence(runId) -> global
+   * association transaction`. It never acquires a name-keyed
+   * publication/association-identity fence and never invents or acquires a
+   * repository-ID fence. The initial name/installation match is advisory
+   * candidate selection; the exact unresolved tuple -- no `repositoryId`, same
+   * run, same installation, same normalized name -- is re-proved once both
+   * governing locks are held.
+   */
+  private async suspendLegacyAssociation(
+    record: AssociationRecord,
+    expected: { installationId: number; repository: string },
+  ): Promise<void> {
+    const apply = () =>
+      this.associations.withTransaction(async (transaction) => {
+        const current = transaction.findLegacy(record.repository, record.pullRequestNumber);
+        if (
+          !current ||
+          current.repositoryId !== undefined ||
+          current.runId !== record.runId ||
+          current.installationId !== expected.installationId ||
+          current.repository !== expected.repository
+        ) {
+          return;
+        }
+        const run = await this.loadRunIfPresent(current.runId);
+        if (run) await this.suspendAssociatedRun(run, current, transaction);
+        transaction.suspendLegacy(
+          current.repository,
+          current.pullRequestNumber,
+          "authorization-revoked",
+        );
+      });
+    if ((await this.loadRunIfPresent(record.runId)) === undefined) {
+      await apply();
+      return;
+    }
+    await this.withRunTargetMutationFence(record.runId, () => apply());
+  }
+
+  /**
+   * Applies `authorization-revoked` to the run half of one association from
+   * inside its association transaction, so a crash can never leave a split
+   * run/index suspension state that a later redelivery cannot reconcile.
+   */
+  private async suspendAssociatedRun(
+    run: RunRecord,
+    association: AssociationRecord,
+    transaction: GitHubAssociationTransaction,
+  ): Promise<void> {
+    const github = run.github;
+    if (!github) return;
     if (
-      run.github.installationId !== association.installationId ||
-      run.github.repository !== association.repository ||
-      run.github.pullRequestNumber !== association.pullRequestNumber
+      github.installationId !== association.installationId ||
+      github.pullRequestNumber !== association.pullRequestNumber
     ) {
       return;
     }
-    if (
-      run.github.suspended &&
-      run.github.suspensionReason === "authorization-revoked"
-    ) {
+    if (association.repositoryId === undefined) {
+      // Legacy half: the run must itself still be unresolved and carry the
+      // exact same mutable name. A name never resolves a stable record here.
+      if (github.repositoryId !== undefined || github.repository !== association.repository) {
+        return;
+      }
+    } else if (github.repositoryId !== association.repositoryId) {
       return;
     }
+    if (github.suspended && github.suspensionReason === "authorization-revoked") return;
+    const before = structuredClone(run);
     run.github = {
-      ...run.github,
+      ...github,
       suspended: true,
       suspensionReason: "authorization-revoked",
     };
-    await this.store.save(run);
+    await this.saveAssociationMutation(before, run, transaction);
   }
 
-  private async handlePushEvent(event: GitHubInternalEvent): Promise<void> {
-    const repository = event.repository!;
-    const branch = event.branch!;
-    const headSha = event.headSha!;
-    const associations = await this.associations.findAllByRepositoryBranch(repository, branch);
+  private async loadRunIfPresent(runId: string): Promise<RunRecord | undefined> {
+    try {
+      return await this.store.load(runId);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      // A non-ENOENT run load failure is ambiguous and must propagate.
+      throw error;
+    }
+  }
+
+  /**
+   * Push fan-out. Targets are selected by stable id and branch, never by the
+   * mutable repository name. Runs after the `repository-identity` entry fence
+   * has been released, with the reconciled canonical name; it must not assume
+   * repository-wide serialization.
+   */
+  private async handlePushEvent(
+    event: GitHubInternalEvent,
+    context: {
+      repositoryId: number;
+      repository: string;
+      installationId: number;
+      branch: string;
+      headSha: string;
+    },
+  ): Promise<GitHubDispatchResult> {
+    const associations = await this.associations.findAllStableByRepositoryBranch(
+      context.repositoryId,
+      context.branch,
+    );
     const failures: unknown[] = [];
+    let applied = 0;
+    let permanent: GitHubDispatchResult | undefined;
     for (const association of associations) {
       if (association.suspended) continue;
       const synthetic: GitHubInternalEvent = {
         ...event,
         type: "pull_request.synchronize",
         pullRequestNumber: association.pullRequestNumber,
-        headSha,
-        branch,
-        repository,
+        headSha: context.headSha,
+        branch: context.branch,
+        repository: context.repository,
+        repositoryId: context.repositoryId,
         installationId: association.installationId,
       };
       try {
-        await this.handlePullRequestEvent(synthetic);
+        const result = await this.handlePullRequestEvent(synthetic, {
+          repositoryId: context.repositoryId,
+          repository: context.repository,
+          installationId: association.installationId,
+          pullRequestNumber: association.pullRequestNumber,
+          headSha: context.headSha,
+        });
+        if (result.kind === "permanent-reject") permanent ??= result;
+        else applied += 1;
       } catch (error) {
         failures.push(error);
       }
@@ -855,96 +1319,103 @@ export class GitHubAppAdapter {
         `Push invalidation failed for ${failures.length} pull request association(s)`,
       );
     }
+    // A per-PR permanent identity rejection consumes the delivery only when no
+    // fan-out target applied; otherwise real work happened for this delivery.
+    if (applied === 0 && permanent) return permanent;
+    return { kind: "applied" };
   }
 
-  private async currentPullRequest(
-    repository: string,
-    pullRequestNumber: number,
-    installationId: number,
-  ): Promise<{ headSha: string; state: "open" | "closed" }> {
-    const { owner, repo } = parseOwnerRepo(repository);
-    const token = await this.tokenProvider(installationId, repository);
-    const response = await this.http.request(
-      "GET",
-      `https://api.github.com/repos/${owner}/${repo}/pulls/${pullRequestNumber}`,
-      {
-        headers: {
-          authorization: `Bearer ${token}`,
-          accept: "application/vnd.github+json",
-          "user-agent": "maswe-github-app",
-        },
-      },
-    );
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(
-        `Failed to resolve current PR head for ${repository}#${pullRequestNumber}: HTTP ${response.status}`,
+  /**
+   * Stable pull request handling. Runs after the `repository-identity` entry
+   * fence has been released, with the reconciled canonical name; it must not
+   * assume repository-wide serialization. Acquires
+   * `publication(repositoryId#pr)` -> `association-identity(repositoryId#pr)`
+   * -> run target fence -> global association transaction, in exactly that
+   * order.
+   */
+  private async handlePullRequestEvent(
+    event: GitHubInternalEvent,
+    context: {
+      repositoryId: number;
+      repository: string;
+      installationId: number;
+      pullRequestNumber: number;
+      headSha: string;
+    },
+  ): Promise<GitHubDispatchResult> {
+    const { repositoryId, repository, installationId, pullRequestNumber, headSha } = context;
+    // §8: unresolved legacy index state is rejected BEFORE any stable
+    // repository/PR publication fence is acquired, and is never upgraded here.
+    if (
+      (await this.associations.findStable(repositoryId, pullRequestNumber)) === undefined &&
+      (await this.associations.findLegacy(repository, pullRequestNumber)) !== undefined
+    ) {
+      return { kind: "permanent-reject", reason: "legacy-repository-identity-missing" };
+    }
+    return this.withPublicationFence(repositoryId, pullRequestNumber, async () => {
+      const readToken = await this.repositoryToken(
+        installationId,
+        repositoryId,
+        "pull-request-read",
       );
-    }
-    const body = response.body as { head?: { sha?: string }; state?: unknown };
-    const head = body.head;
-    if (typeof head?.sha !== "string" || !head.sha) {
-      throw new Error(
-        `Failed to resolve current PR head for ${repository}#${pullRequestNumber}: missing head.sha`,
-      );
-    }
-    if (body.state !== "open" && body.state !== "closed") {
-      throw new Error(
-        `Failed to resolve current PR state for ${repository}#${pullRequestNumber}`,
-      );
-    }
-    return { headSha: head.sha, state: body.state };
-  }
-
-  private async handlePullRequestEvent(event: GitHubInternalEvent): Promise<void> {
-    const repository = event.repository!;
-    const pullRequestNumber = event.pullRequestNumber!;
-    const headSha = event.headSha!;
-    const installationId = event.installationId;
-    if (installationId === undefined || installationId <= 0) {
-      throw new Error("pull_request event missing installation id");
-    }
-    await this.withPublicationFence(repository, pullRequestNumber, async () => {
-      const livePullRequest = await this.currentPullRequest(
+      const snapshot = await readGitHubPullRequestSnapshot({
+        http: this.http,
+        token: readToken,
         repository,
         pullRequestNumber,
-        installationId,
-      );
-      const liveHead = livePullRequest.headSha;
-      if (liveHead !== headSha) {
+      });
+      if (snapshot.baseRepositoryId !== repositoryId) {
+        // §11: ownership is proven by `base.repo.id` only. A fork's head
+        // repository is irrelevant; a different base repository is a permanent
+        // identity conflict with zero authority increase.
+        return { kind: "permanent-reject", reason: "repository-identity-conflict" } as const;
+      }
+      if (snapshot.headSha !== headSha) {
         // Stale or out-of-order delivery: current PR head has already moved on.
-        return;
+        return { kind: "applied" } as const;
       }
       const expectsClosed = event.type === "pull_request.closed";
       if (
-        (expectsClosed && livePullRequest.state !== "closed") ||
-        (!expectsClosed && livePullRequest.state !== "open")
+        (expectsClosed && snapshot.state !== "closed") ||
+        (!expectsClosed && snapshot.state !== "open")
       ) {
         // Same-SHA out-of-order lifecycle deliveries cannot invert the live PR state.
-        return;
+        return { kind: "applied" } as const;
       }
 
       await this.beforeAssociationTransaction?.(event.eventId);
       const publication = await this.withAssociationIdentityFence(
-        repository,
+        repositoryId,
         pullRequestNumber,
         async () => {
-          const identityAssociation = await this.associations.find(
-            repository,
+          const identityAssociation = await this.associations.findStable(
+            repositoryId,
             pullRequestNumber,
           );
-          const identityRun = identityAssociation
-            ? await this.store.load(identityAssociation.runId)
-            : await this.findMatchingRun(repository, pullRequestNumber, event.branch, {
-                allowPullRequestClosedSuspension:
-                  event.type === "pull_request.closed" ||
-                  event.type === "pull_request.reopened",
-              });
+          const closureRecoverable =
+            event.type === "pull_request.closed" || event.type === "pull_request.reopened";
+          let identityRun: RunRecord | undefined;
+          if (identityAssociation) {
+            identityRun = await this.store.load(identityAssociation.runId);
+          } else {
+            const candidate = await this.findMatchingRun(
+              repositoryId,
+              repository,
+              pullRequestNumber,
+              event.branch,
+              { allowPullRequestClosedSuspension: closureRecoverable },
+            );
+            if (candidate.kind === "conflict") {
+              return { kind: "conflict", reason: candidate.reason } as const;
+            }
+            identityRun = candidate.run;
+          }
           const transact = (targetRun: RunRecord | undefined) =>
             this.associations.withTransaction(async (transaction) => {
-              const association = transaction.find(repository, pullRequestNumber);
+              const association = transaction.findStable(repositoryId, pullRequestNumber);
               if (association?.runId !== identityAssociation?.runId) {
                 throw new Error(
-                  `GitHub association ${repository}#${pullRequestNumber} changed before target mutation`,
+                  `GitHub association ${repositoryId}#${pullRequestNumber} changed before target mutation`,
                 );
               }
               const reopeningClosure =
@@ -966,15 +1437,16 @@ export class GitHubAppAdapter {
                   await this.saveAssociationMutation(before, targetRun, transaction);
                 }
                 if (association) {
-                  transaction.suspend(
-                    repository,
+                  transaction.suspendStable(
+                    repositoryId,
                     pullRequestNumber,
                     "pull-request-closed",
                   );
                 } else if (targetRun?.github) {
-                  transaction.bind({
+                  transaction.bindStable({
                     runId: targetRun.id,
                     installationId,
+                    repositoryId,
                     repository,
                     pullRequestNumber,
                     baseSha: targetRun.github.baseSha,
@@ -1008,6 +1480,7 @@ export class GitHubAppAdapter {
               invalidateStaleEvidence(targetRun, headSha);
               targetRun.github = {
                 installationId,
+                repositoryId,
                 repository,
                 pullRequestNumber,
                 baseSha:
@@ -1027,9 +1500,10 @@ export class GitHubAppAdapter {
                   : {}),
               };
               await this.saveAssociationMutation(before, targetRun, transaction);
-              const committedAssociation = transaction.bind({
+              const committedAssociation = transaction.bindStable({
                 runId: targetRun.id,
                 installationId,
+                repositoryId,
                 repository,
                 pullRequestNumber,
                 baseSha: targetRun.github.baseSha,
@@ -1041,38 +1515,41 @@ export class GitHubAppAdapter {
                 run: targetRun,
                 previousHeadSha,
                 pendingHeadShas,
-                committedAssociation,
+                committedAssociation: requireStableAssociationRecord(committedAssociation),
               } as const;
             });
           if (!identityRun) return transact(undefined);
           return this.withRunTargetMutationFence(identityRun.id, async (authoritative) => {
             if (identityAssociation) return transact(authoritative);
             const currentMatch = await this.findMatchingRun(
+              repositoryId,
               repository,
               pullRequestNumber,
               event.branch,
-              {
-                allowPullRequestClosedSuspension:
-                  event.type === "pull_request.closed" ||
-                  event.type === "pull_request.reopened",
-              },
+              { allowPullRequestClosedSuspension: closureRecoverable },
             );
-            if (currentMatch?.id !== authoritative.id) {
+            if (currentMatch.kind === "conflict") {
+              return { kind: "conflict", reason: currentMatch.reason } as const;
+            }
+            if (currentMatch.run?.id !== authoritative.id) {
               return transact(undefined);
             }
-            return transact(currentMatch);
+            return transact(currentMatch.run);
           });
         },
       );
 
+      if (publication.kind === "conflict") {
+        return { kind: "permanent-reject", reason: publication.reason } as const;
+      }
       if (publication.kind === "publish") {
         await this.publishCommittedAssociation(
           publication.committedAssociation,
           publication.pendingHeadShas,
         );
-        return;
+        return { kind: "applied" } as const;
       }
-      if (publication.kind === "ignore") return;
+      if (publication.kind === "ignore") return { kind: "applied" } as const;
 
       const synthetic: RunRecord = {
         schemaVersion: 1,
@@ -1091,6 +1568,7 @@ export class GitHubAppAdapter {
         events: [],
         github: {
           installationId,
+          repositoryId,
           repository,
           pullRequestNumber,
           baseSha: event.baseSha ?? headSha,
@@ -1099,73 +1577,122 @@ export class GitHubAppAdapter {
           suspended: false,
         },
       };
-      await this.publishChecks(synthetic, repository, pullRequestNumber, headSha, installationId);
+      await this.publishChecks(synthetic, {
+        repositoryId,
+        repository,
+        pullRequestNumber,
+        headSha,
+        installationId,
+      });
+      return { kind: "applied" } as const;
     });
   }
 
+  /**
+   * Candidate selection for a not-yet-associated stable pull request.
+   *
+   * Stable identity decides: an exact `(repositoryId, pullRequestNumber)` claim
+   * on a run wins. A run holding a claim on the same mutable name with a
+   * different -- or absent -- stable id is never stolen and never upgraded; it
+   * is reported as the corresponding permanent identity rejection. Only after
+   * those guards may the current remote plus branch act as a candidate
+   * selector, matched against the freshly reconciled canonical name, so a stale
+   * pre-rename remote can never first-associate automatically.
+   */
   private async findMatchingRun(
+    repositoryId: number,
     repository: string,
     pullRequestNumber: number,
     branch: string | undefined,
     options: { allowPullRequestClosedSuspension?: boolean } = {},
-  ): Promise<RunRecord | undefined> {
+  ): Promise<
+    | { kind: "match"; run: RunRecord | undefined }
+    | { kind: "conflict"; reason: GitHubPermanentRepositoryRejectReason }
+  > {
     const runs = await this.store.list();
     const terminal = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
-
-    // Exact PR association on the run record wins.
-    for (const run of runs) {
+    const selectable = (run: RunRecord): boolean => {
+      if (terminal.has(run.state)) return false;
       const recoverableClosure =
         options.allowPullRequestClosedSuspension === true &&
         run.github?.suspended === true &&
         run.github.suspensionReason === "pull-request-closed";
-      if (terminal.has(run.state) || (run.github?.suspended && !recoverableClosure)) continue;
+      return !(run.github?.suspended && !recoverableClosure);
+    };
+
+    // Exact stable PR association on the run record wins.
+    for (const run of runs) {
+      if (!selectable(run)) continue;
       if (
-        run.github?.repository === repository &&
+        run.github?.repositoryId === repositoryId &&
         run.github.pullRequestNumber === pullRequestNumber
       ) {
-        return run;
+        return { kind: "match", run };
       }
     }
 
-    // Otherwise require exact remote + branch match (never repository-only).
-    if (!branch) return undefined;
+    // Identity guards before any name-based candidate selection.
     for (const run of runs) {
-      if (terminal.has(run.state) || run.github?.suspended) continue;
-      if (run.github && run.github.repository === repository) {
-        // Already associated to a different PR — do not steal.
-        if (run.github.pullRequestNumber !== pullRequestNumber) continue;
+      const github = run.github;
+      if (!github || !selectable(run)) continue;
+      if (
+        github.pullRequestNumber !== pullRequestNumber ||
+        github.repository !== repository
+      ) {
+        continue;
       }
+      if (github.repositoryId === undefined) {
+        return { kind: "conflict", reason: "legacy-repository-identity-missing" };
+      }
+      if (github.repositoryId !== repositoryId) {
+        return { kind: "conflict", reason: "repository-identity-conflict" };
+      }
+    }
+
+    // Otherwise require exact current remote + branch match (never repository-only),
+    // and never steal a run that already holds a GitHub association.
+    if (!branch) return { kind: "match", run: undefined };
+    for (const run of runs) {
+      if (terminal.has(run.state) || run.github) continue;
       if (
         remoteMatchesRepository(run.workspace?.remote, repository) &&
         run.workspace?.branch === branch
       ) {
-        return run;
+        return { kind: "match", run };
       }
     }
-    return undefined;
+    return { kind: "match", run: undefined };
   }
 
   private async publishChecks(
     run: RunRecord,
-    repository: string,
-    pullRequestNumber: number,
-    headSha: string,
-    installationId: number,
+    target: {
+      repositoryId: number;
+      repository: string;
+      pullRequestNumber: number;
+      headSha: string;
+      installationId: number;
+    },
     previousHeadShas: readonly string[] = [],
   ): Promise<void> {
     const app = this.githubApp();
-    const { owner, repo } = parseOwnerRepo(repository);
-    const token = await this.tokenProvider(installationId, repository);
+    const { owner, repo } = parseOwnerRepo(target.repository);
+    const token = await this.repositoryToken(
+      target.installationId,
+      target.repositoryId,
+      "checks",
+    );
     const publisher = new CheckPublisher({
       http: this.http,
       sideEffects: this.sideEffects,
       readOnlyChecks: app.readOnlyChecks,
+      repositoryId: target.repositoryId,
       owner,
       repo,
-      pullRequestNumber,
+      pullRequestNumber: target.pullRequestNumber,
       token,
     });
     const options = previousHeadShas.length > 0 ? { previousHeadShas } : {};
-    await publisher.publishForHeadSha(run, headSha, options);
+    await publisher.publishForHeadSha(run, target.headSha, options);
   }
 }

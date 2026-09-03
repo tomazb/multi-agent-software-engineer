@@ -323,9 +323,26 @@ evidence and cannot satisfy the current assurance gate.
 - Keep loopback as the listener default. Explicit wildcard binding requires TLS termination,
   network admission, one MiB proxy/application body ceilings, rate/concurrency controls, and
   header/body/request deadlines that preserve the application's sub-ten-second response budget.
-- Acquire installation-scoped tokens only for the handling installation; tokens are not persisted.
-- Idempotency keys for check-run side effects under `.maswe/github/side-effects/`.
-- Repository allowlist; installation removal suspends associations.
+- Acquire installation tokens only for the handling installation, scoped to a single stable
+  repository ID (`repository_ids: [<repositoryId>]`) with the exact least-privilege permission set
+  for the purpose (`metadata-reconcile`, `pull-request-read`, or `checks`). There is no
+  name-scoped token path. Tokens are not persisted.
+- Idempotency keys for check-run side effects under `.maswe/github/side-effects/`, keyed by stable
+  repository ID rather than by mutable name.
+- Repository authorization uses `githubApp.allowedRepositoryIds` only. A mutable `owner/repo` name
+  never authorizes an association, credential mint, workflow mutation, or check publication, so a
+  rename, a redirect, or an attacker-controlled repository reusing a released name cannot inherit
+  authority. `allowedRepositories` is selection and display metadata only.
+- The webhook listener refuses to reach readiness while `allowedRepositoryIds` is empty, so there
+  is no supported window in which repository deliveries are accepted under name-only
+  authorization.
+- Repository-scoped dispatch that fails identity or policy checks is typed as permanent: zero
+  authority-increasing mutation, a bounded typed reason, the durable delivery consumed rather than
+  retried, no fallback to name-based authorization, and a process-local
+  `permanentRepositoryDropsSinceStart` counter that is observability only. Ambiguous API or
+  pagination failures stay retryable and are never treated as proof of revoked access.
+- Installation removal suspends associations by persisted `installationId`, including for
+  unresolved legacy records; it never establishes repository identity.
 - Generic HTTP 500 responses contain no internal error text; internal failures go only to the local
   diagnostic callback. Every production GitHub HTTP request has a 30-second default deadline.
 - Full-digest `external_id` values bind repository, PR, head SHA, check name, and attempt; bounded
@@ -337,10 +354,14 @@ evidence and cannot satisfy the current assurance gate.
 **Boundary:** Phase A supports one listener/worker plus simultaneous manual publishers using
 cooperative same-host locking on one coherent local filesystem with atomic no-clobber hard links.
 Quiescent retained-path migration is required from legacy state; multiple listeners, mixed old/new
-binaries, and network/distributed filesystems are unsupported. Digest-bound GitHub approval
-authorization by repository role/team remains Phase B. Issue #34 must establish or explicitly
-disposition stable repository identity across owner/name renames before Phase B obtains write
-authority.
+binaries, and network/distributed filesystems are unsupported. Stable repository identity requires
+its own quiescent cutover: stop every pre-#34 listener and manual publisher, configure
+`allowedRepositoryIds`, complete `maswe github-migrate-repository` for **every** repository holding
+pre-#34 state, and only then start the new listener. After stable-identity state is written,
+downgrade to a pre-#34 binary is unsupported and old binaries are expected to fail closed on exact
+validation. Digest-bound GitHub approval authorization by repository role/team remains Phase B.
+Phase B must not obtain GitHub write authority until Issue #34 is completed, independently
+validated, merged, and post-merge `main` is revalidated.
 
 ### T11 — Resource and cost exhaustion
 

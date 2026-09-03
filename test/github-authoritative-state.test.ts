@@ -38,6 +38,19 @@ function associationRecord() {
   };
 }
 
+function stableAssociationBindInput() {
+  return {
+    runId: "run-stable-hostile",
+    installationId: 1,
+    repositoryId: 909,
+    repository: "owner/repo",
+    pullRequestNumber: 1,
+    baseSha: "base",
+    headSha: "head",
+    branch: "feature",
+  };
+}
+
 test("association reads reject a symlinked authoritative index", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-association-symlink-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
@@ -52,9 +65,56 @@ test("association reads reject a symlinked authoritative index", async (t) => {
   await symlink(outside, path.join(githubRoot, "associations.json"));
 
   await assert.rejects(
-    new GitHubAssociationIndex(githubRoot).find("owner/repo", 1),
+    new GitHubAssociationIndex(githubRoot).findLegacy("owner/repo", 1),
     /ordinary|symbolic|unsafe/i,
   );
+});
+
+test("stable association reads reject a symlinked authoritative index the same way legacy reads do", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-association-stable-symlink-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const outside = path.join(root, "outside.json");
+  await writeFile(
+    outside,
+    `${JSON.stringify({ "909#1": { ...associationRecord(), repositoryId: 909 } })}\n`,
+    "utf8",
+  );
+  const githubRoot = path.join(root, "github");
+  await mkdir(githubRoot);
+  await symlink(outside, path.join(githubRoot, "associations.json"));
+
+  await assert.rejects(
+    new GitHubAssociationIndex(githubRoot).findStable(909, 1),
+    /ordinary|symbolic|unsafe/i,
+  );
+});
+
+test("stable association capacity fails before publishing unreadable state", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-association-stable-capacity-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const githubRoot = path.join(root, "github");
+  await mkdir(githubRoot);
+  const index = new GitHubAssociationIndex(githubRoot, { maxFileBytes: 512 });
+  const first = stableAssociationBindInput();
+  await index.withTransaction(async (transaction) => transaction.bindStable(first));
+  const indexPath = path.join(githubRoot, "associations.json");
+  const retained = await readFile(indexPath, "utf8");
+
+  await assert.rejects(
+    index.withTransaction(async (transaction) =>
+      transaction.bindStable({
+        ...first,
+        runId: "run-stable-overflow",
+        repositoryId: 910,
+        pullRequestNumber: 2,
+      }),
+    ),
+    /capacity|bounded|exceed/i,
+  );
+
+  assert.equal(await readFile(indexPath, "utf8"), retained);
+  assert.equal((await index.findStable(909, 1))?.runId, "run-stable-hostile");
+  assert.equal(await index.findStable(910, 2), undefined);
 });
 
 test("association reads reject an oversized authoritative index", async (t) => {
@@ -65,35 +125,9 @@ test("association reads reject an oversized authoritative index", async (t) => {
   await writeFile(path.join(githubRoot, "associations.json"), Buffer.alloc(1_048_577, 0x20));
 
   await assert.rejects(
-    new GitHubAssociationIndex(githubRoot).find("owner/repo", 1),
+    new GitHubAssociationIndex(githubRoot).findLegacy("owner/repo", 1),
     /bounded|too large|ordinary/i,
   );
-});
-
-test("association capacity fails before publishing unreadable state", async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-association-capacity-"));
-  t.after(async () => rm(root, { recursive: true, force: true }));
-  const githubRoot = path.join(root, "github");
-  await mkdir(githubRoot);
-  const index = new GitHubAssociationIndex(githubRoot, { maxFileBytes: 512 });
-  const first = associationRecord();
-  await index.bind(first);
-  const indexPath = path.join(githubRoot, "associations.json");
-  const retained = await readFile(indexPath, "utf8");
-
-  await assert.rejects(
-    index.bind({
-      ...first,
-      runId: "run-overflow",
-      repository: "owner/second",
-      pullRequestNumber: 2,
-    }),
-    /capacity|bounded|exceed/i,
-  );
-
-  assert.equal(await readFile(indexPath, "utf8"), retained);
-  assert.equal((await index.find("owner/repo", 1))?.runId, "run-hostile");
-  assert.equal(await index.find("owner/second", 2), undefined);
 });
 
 test("bounded ordinary reads fail closed without no-follow support and detect post-stat growth", async (t) => {
@@ -374,7 +408,9 @@ test("authoritative atomic writes surface file and parent-directory sync failure
         ...(failure === "file" ? { syncFile: fail } : { syncDirectory: fail }),
       } as never);
       await assert.rejects(
-        index.bind(associationRecord()),
+        index.withTransaction(async (transaction) =>
+          transaction.bindStable(stableAssociationBindInput()),
+        ),
         failure === "file"
           ? /file sync failure/
           : /published.*directory sync failed/,

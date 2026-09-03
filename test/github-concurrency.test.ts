@@ -9,11 +9,16 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { CheckPublisher, type GitHubHttpClient } from "../src/github/checks.ts";
 import { GitHubAssociationIndex } from "../src/github/association.ts";
+import { inspectLegacyGitHubJournalOwnership } from "../src/github/journal.ts";
 import { GitHubSideEffectStore } from "../src/github/side-effect-store.ts";
+import { scanLockJournal } from "../src/lock-journal.ts";
 import type { RunRecord } from "../src/domain.ts";
 
 const workerPath = fileURLToPath(
   new URL("./fixtures/github-store-worker.ts", import.meta.url),
+);
+const journalWorkerPath = fileURLToPath(
+  new URL("./fixtures/github-journal-worker.ts", import.meta.url),
 );
 const WATCHDOG_MS = 10_000;
 
@@ -27,7 +32,7 @@ function spawnStoreWorker(
   githubRoot: string,
   barrierPath: string,
   actor: string,
-  mode: "association" | "check-create",
+  mode: "association-stable" | "check-create",
   extraEnv: Record<string, string>,
 ): { child: ChildProcess; next(type: WorkerMessage["type"]): Promise<WorkerMessage> } {
   const child = fork(workerPath, [], {
@@ -171,6 +176,7 @@ test("concurrent check publishers serialize creates for the same key", async (t)
       http,
       sideEffects,
       readOnlyChecks: true,
+      repositoryId: 424242,
       owner: "owner",
       repo: "repo",
       pullRequestNumber: 1,
@@ -187,13 +193,13 @@ test("concurrent check publishers serialize creates for the same key", async (t)
   assert.equal(posts, 4);
 });
 
-test("separate processes concurrently binding two PRs preserve both association records", async (t) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-lock-"));
-  const barrierPath = path.join(root, "association.start");
-  const first = spawnStoreWorker(root, barrierPath, "one", "association", {
+test("separate processes concurrently binding two stable PRs preserve both stable association records", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-assoc-stable-lock-"));
+  const barrierPath = path.join(root, "association-stable.start");
+  const first = spawnStoreWorker(root, barrierPath, "one", "association-stable", {
     MASWE_GITHUB_PULL_REQUEST_NUMBER: "1",
   });
-  const second = spawnStoreWorker(root, barrierPath, "two", "association", {
+  const second = spawnStoreWorker(root, barrierPath, "two", "association-stable", {
     MASWE_GITHUB_PULL_REQUEST_NUMBER: "2",
   });
   t.after(async () => {
@@ -206,8 +212,8 @@ test("separate processes concurrently binding two PRs preserve both association 
   await waitForWorkers([first.child, second.child]);
 
   const index = new GitHubAssociationIndex(root);
-  assert.equal((await index.find("owner/repo", 1))?.runId, "run-one");
-  assert.equal((await index.find("owner/repo", 2))?.runId, "run-two");
+  assert.equal((await index.findStable(9090, 1))?.runId, "run-one");
+  assert.equal((await index.findStable(9090, 2))?.runId, "run-two");
 });
 
 test("two processes sharing a full check key execute exactly one create section", async (t) => {
@@ -248,15 +254,18 @@ test("association binding migrates the exact legacy associations.lock path", asy
     `${JSON.stringify({ pid: 999_999_999, token: "dead", at: "2026-08-09T10:00:00.000Z" })}\n`,
   );
 
-  await new GitHubAssociationIndex(root).bind({
-    runId: "run-migrated",
-    installationId: 41,
-    repository: "owner/repo",
-    pullRequestNumber: 3,
-    baseSha: "base",
-    headSha: "head",
-    branch: "migration",
-  });
+  await new GitHubAssociationIndex(root).withTransaction(async (transaction) =>
+    transaction.bindStable({
+      runId: "run-migrated",
+      installationId: 41,
+      repositoryId: 9090,
+      repository: "owner/repo",
+      pullRequestNumber: 3,
+      baseSha: "base",
+      headSha: "head",
+      branch: "migration",
+    }),
+  );
 
   assert.equal((await lstat(legacyPath)).isDirectory(), true);
   assert.equal(
@@ -308,3 +317,98 @@ test("check creation migrates the exact legacy per-key lock path", async () => {
     true,
   );
 });
+
+test(
+  "read-only legacy-journal preflight reports live and never acquires or disturbs a genuinely live pre-#34 publication owner",
+  async (t) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-legacy-preflight-live-"));
+    const eventsPath = path.join(root, "events.log");
+    await writeFile(eventsPath, "", "utf8");
+    const logicalKey = "owner/repo#42";
+    const digest = createHash("sha256").update(logicalKey).digest("hex");
+    const journalDirectory = path.join(root, "journals", "publication", digest);
+
+    const child = fork(journalWorkerPath, [], {
+      execArgv: ["--experimental-strip-types"],
+      env: {
+        ...process.env,
+        MASWE_GITHUB_ROOT: root,
+        MASWE_GITHUB_EVENTS_PATH: eventsPath,
+        MASWE_GITHUB_ACTOR: "legacy-owner",
+        MASWE_GITHUB_JOURNAL_KIND: "publication",
+        MASWE_GITHUB_LOGICAL_KEY: logicalKey,
+        MASWE_GITHUB_TIMEOUT_MS: "5000",
+      },
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    });
+    t.after(async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await rm(root, { recursive: true, force: true });
+    });
+
+    interface WorkerMessage {
+      type: "ENTER" | "TRANSITION" | "COMPLETE" | "ERROR";
+      actor: string;
+      pid: number;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("legacy owner ENTER watchdog expired")),
+        WATCHDOG_MS,
+      );
+      child.on("message", (message: WorkerMessage) => {
+        if (message.type !== "ENTER") return;
+        clearTimeout(timer);
+        resolve();
+      });
+      child.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        reject(new Error(`legacy owner exited ${code ?? signal} before ENTER`));
+      });
+    });
+
+    // The live legacy owner is now holding the exact name-keyed publication claim that a
+    // pre-#34 binary would hold. Capture its on-disk state before running the read-only
+    // preflight so the "undisturbed" assertion below compares real journal contents.
+    const before = await scanLockJournal(journalDirectory, "data");
+    assert.equal(before.claims.length, 1);
+    assert.equal(before.releases.size, 0);
+
+    const result = await inspectLegacyGitHubJournalOwnership({
+      githubRoot: root,
+      kind: "publication",
+      logicalKey,
+    });
+    assert.deepEqual(result, { state: "live" });
+
+    // No competing claim was appended and the live owner's claim is exactly intact: same
+    // ticket count, same claim digest, still unreleased.
+    const after = await scanLockJournal(journalDirectory, "data");
+    assert.deepEqual(after.claims, before.claims);
+    assert.equal(after.releases.size, 0);
+
+    child.send({ type: "RELEASE" });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("legacy owner COMPLETE watchdog expired")),
+        WATCHDOG_MS,
+      );
+      child.on("message", (message: WorkerMessage) => {
+        if (message.type !== "COMPLETE") return;
+        clearTimeout(timer);
+        resolve();
+      });
+      child.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        if (code === 0) resolve();
+        else reject(new Error(`legacy owner exited ${code ?? signal} before COMPLETE`));
+      });
+    });
+
+    assert.equal(await readFile(eventsPath, "utf8"), "legacy-owner:enter\nlegacy-owner:exit\n");
+    const final = await scanLockJournal(journalDirectory, "data");
+    assert.equal(final.claims.length, 1);
+    assert.equal(final.releases.size, 1);
+  },
+);

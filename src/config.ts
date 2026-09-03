@@ -129,22 +129,29 @@ function normalizeGitHubAppConfig(raw: unknown): NonNullable<MasweConfig["github
     "webhookSecretEnv",
     "appIdEnv",
     "privateKeyEnv",
+    "allowedRepositoryIds",
     "allowedRepositories",
     "webhookHost",
     "webhookPort",
   ]);
   const repositories = value.allowedRepositories;
+  const repositoryIds = value.allowedRepositoryIds;
   return {
     enabled: value.enabled as boolean,
     readOnlyChecks: value.readOnlyChecks as boolean,
     webhookSecretEnv: value.webhookSecretEnv as string,
     appIdEnv: value.appIdEnv as string,
     privateKeyEnv: value.privateKeyEnv as string,
-    allowedRepositories: Array.isArray(repositories)
-      ? repositories.map((repository) =>
-          typeof repository === "string" ? repository.toLowerCase() : repository,
-        ) as string[]
-      : repositories as string[],
+    // The two allowlists normalize independently: names never populate ids and ids never
+    // populate names. Only an omitted array becomes []; malformed values reach validation.
+    allowedRepositoryIds: (repositoryIds === undefined ? [] : repositoryIds) as number[],
+    allowedRepositories: repositories === undefined
+      ? []
+      : Array.isArray(repositories)
+        ? repositories.map((repository) =>
+            typeof repository === "string" ? repository.toLowerCase() : repository,
+          ) as string[]
+        : repositories as string[],
     ...(value.webhookHost !== undefined ? { webhookHost: value.webhookHost as string } : {}),
     ...(value.webhookPort !== undefined ? { webhookPort: value.webhookPort as number } : {}),
   };
@@ -416,6 +423,7 @@ function assertGitHubAppConfig(githubApp: MasweConfig["githubApp"]): void {
     "webhookSecretEnv",
     "appIdEnv",
     "privateKeyEnv",
+    "allowedRepositoryIds",
     "allowedRepositories",
     "webhookHost",
     "webhookPort",
@@ -435,9 +443,24 @@ function assertGitHubAppConfig(githubApp: MasweConfig["githubApp"]): void {
       "githubApp.allowedRepositories must be an array of owner/repo strings",
     );
   }
-  if (githubApp.enabled && githubApp.allowedRepositories.length < 1) {
+  if (
+    !Array.isArray(githubApp.allowedRepositoryIds) ||
+    !githubApp.allowedRepositoryIds.every(
+      (repositoryId) => Number.isSafeInteger(repositoryId) && (repositoryId as number) > 0,
+    ) ||
+    new Set(githubApp.allowedRepositoryIds).size !== githubApp.allowedRepositoryIds.length
+  ) {
     throw new Error(
-      "githubApp.allowedRepositories must contain at least one repository when enabled",
+      "githubApp.allowedRepositoryIds must be an array of unique positive safe integers",
+    );
+  }
+  if (
+    githubApp.enabled &&
+    githubApp.allowedRepositoryIds.length < 1 &&
+    githubApp.allowedRepositories.length < 1
+  ) {
+    throw new Error(
+      "githubApp.allowedRepositoryIds or githubApp.allowedRepositories must contain at least one entry when enabled",
     );
   }
   if (

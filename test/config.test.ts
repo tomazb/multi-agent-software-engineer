@@ -191,9 +191,33 @@ test("githubApp accepts enabled read-only pilot config", () => {
     webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
     appIdEnv: "MASWE_GITHUB_APP_ID",
     privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+    allowedRepositoryIds: [],
     allowedRepositories: ["owner/repo"],
     webhookHost: "127.0.0.1",
     webhookPort: 8787,
+  });
+});
+
+test("githubApp accepts an enabled stable-id-only allowlist", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositoryIds: [1308655205],
+    },
+  });
+
+  assert.deepEqual(config.githubApp, {
+    enabled: true,
+    readOnlyChecks: true,
+    webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+    appIdEnv: "MASWE_GITHUB_APP_ID",
+    privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+    allowedRepositoryIds: [1308655205],
+    allowedRepositories: [],
   });
 });
 
@@ -232,21 +256,61 @@ test("githubApp rejects unsupported fields instead of retaining inline secrets",
   );
 });
 
-test("githubApp rejects empty allowlist when enabled", () => {
-  assert.throws(
-    () =>
-      mergeConfigForTest({
-        githubApp: {
-          enabled: true,
-          readOnlyChecks: true,
-          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
-          appIdEnv: "MASWE_GITHUB_APP_ID",
-          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
-          allowedRepositories: [],
-        },
-      }),
-    /allowedRepositories/,
-  );
+test("githubApp rejects both allowlists empty when enabled", () => {
+  for (const allowlists of [
+    {},
+    { allowedRepositories: [] },
+    { allowedRepositoryIds: [] },
+    { allowedRepositoryIds: [], allowedRepositories: [] },
+  ]) {
+    assert.throws(
+      () =>
+        mergeConfigForTest({
+          githubApp: {
+            enabled: true,
+            readOnlyChecks: true,
+            webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+            appIdEnv: "MASWE_GITHUB_APP_ID",
+            privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+            ...allowlists,
+          },
+        }),
+      /allowedRepositoryIds.*allowedRepositories.*at least one/,
+      JSON.stringify(allowlists),
+    );
+  }
+});
+
+test("githubApp rejects malformed stable repository ids", () => {
+  for (const allowedRepositoryIds of [
+    [1308655205, 1308655205],
+    [0],
+    [-1],
+    [1.5],
+    [Number.MAX_SAFE_INTEGER + 2],
+    [Number.NaN],
+    [Number.POSITIVE_INFINITY],
+    ["1308655205"],
+    [null],
+    "1308655205",
+  ]) {
+    assert.throws(
+      () =>
+        mergeConfigForTest({
+          githubApp: {
+            enabled: true,
+            readOnlyChecks: true,
+            webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+            appIdEnv: "MASWE_GITHUB_APP_ID",
+            privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+            allowedRepositoryIds,
+            allowedRepositories: ["owner/repo"],
+          },
+        }),
+      /allowedRepositoryIds must be an array of unique positive safe integers/,
+      JSON.stringify(allowedRepositoryIds),
+    );
+  }
 });
 
 test("githubApp accepts an empty allowlist when disabled", () => {
@@ -262,6 +326,7 @@ test("githubApp accepts an empty allowlist when disabled", () => {
   });
 
   assert.deepEqual(config.githubApp?.allowedRepositories, []);
+  assert.deepEqual(config.githubApp?.allowedRepositoryIds, []);
 });
 
 test("githubApp normalizes validated repository allowlist entries case-insensitively", () => {
@@ -277,6 +342,41 @@ test("githubApp normalizes validated repository allowlist entries case-insensiti
   });
 
   assert.deepEqual(config.githubApp?.allowedRepositories, ["owner/repo"]);
+  assert.deepEqual(config.githubApp?.allowedRepositoryIds, []);
+});
+
+test("githubApp keeps the stable id allowlist independent of repository names", () => {
+  const config = mergeConfigForTest({
+    githubApp: {
+      enabled: true,
+      readOnlyChecks: true,
+      webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+      appIdEnv: "MASWE_GITHUB_APP_ID",
+      privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositoryIds: [1308655205, 42],
+      allowedRepositories: ["Owner/Repo"],
+    },
+  });
+
+  assert.deepEqual(config.githubApp?.allowedRepositoryIds, [1308655205, 42]);
+  assert.deepEqual(config.githubApp?.allowedRepositories, ["owner/repo"]);
+});
+
+test("githubApp keeps the Phase A read-only guard for stable-id allowlists", () => {
+  assert.throws(
+    () =>
+      mergeConfigForTest({
+        githubApp: {
+          enabled: true,
+          readOnlyChecks: false,
+          webhookSecretEnv: "MASWE_GITHUB_WEBHOOK_SECRET",
+          appIdEnv: "MASWE_GITHUB_APP_ID",
+          privateKeyEnv: "MASWE_GITHUB_APP_PRIVATE_KEY",
+          allowedRepositoryIds: [1308655205],
+        },
+      }),
+    /readOnlyChecks/,
+  );
 });
 
 test("project config rejects unknown fields throughout the runtime tree", async (t) => {

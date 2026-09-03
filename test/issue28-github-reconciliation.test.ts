@@ -19,7 +19,10 @@ import {
   writeDurableAtomic,
 } from "../src/durable-file.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
-import { GitHubAssociationIndex } from "../src/github/association.ts";
+import {
+  GitHubAssociationIndex,
+  type StableAssociationBindInput,
+} from "../src/github/association.ts";
 import type { GitHubHttpClient } from "../src/github/checks.ts";
 import { isGitWorkspaceClean } from "../src/git-snapshot.ts";
 import { captureWorkspace } from "../src/git-workspace.ts";
@@ -32,6 +35,8 @@ import { FileRunStore } from "../src/store.ts";
 
 const SECRET = "issue-28-github-reconciliation-secret";
 const SECRET_ENV = "MASWE_TEST_ISSUE_28_GITHUB_RECONCILIATION_SECRET";
+/** The stable repository id every fixture in this file is scoped to. */
+const REPO_ID = 1308655205;
 const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
 const HEAD_C = "c".repeat(40);
@@ -75,6 +80,7 @@ function config(): MasweConfig {
       webhookSecretEnv: SECRET_ENV,
       appIdEnv: "MASWE_TEST_GITHUB_APP_ID",
       privateKeyEnv: "MASWE_TEST_GITHUB_APP_PRIVATE_KEY",
+      allowedRepositoryIds: [REPO_ID],
       allowedRepositories: ["owner/repo"],
     },
   });
@@ -84,11 +90,28 @@ function sign(body: string): string {
   return `sha256=${createHmac("sha256", SECRET).update(body, "utf8").digest("hex")}`;
 }
 
+/** Seeds a stable `<repositoryId>#<pr>` association record. */
+async function bindStableRecord(
+  index: GitHubAssociationIndex,
+  input: StableAssociationBindInput,
+): Promise<void> {
+  await index.withTransaction(async (transaction) => transaction.bindStable(input));
+}
+
+/** The live installation-repository listing every stable operation reconciles against. */
+function canonicalListingResponse() {
+  return {
+    status: 200,
+    headers: {},
+    body: { repositories: [{ id: REPO_ID, full_name: "owner/repo" }] },
+  };
+}
+
 function prPayload(headSha: string, baseSha = HEAD_A) {
   return {
     action: "synchronize",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: 1308655205, full_name: "owner/repo" },
     pull_request: {
       number: 28,
       head: { sha: headSha, ref: "maswe/issue-28" },
@@ -132,6 +155,7 @@ async function advanceToPrReview(store: FileRunStore): Promise<RunRecord> {
   };
   run.github = {
     installationId: 44,
+    repositoryId: REPO_ID,
     repository: "owner/repo",
     pullRequestNumber: 28,
     baseSha: HEAD_A,
@@ -353,6 +377,7 @@ async function associationRaceHarness(
   run.workspace = await captureWorkspace(cwd);
   run.github = {
     installationId: 44,
+    repositoryId: REPO_ID,
     repository: "owner/repo",
     pullRequestNumber: 28,
     baseSha: headA,
@@ -386,9 +411,10 @@ async function associationRaceHarness(
   assert.equal(run.revalidation, undefined);
 
   const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
+  await bindStableRecord(index, {
     runId: run.id,
     installationId: 44,
+    repositoryId: REPO_ID,
     repository: "owner/repo",
     pullRequestNumber: 28,
     baseSha: headA,
@@ -398,8 +424,23 @@ async function associationRaceHarness(
   let nextCheckId = 1;
   const http: GitHubHttpClient = {
     async request(method, url) {
+      if (method === "GET" && url.includes("/installation/repositories")) {
+        return canonicalListingResponse();
+      }
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: headC }, state: "open" } };
+        return {
+          status: 200,
+          headers: {},
+          body: {
+            state: "open",
+            head: { sha: headC, ref: "maswe/issue-28" },
+            base: {
+              sha: HEAD_A,
+              ref: "main",
+              repo: { id: REPO_ID, full_name: "owner/repo" },
+            },
+          },
+        };
       }
       if (method === "GET" && url.includes("/check-runs")) {
         return { status: 200, headers: {}, body: { check_runs: [] } };
@@ -412,7 +453,7 @@ async function associationRaceHarness(
     config: value,
     store,
     http,
-    tokenProvider: async () => "test-token",
+    repositoryTokenProvider: async () => "test-token",
     synchronousWebhookDispatch: true,
     afterAssociationCommitBeforeRouting,
   });
@@ -458,9 +499,10 @@ async function adapterHarness(
   const githubRoot = path.join(cwd, ".maswe", "github");
   const index = new GitHubAssociationIndex(githubRoot);
   if (options.bindAssociation !== false) {
-    await index.bind({
+    await bindStableRecord(index, {
       runId: run.id,
       installationId: 44,
+      repositoryId: REPO_ID,
       repository: "owner/repo",
       pullRequestNumber: 28,
       baseSha: HEAD_A,
@@ -474,11 +516,22 @@ async function adapterHarness(
   const posts: Array<Record<string, unknown>> = [];
   const http: GitHubHttpClient = {
     async request(method, url, requestOptions) {
+      if (method === "GET" && url.includes("/installation/repositories")) {
+        return canonicalListingResponse();
+      }
       if (method === "GET" && url.includes("/pulls/")) {
         return {
           status: 200,
           headers: {},
-          body: { head: { sha: liveHead }, state: "open" },
+          body: {
+            state: "open",
+            head: { sha: liveHead, ref: "maswe/issue-28" },
+            base: {
+              sha: HEAD_A,
+              ref: "main",
+              repo: { id: REPO_ID, full_name: "owner/repo" },
+            },
+          },
         };
       }
       if (method === "GET" && url.includes("/check-runs")) {
@@ -497,7 +550,7 @@ async function adapterHarness(
     config: config(),
     store: options.wrapStore?.(store) ?? store,
     http,
-    tokenProvider: async () => "test-token",
+    repositoryTokenProvider: async () => "test-token",
     synchronousWebhookDispatch: true,
     ...(options.associationWriteRecords
       ? { associationWriteRecords: options.associationWriteRecords }
@@ -1230,9 +1283,10 @@ async function advancePostReviewWithoutRevalidation(
     mergeReady: { headSha: HEAD_B, passed: true, at: "2026-08-19T09:02:00.000Z" },
   };
   await harness.store.save(run);
-  await harness.index.bind({
+  await bindStableRecord(harness.index, {
     runId: run.id,
     installationId: 44,
+    repositoryId: REPO_ID,
     repository: "owner/repo",
     pullRequestNumber: 28,
     baseSha: HEAD_A,
@@ -1256,7 +1310,8 @@ async function advancePostReviewWithoutRevalidation(
 test("manual Phase A preserves index-only authorization suspension before bind", async (t) => {
   const harness = await adapterHarness(t);
   const before = await harness.store.load(harness.runId);
-  await harness.index.suspend("owner/repo", 28, "authorization-revoked");
+  await harness.index.withTransaction(async (transaction) =>
+    transaction.suspendStable(REPO_ID, 28, "authorization-revoked"));
 
   await assert.rejects(
     harness.adapter.publishChecksForRun(harness.runId),
@@ -1264,7 +1319,7 @@ test("manual Phase A preserves index-only authorization suspension before bind",
   );
 
   assert.deepEqual(await harness.store.load(harness.runId), before);
-  const indexed = await harness.index.find("owner/repo", 28);
+  const indexed = await harness.index.findStable(REPO_ID, 28);
   assert.equal(indexed?.suspended, true);
   assert.equal(indexed?.suspensionReason, "authorization-revoked");
   assert.equal(harness.posts.length, 0);
@@ -1292,7 +1347,7 @@ test("webhook does not mutate a run discovered only after its fenced identity sn
   await deliver(harness, HEAD_B, "late-run-after-identity-snapshot");
 
   assert.deepEqual(await harness.store.load(harness.runId), before);
-  assert.equal(await harness.index.find("owner/repo", 28), undefined);
+  assert.equal(await harness.index.findStable(REPO_ID, 28), undefined);
 });
 
 test("github association failure matrix never rewrites an already-published workflow event", async (t) => {
@@ -1357,7 +1412,7 @@ test("github association failure matrix never rewrites an already-published work
     assert.deepEqual(eventIdentity(recovered), eventIdentity(before));
     assert.equal(recovered.github?.headSha, HEAD_B);
     assert.equal(recovered.evidence, undefined);
-    assert.equal((await harness.index.find("owner/repo", 28))?.headSha, HEAD_A);
+    assert.equal((await harness.index.findStable(REPO_ID, 28))?.headSha, HEAD_A);
   });
 
   await t.test("known index failure restores only prior association fields", async (t) => {
@@ -1405,7 +1460,7 @@ test("github association failure matrix never rewrites an already-published work
     assert.deepEqual(eventIdentity(recovered), eventIdentity(before));
     assert.equal(recovered.github?.headSha, HEAD_B);
     assert.equal(recovered.evidence, undefined);
-    assert.equal((await harness.index.find("owner/repo", 28))?.headSha, HEAD_B);
+    assert.equal((await harness.index.findStable(REPO_ID, 28))?.headSha, HEAD_B);
   });
 
   await t.test("stop after association commit preserves the snapshot without routing an event", async (t) => {
@@ -1665,6 +1720,7 @@ test("delivery reruns converge to current head C and revalidation returns to PR_
   run.workspace = await captureWorkspace(cwd);
   run.github = {
     installationId: 44,
+    repositoryId: REPO_ID,
     repository: "owner/repo",
     pullRequestNumber: 28,
     baseSha: headA,
@@ -1678,9 +1734,10 @@ test("delivery reruns converge to current head C and revalidation returns to PR_
   };
   await store.save(run);
   const index = new GitHubAssociationIndex(path.join(cwd, ".maswe", "github"));
-  await index.bind({
+  await bindStableRecord(index, {
     runId: run.id,
     installationId: 44,
+    repositoryId: REPO_ID,
     repository: "owner/repo",
     pullRequestNumber: 28,
     baseSha: headA,
@@ -1689,8 +1746,23 @@ test("delivery reruns converge to current head C and revalidation returns to PR_
   });
   const http: GitHubHttpClient = {
     async request(method, url) {
+      if (method === "GET" && url.includes("/installation/repositories")) {
+        return canonicalListingResponse();
+      }
       if (method === "GET" && url.includes("/pulls/")) {
-        return { status: 200, headers: {}, body: { head: { sha: headC }, state: "open" } };
+        return {
+          status: 200,
+          headers: {},
+          body: {
+            state: "open",
+            head: { sha: headC, ref: "maswe/issue-28" },
+            base: {
+              sha: HEAD_A,
+              ref: "main",
+              repo: { id: REPO_ID, full_name: "owner/repo" },
+            },
+          },
+        };
       }
       if (method === "GET" && url.includes("/check-runs")) {
         return { status: 200, headers: {}, body: { check_runs: [] } };
@@ -1703,7 +1775,7 @@ test("delivery reruns converge to current head C and revalidation returns to PR_
     config: value,
     store,
     http,
-    tokenProvider: async () => "test-token",
+    repositoryTokenProvider: async () => "test-token",
     synchronousWebhookDispatch: true,
   });
 
@@ -1753,11 +1825,8 @@ test("post-commit association fence blocks routing when authoritative identity c
       const harness = await adapterHarness(t, {
         afterAssociationCommitBeforeRouting: async (runId) => {
           if (mutation === "index suspended before run record") {
-            await authoritativeIndex.suspend(
-              "owner/repo",
-              28,
-              "authorization-revoked",
-            );
+            await authoritativeIndex.withTransaction(async (transaction) =>
+              transaction.suspendStable(REPO_ID, 28, "authorization-revoked"));
             return;
           }
           if (mutation === "run record suspended before index") {
@@ -1770,11 +1839,12 @@ test("post-commit association fence blocks routing when authoritative identity c
             await authoritativeStore.save(concurrent);
             return;
           }
-          const committed = await authoritativeIndex.find("owner/repo", 28);
+          const committed = await authoritativeIndex.findStable(REPO_ID, 28);
           assert.ok(committed);
-          await authoritativeIndex.bind({
+          await bindStableRecord(authoritativeIndex, {
             runId: committed.runId,
             installationId: committed.installationId,
+            repositoryId: REPO_ID,
             repository: committed.repository,
             pullRequestNumber: committed.pullRequestNumber,
             baseSha: committed.baseSha,
@@ -1816,7 +1886,7 @@ test("installation suspension that wins after association validation publishes n
     config: config(),
     store: harness.store,
     http: { async request() { throw new Error("installation suspension must not call GitHub"); } },
-    tokenProvider: async () => {
+    repositoryTokenProvider: async () => {
       throw new Error("installation suspension must not create a token");
     },
     synchronousWebhookDispatch: true,
@@ -1832,7 +1902,7 @@ test("installation suspension that wins after association validation publishes n
   const recovered = await harness.store.load(harness.runId);
   assert.deepEqual(eventIdentity(recovered), eventIdentity(before));
   assert.equal(recovered.github?.suspended, true);
-  assert.equal((await harness.index.find("owner/repo", 28))?.suspended, true);
+  assert.equal((await harness.index.findStable(REPO_ID, 28))?.suspended, true);
   assert.equal(harness.posts.length, 0);
 });
 
@@ -1860,7 +1930,7 @@ test("installation suspension started after routing cannot publish checks agains
     config: config(),
     store: harness.store,
     http: { async request() { throw new Error("installation suspension must not call GitHub"); } },
-    tokenProvider: async () => {
+    repositoryTokenProvider: async () => {
       throw new Error("installation suspension must not create a token");
     },
     synchronousWebhookDispatch: true,
@@ -1877,7 +1947,7 @@ test("installation suspension started after routing cannot publish checks agains
   assert.deepEqual(eventIdentity(recovered), eventHistoryDuringCheckPublication);
   assert.equal(recovered.events.at(-1)?.type, "REVALIDATE_REQUESTED");
   assert.equal(recovered.github?.suspended, true);
-  assert.equal((await harness.index.find("owner/repo", 28))?.suspended, true);
+  assert.equal((await harness.index.findStable(REPO_ID, 28))?.suspended, true);
   assert.ok(harness.posts.length > 0);
 });
 
@@ -1931,9 +2001,10 @@ test("association outcome unknown never invokes registered rollback callbacks", 
       transaction.onRollback(async () => {
         rollbacks.push("must-not-run");
       });
-      transaction.bind({
+      transaction.bindStable({
         runId: "run-outcome-unknown",
         installationId: 44,
+        repositoryId: REPO_ID,
         repository: "owner/repo",
         pullRequestNumber: 28,
         baseSha: HEAD_A,
@@ -1978,9 +2049,10 @@ for (const nesting of ["AggregateError.errors", "Error.cause"] as const) {
         transaction.onRollback(async () => {
           rollbackCalls += 1;
         });
-        transaction.bind({
+        transaction.bindStable({
           runId: `run-nested-${nesting === "Error.cause" ? "cause" : "aggregate"}`,
           installationId: 44,
+          repositoryId: REPO_ID,
           repository: "owner/repo",
           pullRequestNumber: 28,
           baseSha: HEAD_A,

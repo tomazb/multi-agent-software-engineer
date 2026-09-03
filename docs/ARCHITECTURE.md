@@ -10,7 +10,10 @@ MASWE is an **orchestrator-first system with a thin Cursor plugin** today and an
 - MH-00 defines a future harness registry, exact attempt identity, capability negotiation, governed outer supervision, raw/normalized execution evidence, and assurance evaluation without transferring workflow authority to a harness.
 - Superpowers defines how each role performs its assigned engineering work.
 - Deterministic project commands decide test/build health.
-- GitHub Phase A is implemented; Phase B remains governed by Issue #3 and stable repository identity work in #34.
+- GitHub Phase A is implemented and keys repository authorization, association, locking, credential
+  scope, and check ownership on GitHub's immutable numeric repository ID (#34). Phase B remains
+  governed by Issue #3 and must not obtain write authority until #34 is completed, independently
+  validated, merged, and post-merge `main` is revalidated.
 
 The accepted MH-00 baseline is `23f06f3900598443dc40c65c35336aecda76ea2f`. The normative planned
 multi-harness design is `docs/superpowers/specs/2026-08-26-mh-00-multi-harness-execution-architecture.md`
@@ -594,7 +597,21 @@ Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/
   file/directory-syncs a hash-addressed normalized inbox envelope before returning 202. Completed
   duplicates return 200, queued/processing duplicates return 202, and same-ID content conflicts
   return 409. One lease worker recovers durable pending work before listener readiness.
+- Authorizes every repository-scoped operation against `githubApp.allowedRepositoryIds` alone. The
+  immutable numeric `repository.id` is the identity anchor; mutable `owner/repo` is routing and
+  display metadata that never authorizes, and no redirect, remote, branch, SHA, or check resource
+  substitutes for the ID. Association records, publication and association-identity fences,
+  installation-token scope, and check idempotency keys are all ID-keyed.
 - Binds runs to repository/PR/head SHA via github.com HTTPS/SSH remotes only; invalidates local evidence when head SHA changes; fails closed when live-head lookup errors.
+- Reconciles a stale canonical name from the authenticated installation-repository listing under
+  the ID it already holds, and mints one ID-scoped installation token per purpose
+  (`metadata-reconcile`, `pull-request-read`, `checks`) with that purpose's exact permission set.
+- Classifies repository-scoped dispatch failures as permanent or retryable, so an identity or
+  policy rejection is consumed with zero authority-increasing mutation instead of becoming a
+  poison delivery; ambiguous API and pagination failures stay retryable.
+- Migrates pre-#34 name-keyed state through the explicit, restartable
+  `maswe github-migrate-repository` operator command under the `repository-identity` fence.
+  `maswe github-webhook` refuses listener readiness while `allowedRepositoryIds` is empty.
 - Creates separate check runs for specification compliance, deterministic quality, independent
   verification, and review-comment resolution (resolution remains `neutral` until Phase B).
   `external_id` hashes the complete idempotency key; missing local records reconcile through
@@ -607,16 +624,19 @@ Phase A (read-only checks) lives in `src/github/` and calls public orchestrator/
   sanitized local diagnostics. Manual publication never reclaims the listener's inbox leases.
 
 GitHub journals live beneath
-`.maswe/github/journals/{association,association-identity,check-create,delivery,publication}/<logical-key-sha256>/.lock-journal-v3/`
-and use the same claims/releases/tmp layout as local journals. The Phase A concurrency boundary is
+`.maswe/github/journals/{association,association-identity,check-create,delivery,publication,repository-identity}/<logical-key-sha256>/.lock-journal-v3/`
+and use the same claims/releases/tmp layout as local journals. `repository-identity` is keyed by
+`<repositoryId>`; `publication` and `association-identity` are keyed by
+`<repositoryId>#<pullRequestNumber>`. The Phase A concurrency boundary is
 one listener plus simultaneous manual publishers on one host and one coherent local filesystem
 with atomic no-clobber hard links. Legacy association/check-create/delivery migration requires all
 old processes to stop, retains legacy evidence, and does not support mixed old/new binaries.
 
 Phase B adds authenticated digest-bound approvals, deterministic push/PR publication,
-human-approved review resolution/replies, and Actions/artifact ingestion. Issue #34 must establish
-or explicitly disposition stable repository identity across renames before Phase B obtains GitHub
-write authority. Multi-harness runtime implementation remains blocked until Phase B completes.
+human-approved review resolution/replies, and Actions/artifact ingestion. Phase B must not obtain
+GitHub write authority until Issue #34 is completed, independently validated, merged, and
+post-merge `main` is revalidated. Multi-harness runtime implementation remains blocked until Phase
+B completes.
 See `docs/GITHUB_APP.md` and Issues #3/#34.
 
 ## 9. Consistency and concurrency
@@ -624,9 +644,14 @@ See `docs/GITHUB_APP.md` and Issues #3/#34.
 v0.2 uses optimistic `version` checks and atomic writes per run. Concurrent writers against the
 same run still fail closed rather than merge updates.
 
-The cross-system acquisition order is fixed: GitHub per-PR publication journal, GitHub per-PR
-association-identity journal, per-run mutation journal, global GitHub association journal, then
-per-run store data journal. Paths that need only a suffix of this order start at that suffix.
+The cross-system acquisition order is fixed: GitHub `repository-identity(repositoryId)` journal,
+GitHub per-PR publication journal, GitHub per-PR association-identity journal (both keyed
+`<repositoryId>#<pullRequestNumber>`), per-run mutation journal, global GitHub association journal,
+then per-run store data journal. Paths that need only a suffix of this order start at that suffix.
+Authority-reducing removal of an unresolved pre-#34 legacy association uses the
+`run target mutation fence -> global association transaction` suffix only: it never takes a
+name-keyed publication/association-identity fence and never invents a repository-ID fence for a
+record that has no ID.
 No callback reacquires a journal it already owns. This ordering lets manual and webhook Phase A
 mutations share the same target boundary as local retargets without deadlocking store writes.
 
@@ -783,7 +808,7 @@ GitHub input
   before persistence, but typed SDK-specific metadata requires a separate adapter lifecycle/test
   seam change.
 - Reasoning effort is stored but not translated into provider-specific SDK parameters.
-- GitHub App Phase A read-only check runs are implemented in `src/github/`; Phase B remains on #3 and stable repository identity across renames remains #34.
+- GitHub App Phase A read-only check runs are implemented in `src/github/` and are stable-repository-identity keyed (#34); Phase B write authority remains on #3 and is gated on #34 completing.
 - MH-00 multi-harness architecture is documentation-only. Harness-neutral domain contracts, registry refactor, external adapters, assurance profiles, governed writers, and distributed execution remain future tranches MH-01 through MH-09.
 
 Closed in v0.2/#27: branch/worktree manager, git SHA persistence on the run record, atomic file-store writes with optimistic versioning, artifact digest revalidation, attempt history, secret redaction, stdin prompt transport, budgets/timeouts, retry/supersede recovery, governed Node runtime enforcement, durable CREATED/revalidation recovery, non-bypassable role policy, and retryable terminal worktree cleanup.

@@ -3,6 +3,7 @@ import {
   UnsupportedGitHubWebhookError,
   type GitHubInternalEvent,
   type GitHubInternalEventType,
+  type GitHubRepositoryIdentity,
 } from "./types.ts";
 
 export interface NormalizeInput {
@@ -81,11 +82,76 @@ function requireInstallationId(payload: Record<string, unknown>): number {
   return requirePositiveInteger(installationId(payload), "installation.id");
 }
 
+/**
+ * The single exact repository-identity extractor for every supported
+ * repository-scoped event. Requires and returns a positive safe-integer
+ * `repository.id` alongside the canonical `owner/repo` name. Never derives
+ * one from the other: an ID is read from `repository.id`, a name is read
+ * from `repository.full_name`, and neither call synthesizes the other.
+ */
+function requireRepositoryIdentity(payload: Record<string, unknown>): {
+  repositoryId: number;
+  repository: string;
+} {
+  const repository = asRecord(payload.repository);
+  return {
+    repositoryId: requirePositiveInteger(repository?.id, "repository.id"),
+    repository: requireRepository(payload),
+  };
+}
+
+/**
+ * Extracts one exact `{ repositoryId, repository }` pair from a single
+ * `installation_repositories` list item. Requires both a positive safe
+ * integer id and a canonical owner/repo name on the item itself.
+ */
+function requireRepositoryIdentityItem(item: unknown, listKey: string): GitHubRepositoryIdentity {
+  const record = asRecord(item);
+  const fullName = requireString(record?.full_name, `${listKey}.full_name`);
+  if (!/^[^/\s]+\/[^/\s]+$/.test(fullName)) {
+    malformed(`${listKey}.full_name must use owner/repository form`);
+  }
+  return {
+    repositoryId: requirePositiveInteger(record?.id, `${listKey}.id`),
+    repository: fullName.toLowerCase(),
+  };
+}
+
+/**
+ * Builds the deduplicated, order-preserving list of ID/name pairs for an
+ * `installation_repositories` event. Identical duplicate pairs collapse to
+ * one entry; the same numeric id appearing with a conflicting name is
+ * malformed.
+ */
+function requireRepositoryIdentityPairs(
+  listed: unknown[],
+  listKey: string,
+): GitHubRepositoryIdentity[] {
+  const nameById = new Map<number, string>();
+  const seenPairs = new Set<string>();
+  const pairs: GitHubRepositoryIdentity[] = [];
+  for (const item of listed) {
+    const pair = requireRepositoryIdentityItem(item, listKey);
+    const existingName = nameById.get(pair.repositoryId);
+    if (existingName !== undefined && existingName !== pair.repository) {
+      malformed(`${listKey} contains conflicting repository names for the same repository id`);
+    }
+    nameById.set(pair.repositoryId, pair.repository);
+    const pairKey = `${pair.repositoryId}:${pair.repository}`;
+    if (!seenPairs.has(pairKey)) {
+      seenPairs.add(pairKey);
+      pairs.push(pair);
+    }
+  }
+  return pairs;
+}
+
 function withOptional(
   base: GitHubInternalEvent,
   extras: {
     repository?: string | undefined;
-    repositories?: string[] | undefined;
+    repositoryId?: number | undefined;
+    repositories?: GitHubRepositoryIdentity[] | undefined;
     installationId?: number | undefined;
     pullRequestNumber?: number | undefined;
     headSha?: string | undefined;
@@ -97,6 +163,7 @@ function withOptional(
 ): GitHubInternalEvent {
   const event: GitHubInternalEvent = { ...base };
   if (extras.repository !== undefined) event.repository = extras.repository;
+  if (extras.repositoryId !== undefined) event.repositoryId = extras.repositoryId;
   if (extras.repositories !== undefined) event.repositories = extras.repositories;
   if (extras.installationId !== undefined) event.installationId = extras.installationId;
   if (extras.pullRequestNumber !== undefined) {
@@ -135,10 +202,12 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
     const base = asRecord(pr?.base);
     if (!base) malformed("pull_request.base must be an object");
     const type = `pull_request.${supportedAction}` as GitHubInternalEventType;
+    const identity = requireRepositoryIdentity(payload);
     return withOptional(
       { eventId: input.deliveryId, type, receivedAt },
       {
-        repository: requireRepository(payload),
+        repository: identity.repository,
+        repositoryId: identity.repositoryId,
         installationId: requireInstallationId(payload),
         pullRequestNumber: requirePositiveInteger(pr.number, "pull_request.number"),
         headSha: requireString(head.sha, "pull_request.head.sha"),
@@ -155,10 +224,12 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       malformed("ref must identify a branch");
     }
     const branch = ref.slice("refs/heads/".length);
+    const identity = requireRepositoryIdentity(payload);
     return withOptional(
       { eventId: input.deliveryId, type: "push", receivedAt },
       {
-        repository: requireRepository(payload),
+        repository: identity.repository,
+        repositoryId: identity.repositoryId,
         installationId: requireInstallationId(payload),
         headSha: requireString(payload.after, "after"),
         branch,
@@ -196,13 +267,7 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       supportedAction === "removed" ? "repositories_removed" : "repositories_added";
     if (!Array.isArray(payload[listKey])) malformed(`${listKey} must be an array`);
     const listed = payload[listKey] as unknown[];
-    const repositories = [...new Set(listed.map((item) => {
-      const fullName = requireString(asRecord(item)?.full_name, `${listKey}.full_name`);
-      if (!/^[^/\s]+\/[^/\s]+$/.test(fullName)) {
-        malformed(`${listKey}.full_name must use owner/repository form`);
-      }
-      return fullName.toLowerCase();
-    }))];
+    const repositories = requireRepositoryIdentityPairs(listed, listKey);
     return withOptional(
       {
         eventId: input.deliveryId,
@@ -214,7 +279,7 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
       },
       {
         installationId: requireInstallationId(payload),
-        repository: repositories[0] ?? optionalRepository(payload),
+        repository: repositories[0]?.repository ?? optionalRepository(payload),
         repositories,
         rawAction: supportedAction,
       },
@@ -224,10 +289,12 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
   if (input.eventName === "workflow_run") {
     const supportedAction = requireCompletedAction("workflow_run", action);
     const run = asRecord(payload.workflow_run);
+    const workflowRunIdentity = requireRepositoryIdentity(payload);
     return withOptional(
       { eventId: input.deliveryId, type: "workflow_run.completed", receivedAt },
       {
-        repository: requireRepository(payload),
+        repository: workflowRunIdentity.repository,
+        repositoryId: workflowRunIdentity.repositoryId,
         installationId: requireInstallationId(payload),
         headSha: requireString(run?.head_sha, "workflow_run.head_sha"),
         observeOnly: true,
@@ -246,10 +313,12 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
         : typeof checkRun?.head_sha === "string"
           ? checkRun.head_sha
           : undefined;
+    const checkRunIdentity = requireRepositoryIdentity(payload);
     return withOptional(
       { eventId: input.deliveryId, type: "check_run.completed", receivedAt },
       {
-        repository: requireRepository(payload),
+        repository: checkRunIdentity.repository,
+        repositoryId: checkRunIdentity.repositoryId,
         installationId: requireInstallationId(payload),
         headSha: requireString(headSha, "check_run.head_sha"),
         observeOnly: true,
@@ -261,10 +330,12 @@ export function normalizeGitHubWebhook(input: NormalizeInput): GitHubInternalEve
   if (input.eventName === "check_suite") {
     const supportedAction = requireCompletedAction("check_suite", action);
     const suite = asRecord(payload.check_suite);
+    const checkSuiteIdentity = requireRepositoryIdentity(payload);
     return withOptional(
       { eventId: input.deliveryId, type: "check_suite.completed", receivedAt },
       {
-        repository: requireRepository(payload),
+        repository: checkSuiteIdentity.repository,
+        repositoryId: checkSuiteIdentity.repositoryId,
         installationId: requireInstallationId(payload),
         headSha: requireString(suite?.head_sha, "check_suite.head_sha"),
         observeOnly: true,

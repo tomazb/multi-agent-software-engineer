@@ -5,12 +5,23 @@ import { parseMasweArgs } from "./cli-args.ts";
 import { loadConfig, writeStarterConfig } from "./config.ts";
 import type { AgentRuntime, MasweConfig, RunRecord } from "./domain.ts";
 import { GitHubAppAdapter } from "./github/adapter.ts";
+import { githubStateRoot, parseOwnerRepo } from "./github/adapter-identities.ts";
+import { GitHubAssociationIndex } from "./github/association.ts";
+import {
+  GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP_CODE,
+  isGitHubPermanentRepositoryRejectReason,
+} from "./github/dispatch-disposition.ts";
 import {
   createFetchGitHubHttpClient,
   type FetchGitHubHttpClientOptions,
   type GitHubHttpClient,
 } from "./github/http.ts";
-import { createInstallationAccessToken } from "./github/token.ts";
+import { RepositoryIdentityMigrationService } from "./github/repository-identity-migration.ts";
+import { GitHubSideEffectStore } from "./github/side-effect-store.ts";
+import {
+  createRepositoryInstallationAccessToken,
+  type GitHubRepositoryTokenProvider,
+} from "./github/token.ts";
 import {
   listenWebhookServer,
   type WebhookServerOptions,
@@ -35,8 +46,46 @@ function safeDiagnosticField(value: unknown, pattern: RegExp, maxLength = 128): 
     : undefined;
 }
 
+/**
+ * Bounded renderer for a permanently consumed repository delivery (design
+ * doc §16). Recognized by its own safe fields and rendered from those fields
+ * alone -- it deliberately never falls through to generic message/cause/detail
+ * rendering, so no arbitrary text can travel out through this shape. The
+ * diagnostic callback is the defined reader of the process-local
+ * `permanentRepositoryDropsSinceStart` counter; it is never persisted.
+ */
+function permanentRepositoryDropDiagnostic(
+  source: Record<string, unknown>,
+): string | undefined {
+  if (source.code !== GITHUB_WEBHOOK_PERMANENT_REPOSITORY_DROP_CODE) return undefined;
+  if (!isGitHubPermanentRepositoryRejectReason(source.reason)) return undefined;
+  return [
+    `code=${source.code}`,
+    `reason=${source.reason}`,
+    safeDiagnosticField(source.deliveryId, /^[A-Za-z0-9._-]+$/)
+      ? `delivery=${String(source.deliveryId)}`
+      : undefined,
+    safeDiagnosticField(source.eventName, /^[A-Za-z0-9._-]+$/)
+      ? `event=${String(source.eventName)}`
+      : undefined,
+    Number.isSafeInteger(source.attempt) && Number(source.attempt) >= 0
+      ? `attempt=${String(source.attempt)}`
+      : undefined,
+    Number.isSafeInteger(source.count) && Number(source.count) > 0
+      ? `count=${String(source.count)}`
+      : undefined,
+  ].filter((value): value is string => value !== undefined).join(" ");
+}
+
 function emitGitHubDiagnostic(error: unknown): void {
   const source = isRecord(error) ? error : {};
+  const permanentDrop = permanentRepositoryDropDiagnostic(source);
+  if (permanentDrop !== undefined) {
+    console.error(
+      sanitizeDiagnostic(permanentDrop, FAILURE_AGGREGATE_MAX_CODE_POINTS).text,
+    );
+    return;
+  }
   const context = [
     safeDiagnosticField(source.code, /^[A-Z0-9_]+$/)
       ? `code=${String(source.code)}`
@@ -89,12 +138,15 @@ Usage:
   maswe unlock-admin <run-id> [--force]
   maswe github-webhook
   maswe github-publish-checks <run-id> [--json]
+  maswe github-migrate-repository --from <owner/repo> --repository-id <id> [--json]
 
 Options:
   --config <path>  Use a specific config file.
   --cwd <path>     Run against a different repository directory.
   --json           Print machine-readable output.
   --force          init: replace config; unlock*: assert quiescence and release exactly.
+  --from <owner/repo>   github-migrate-repository: local legacy selector only; never identity proof.
+  --repository-id <id>  github-migrate-repository: the authoritative stable GitHub repository id.
 
 String option values beginning with "-" require --name=value.
 `;
@@ -116,7 +168,44 @@ async function orchestratorForRun(
   return { orchestrator, runtime, run };
 }
 
-const PROJECT_CONFIG_COMMANDS = new Set(["doctor", "start", "github-webhook", "github-publish-checks"]);
+const PROJECT_CONFIG_COMMANDS = new Set([
+  "doctor",
+  "start",
+  "github-webhook",
+  "github-publish-checks",
+  "github-migrate-repository",
+]);
+
+/**
+ * Strict `--repository-id` grammar: decimal digits with no leading zero, sign,
+ * separator, exponent, or radix prefix, and inside the safe-integer range. The
+ * stable repository id is the sole identity anchor, so anything a human could
+ * mistype into a different number is rejected rather than coerced.
+ */
+function parseRepositoryIdOption(value: string): number {
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error("--repository-id must be a positive safe integer");
+  }
+  const repositoryId = Number(value);
+  if (!Number.isSafeInteger(repositoryId) || repositoryId <= 0) {
+    throw new Error("--repository-id must be a positive safe integer");
+  }
+  return repositoryId;
+}
+
+/**
+ * `--from` is a local selector only and never identity proof (design doc
+ * §12). It is parsed with the shared repository grammar and normalized to
+ * lowercase here, before it selects or names anything.
+ */
+function parseLegacySelectorOption(value: string): string {
+  const normalized = value.toLowerCase();
+  if (!/^[^/\s]+\/[^/\s]+$/.test(normalized)) {
+    throw new Error(`--from must use the owner/repo form: ${value}`);
+  }
+  parseOwnerRepo(normalized);
+  return normalized;
+}
 
 export interface RunCliOptions {
   argv?: string[];
@@ -163,6 +252,35 @@ async function closeServerWithin(server: Server, timeoutMs: number): Promise<voi
   if (outcome === "timeout") server.closeAllConnections?.();
 }
 
+/**
+ * The single production credential source (design doc §4): every repository
+ * operation mints an ID-scoped installation token with the exact
+ * least-privilege permission set for its purpose. There is no name-scoped
+ * fallback anywhere in this path.
+ */
+function repositoryTokenProviderFor(
+  config: MasweConfig,
+  http: GitHubHttpClient,
+): GitHubRepositoryTokenProvider {
+  return async (installationId, repositoryId, purpose) => {
+    const githubApp = config.githubApp!;
+    const appId = process.env[githubApp.appIdEnv];
+    const privateKey = process.env[githubApp.privateKeyEnv];
+    if (!appId || !privateKey) {
+      throw new Error("GitHub App id or private key environment variables are missing");
+    }
+    return createRepositoryInstallationAccessToken({
+      appId,
+      privateKeyPem: privateKey,
+      installationId,
+      repositoryId,
+      purpose,
+      http,
+      readOnlyChecks: githubApp.readOnlyChecks,
+    });
+  };
+}
+
 function githubAdapterForCommand(
   cwd: string,
   config: MasweConfig,
@@ -174,22 +292,7 @@ function githubAdapterForCommand(
     config,
     store,
     http,
-    tokenProvider: async (installationId, repository) => {
-      const githubApp = config.githubApp!;
-      const appId = process.env[githubApp.appIdEnv];
-      const privateKey = process.env[githubApp.privateKeyEnv];
-      if (!appId || !privateKey) {
-        throw new Error("GitHub App id or private key environment variables are missing");
-      }
-      return createInstallationAccessToken({
-        appId,
-        privateKeyPem: privateKey,
-        installationId,
-        http,
-        repository,
-        readOnlyChecks: githubApp.readOnlyChecks,
-      });
-    },
+    repositoryTokenProvider: repositoryTokenProviderFor(config, http),
     onWebhookDiagnostic: emitGitHubDiagnostic,
   });
 }
@@ -215,6 +318,15 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
   }
 
   const store = new FileRunStore(cwd);
+
+  // Malformed migration input is a CLI grammar failure, reported before any
+  // project configuration, credential, or GitHub work is attempted.
+  const migrationInput = command === "github-migrate-repository"
+    ? {
+      legacyRepository: parseLegacySelectorOption(parsed.options.from!),
+      repositoryId: parseRepositoryIdOption(parsed.options["repository-id"]!),
+    }
+    : undefined;
 
   // Existing-run commands must not depend on current project config / env.
   let projectConfig: MasweConfig | undefined;
@@ -345,6 +457,16 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       if (!config.githubApp?.enabled) {
         throw new Error("githubApp.enabled must be true to start the webhook server");
       }
+      // Stable-identity cutover gate (design doc §3.2, §9.1). The documented
+      // cutover configures `allowedRepositoryIds` and completes migration
+      // before the listener starts, so a name-only configuration must never
+      // reach listener readiness: there is no intended window in which
+      // repository deliveries are accepted under name-only authorization.
+      if (config.githubApp.allowedRepositoryIds.length === 0) {
+        throw new Error(
+          "githubApp.allowedRepositoryIds must contain at least one repository id before the GitHub webhook listener starts",
+        );
+      }
       if (
         !process.env[config.githubApp.webhookSecretEnv] ||
         !process.env[config.githubApp.appIdEnv] ||
@@ -412,6 +534,54 @@ export async function runCli(options: RunCliOptions = {}): Promise<void> {
       await adapter.initializeManualPublisher();
       const run = await adapter.publishChecksForRun(runId);
       console.log(parsed.options.json ? JSON.stringify(run, null, 2) : renderRun(run));
+      return;
+    }
+    case "github-migrate-repository": {
+      const config = projectConfig!;
+      if (!config.githubApp?.enabled) {
+        throw new Error("githubApp.enabled must be true to migrate repository identity");
+      }
+      if (!process.env[config.githubApp.appIdEnv] || !process.env[config.githubApp.privateKeyEnv]) {
+        throw new Error("GitHub App id or private key environment variables are missing");
+      }
+      const http = createFetchGitHubHttpClient(options.githubHttpOptions);
+      const githubRoot = githubStateRoot(cwd);
+      // Migration is an explicit operator command: it holds the stable
+      // repository-identity fence and never starts a webhook listener or worker.
+      const service = new RepositoryIdentityMigrationService({
+        cwd,
+        config,
+        store,
+        associations: new GitHubAssociationIndex(githubRoot),
+        sideEffects: new GitHubSideEffectStore(githubRoot),
+        http,
+        tokenProvider: repositoryTokenProviderFor(config, http),
+      });
+      const result = await service.migrate(migrationInput!);
+      if (parsed.options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(
+        `Migrated GitHub repository identity ${result.legacyRepository} -> ${result.repositoryId}`
+          + ` (${result.canonicalRepository})`,
+      );
+      console.log(
+        `status=${result.status} passes=${result.passes}`
+          + ` installations=${result.installationIds.join(",")}`
+          + ` candidates=${result.candidates.length}`,
+      );
+      for (const candidate of result.candidates) {
+        console.log(
+          `  pr=${candidate.pullRequestNumber} run=${candidate.runId}`
+            + ` migratedFromLegacy=${candidate.migratedFromLegacy}`
+            + ` canonicalRefreshed=${candidate.canonicalRefreshed}`
+            + ` headChanged=${candidate.headChanged}`
+            + ` revalidationRouted=${candidate.revalidationRouted}`
+            + ` suspended=${candidate.suspended}`
+            + ` aliasedHeadShas=${candidate.aliasedHeadShas.length}`,
+        );
+      }
       return;
     }
     default:

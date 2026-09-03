@@ -7,9 +7,37 @@ import test from "node:test";
 import { mergeConfigForTest } from "../src/config.ts";
 import { GitHubAppAdapter } from "../src/github/adapter.ts";
 import { GitHubDeliveryInbox } from "../src/github/delivery-inbox.ts";
+import type { GitHubInternalEvent } from "../src/github/types.ts";
 import { FileRunStore } from "../src/store.ts";
 
 const SECRET_ENV = "MASWE_TEST_INBOX_MIGRATION_SECRET";
+const REPO_ID = 1308655205;
+
+/** Live installation-repository listing proving the allowlisted stable id is present. */
+function canonicalListing() {
+  return {
+    status: 200,
+    headers: {},
+    body: { repositories: [{ id: REPO_ID, full_name: "owner/repo" }] },
+  };
+}
+
+/** Full live pull request snapshot proving `base.repo.id`. */
+function livePullRequest(headSha: string) {
+  return {
+    status: 200,
+    headers: {},
+    body: {
+      state: "open",
+      head: { sha: headSha, ref: "feature" },
+      base: {
+        sha: "base",
+        ref: "main",
+        repo: { id: REPO_ID, full_name: "owner/repo" },
+      },
+    },
+  };
+}
 const SECRET = "inbox-migration-secret";
 
 function config() {
@@ -22,6 +50,7 @@ function config() {
       webhookSecretEnv: SECRET_ENV,
       appIdEnv: "MASWE_TEST_APP_ID",
       privateKeyEnv: "MASWE_TEST_PRIVATE_KEY",
+      allowedRepositoryIds: [REPO_ID],
       allowedRepositories: ["owner/repo"],
     },
   });
@@ -31,7 +60,7 @@ function request(deliveryId: string, headSha: string) {
   const rawBody = JSON.stringify({
     action: "synchronize",
     installation: { id: 44 },
-    repository: { full_name: "owner/repo" },
+    repository: { id: REPO_ID, full_name: "owner/repo" },
     pull_request: {
       number: 9,
       head: { sha: headSha, ref: "feature" },
@@ -82,15 +111,18 @@ test("startup migration turns v1 processing into awaiting-redelivery", async (t)
     store: new FileRunStore(cwd),
     http: {
       async request(method, url) {
+        if (method === "GET" && url.includes("/installation/repositories")) {
+          return canonicalListing();
+        }
         if (method === "GET" && url.includes("/pulls/")) {
-          return { status: 200, headers: {}, body: { head: { sha: "sha-legacy" }, state: "open" } };
+          return livePullRequest("sha-legacy");
         }
         if (method === "GET") return { status: 200, headers: {}, body: { check_runs: [] } };
         posts += 1;
         return { status: 201, headers: {}, body: { id: posts } };
       },
     },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   await adapter.initialize();
@@ -135,7 +167,7 @@ test("startup migration preserves v1 completed as terminal legacy", async (t) =>
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { requests += 1; return { status: 500, headers: {}, body: {} }; } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   await adapter.initialize();
@@ -169,7 +201,7 @@ test("startup migration fails closed instead of overwriting conflicting retained
     config: config(),
     store: new FileRunStore(cwd),
     http: { async request() { throw new Error("migration must fail before API work"); } },
-    tokenProvider: async () => "token",
+    repositoryTokenProvider: async () => "token",
   });
 
   await assert.rejects(adapter.initialize(), /conflicting legacy delivery evidence/i);
@@ -221,6 +253,191 @@ test("orphan queue markers cannot lease payloadless legacy migration states", as
 
     assert.equal(await inbox.claimNext(Date.now() + 1), undefined);
   }
+});
+
+/**
+ * Writes a pre-#34 format-2 durable inbox record directly to disk, bypassing
+ * normalization entirely, to prove historical ID-less events remain exactly
+ * loadable at the durable-record boundary. Historical records never carry a
+ * `repositoryId`; #34 must not synthesize one on read.
+ */
+async function writeFormat2QueuedFixture(
+  githubRoot: string,
+  deliveryId: string,
+  eventName: string,
+  event: Record<string, unknown>,
+): Promise<void> {
+  const hash = createHash("sha256").update(deliveryId).digest("hex");
+  const prefix = hash.slice(0, 2);
+  const stateDirectory = path.join(githubRoot, "inbox", "state", prefix, hash);
+  const queueDirectory = path.join(githubRoot, "inbox", "queue", prefix);
+  await mkdir(stateDirectory, { recursive: true });
+  await mkdir(queueDirectory, { recursive: true });
+  const receivedAt = "2026-01-01T00:00:00.000Z";
+  const record = {
+    format: 2,
+    record: "github-delivery-inbox",
+    deliveryId,
+    eventName,
+    receivedAt,
+    rawBodyDigest: `sha256:${"a".repeat(64)}`,
+    status: "queued",
+    attempt: 0,
+    nextAttemptAt: receivedAt,
+    event: { eventId: deliveryId, receivedAt, ...event },
+  };
+  await writeFile(path.join(stateDirectory, "state.json"), JSON.stringify(record), "utf8");
+  await writeFile(path.join(queueDirectory, `${hash}.queued`), "", "utf8");
+}
+
+test("a pre-#34 ordinary repository event remains readable and stays ID-less", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-legacy-ordinary-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "pre34-ordinary-push";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "push", {
+    type: "push",
+    repository: "owner/repo",
+    installationId: 44,
+    headSha: "sha-legacy",
+    branch: "main",
+  });
+
+  const inbox = new GitHubDeliveryInbox(githubRoot);
+  await inbox.initialize();
+  const claimed = await inbox.claimNext(Date.now());
+  assert.ok(claimed, "expected the pre-#34 event to be claimable");
+  const event = claimed!.record.event as GitHubInternalEvent;
+  assert.equal(event.repository, "owner/repo");
+  assert.equal(event.repositoryId, undefined);
+  assert.equal(event.headSha, "sha-legacy");
+  assert.equal(event.branch, "main");
+});
+
+test("a pre-#34 installation_repositories string array migrates to legacyRepositories at the durable-record boundary", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-legacy-install-repos-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "pre34-installation-repositories-removed";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: ["owner/one", "owner/two"],
+    rawAction: "removed",
+  });
+
+  const inbox = new GitHubDeliveryInbox(githubRoot);
+  await inbox.initialize();
+  const claimed = await inbox.claimNext(Date.now());
+  assert.ok(claimed, "expected the pre-#34 installation_repositories event to be claimable");
+  const event = claimed!.record.event as GitHubInternalEvent;
+  assert.deepEqual(event.legacyRepositories, ["owner/one", "owner/two"]);
+  assert.equal(event.repositories, undefined);
+  assert.equal(event.repository, "owner/one");
+  assert.equal(event.repositoryId, undefined);
+});
+
+test("a new-form installation_repositories record with an empty repositories array round-trips without becoming legacyRepositories", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-empty-pairs-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-empty-pairs";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repositories: [],
+    rawAction: "removed",
+  });
+
+  const inbox = new GitHubDeliveryInbox(githubRoot);
+  await inbox.initialize();
+  const claimed = await inbox.claimNext(Date.now());
+  assert.ok(claimed, "expected the empty-pairs new-form event to be claimable");
+  const event = claimed!.record.event as GitHubInternalEvent;
+  assert.deepEqual(event.repositories, []);
+  assert.equal(event.legacyRepositories, undefined);
+});
+
+test("a both-keys installation_repositories record is rejected instead of laundered into a legacy record", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-both-keys-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "both-keys-record";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: ["owner/one"],
+    legacyRepositories: ["owner/evil"],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
+test("a new-form pairs record with conflicting names for the same repository id is rejected", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-pairs-conflict-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-pairs-conflicting-name";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: [
+      { repositoryId: 111, repository: "owner/one" },
+      { repositoryId: 111, repository: "owner/two" },
+    ],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
+test("a new-form pairs record with a mixed string/object array is rejected", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-pairs-mixed-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-pairs-mixed-array";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: ["owner/one", { repositoryId: 222, repository: "owner/two" }],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
+});
+
+test("a both-keys record with genuine object pairs alongside legacyRepositories is rejected", async (t) => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "maswe-gh-inbox-pairs-both-keys-"));
+  t.after(async () => rm(cwd, { recursive: true, force: true }));
+  const githubRoot = path.join(cwd, ".maswe", "github");
+  const deliveryId = "new-form-pairs-both-keys";
+  await writeFormat2QueuedFixture(githubRoot, deliveryId, "installation_repositories", {
+    type: "installation_repositories.removed",
+    installationId: 7,
+    repository: "owner/one",
+    repositories: [{ repositoryId: 111, repository: "owner/one" }],
+    legacyRepositories: ["owner/evil"],
+    rawAction: "removed",
+  });
+
+  await assert.rejects(
+    new GitHubDeliveryInbox(githubRoot).initialize(),
+    /Invalid GitHub durable inbox event/,
+  );
 });
 
 test("startup rejects symlinked inbox namespaces without mutating their targets", async (t) => {

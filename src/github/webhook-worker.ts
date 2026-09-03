@@ -1,4 +1,9 @@
 import type { GitHubDeliveryInbox } from "./delivery-inbox.ts";
+import {
+  type GitHubDispatchResult,
+  type GitHubPermanentRejectContext,
+  settleGitHubDispatchResult,
+} from "./dispatch-disposition.ts";
 import type { GitHubInternalEvent } from "./types.ts";
 import { GitHubWebhookDiagnosticError } from "./webhook-diagnostic.ts";
 
@@ -10,8 +15,10 @@ const WORKER_FAILURE_BACKOFF_MS = 250;
 /** One due-aware durable-delivery worker owned by a listener adapter. */
 export class GitHubWebhookWorker {
   private readonly inbox: GitHubDeliveryInbox;
-  private readonly dispatch: (event: GitHubInternalEvent) => Promise<void>;
+  private readonly dispatch: (event: GitHubInternalEvent) => Promise<GitHubDispatchResult>;
   private readonly onDiagnostic: ((error: unknown) => void) | undefined;
+  private readonly onPermanentRejectCompleted:
+    ((context: GitHubPermanentRejectContext) => void) | undefined;
   private readonly onSchedule: ((delayMs: number) => void) | undefined;
   private enabled: boolean;
   private worker: Promise<void> | undefined;
@@ -24,15 +31,18 @@ export class GitHubWebhookWorker {
 
   constructor(options: {
     inbox: GitHubDeliveryInbox;
-    dispatch: (event: GitHubInternalEvent) => Promise<void>;
+    dispatch: (event: GitHubInternalEvent) => Promise<GitHubDispatchResult>;
     enabled?: boolean;
     onDiagnostic?: (error: unknown) => void;
+    /** Observability only; invoked after `inbox.complete()` succeeds (design doc §16). */
+    onPermanentRejectCompleted?: (context: GitHubPermanentRejectContext) => void;
     onSchedule?: (delayMs: number) => void;
   }) {
     this.inbox = options.inbox;
     this.dispatch = options.dispatch;
     this.enabled = options.enabled ?? false;
     this.onDiagnostic = options.onDiagnostic;
+    this.onPermanentRejectCompleted = options.onPermanentRejectCompleted;
     this.onSchedule = options.onSchedule;
   }
 
@@ -137,9 +147,17 @@ export class GitHubWebhookWorker {
       try {
         let dispatchCompleted = false;
         try {
-          await this.dispatch(claimed.record.event);
+          const result = await this.dispatch(claimed.record.event);
           dispatchCompleted = true;
-          await this.inbox.complete(deliveryId, leaseId);
+          // A permanent identity/policy rejection consumes the delivery; the
+          // post-completion callback is observability only and can never
+          // reach the retry path below (design doc §16).
+          await settleGitHubDispatchResult({
+            result,
+            complete: () => this.inbox.complete(deliveryId, leaseId),
+            onPermanentRejectCompleted: (reason) =>
+              this.onPermanentRejectCompleted?.({ ...context, reason }),
+          });
         } catch (error) {
           this.emitDiagnostic(new GitHubWebhookDiagnosticError(
             dispatchCompleted

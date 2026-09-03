@@ -12,10 +12,12 @@ import {
 import path from "node:path";
 import {
   LockJournalError,
+  formatLockTicket,
   initializeLockJournal,
   publishClaimRelease,
   publishLockClaim,
   recoverCurrentLock,
+  scanLockJournal,
   validateClaimOwnership,
   type ClaimOperation,
   type JournalTransition,
@@ -27,7 +29,8 @@ export type GitHubJournalKind =
   | "association-identity"
   | "check-create"
   | "delivery"
-  | "publication";
+  | "publication"
+  | "repository-identity";
 
 export type GitHubJournalErrorCode =
   | "GITHUB_JOURNAL_INVALID_OPTIONS"
@@ -97,6 +100,7 @@ interface LegacyMigrationRecord {
 }
 
 const ASSOCIATION_KEY = "associations";
+const REPOSITORY_ID_KEY_PATTERN = /^[1-9][0-9]*$/;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 10;
@@ -109,6 +113,7 @@ const JOURNAL_KINDS: GitHubJournalKind[] = [
   "check-create",
   "delivery",
   "publication",
+  "repository-identity",
 ];
 const OPERATION_BY_KIND: Record<GitHubJournalKind, ClaimOperation> = {
   association: "github-association",
@@ -116,6 +121,7 @@ const OPERATION_BY_KIND: Record<GitHubJournalKind, ClaimOperation> = {
   "check-create": "github-check-create",
   delivery: "github-delivery",
   publication: "github-publication",
+  "repository-identity": "github-repository-identity",
 };
 
 function errno(error: unknown): string | undefined {
@@ -883,7 +889,8 @@ export async function withGitHubJournal<T>(
     !JOURNAL_KINDS.includes(kind) ||
     typeof logicalKey !== "string" ||
     !logicalKey ||
-    (kind === "association" && logicalKey !== ASSOCIATION_KEY)
+    (kind === "association" && logicalKey !== ASSOCIATION_KEY) ||
+    (kind === "repository-identity" && !REPOSITORY_ID_KEY_PATTERN.test(logicalKey))
   ) {
     throw publicError(
       "GITHUB_JOURNAL_INVALID_OPTIONS",
@@ -989,4 +996,134 @@ export async function withGitHubJournal<T>(
   if (primaryError !== undefined) throw primaryError;
   if (releaseError !== undefined) throw releaseError;
   return result as T;
+}
+
+export type LegacyGitHubJournalOwnershipState =
+  | "absent"
+  | "dead"
+  | "live"
+  | "malformed"
+  | "ambiguous";
+
+/**
+ * Read-only pre-#34 legacy-journal ownership preflight (design §9.1). Classifies the current
+ * name-keyed publication/association-identity lock conservatively without ever acquiring,
+ * recovering, or otherwise disturbing it: no claim is published, no release is published, and
+ * no dead owner is reclaimed. This is defense in depth only -- it cannot prove an idle old
+ * process will not acquire the lock later. Operator/process quiescence of all pre-#34 binaries
+ * remains a hard migration precondition (see §9.1); this function reports lock state only and
+ * never claims or implies quiescence.
+ */
+export async function inspectLegacyGitHubJournalOwnership(options: {
+  githubRoot: string;
+  kind: "publication" | "association-identity";
+  logicalKey: string;
+  isProcessDefinitelyDead?: (pid: number) => boolean;
+}): Promise<{ state: LegacyGitHubJournalOwnershipState }> {
+  const { githubRoot, kind, logicalKey } = options;
+  if (
+    (kind !== "publication" && kind !== "association-identity") ||
+    typeof githubRoot !== "string" ||
+    githubRoot.length === 0 ||
+    typeof logicalKey !== "string" ||
+    logicalKey.length === 0
+  ) {
+    throw publicError(
+      "GITHUB_JOURNAL_INVALID_OPTIONS",
+      kind,
+      `GitHub ${kind} journal options are invalid`,
+    );
+  }
+  const isProcessDefinitelyDeadFn = options.isProcessDefinitelyDead ?? processDefinitelyDead;
+  const target = journalDirectory(githubRoot, kind, logicalKey);
+
+  let rootStat;
+  try {
+    rootStat = await lstat(target);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return { state: "absent" };
+    // Cannot exactly classify a stat failure we do not recognize; fail conservative.
+    return { state: "ambiguous" };
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    return { state: "malformed" };
+  }
+
+  // scanLockJournal()/initializeLockJournal() only complete idempotent journal scaffolding
+  // (manifest/fixed directories) when missing; neither publishes a claim or a release, so no
+  // ownership state is created, acquired, or disturbed by this read. "Read-only" above therefore
+  // means read-only with respect to ownership, not to the filesystem: this call may still create
+  // the manifest/fixed-directory scaffolding on disk the first time a logical key is inspected.
+  let scan;
+  try {
+    scan = await scanLockJournal(target, "data", { allowUnresolvedRawClaims: true });
+  } catch (error) {
+    if (
+      error instanceof LockJournalError &&
+      (error.code === "LOCK_CORRUPT" || error.code === "LOCK_UNSAFE_PATH_TYPE")
+    ) {
+      return { state: "malformed" };
+    }
+    // An unrecognized failure is not proof of corruption; fail conservative rather than
+    // guessing "absent" or "malformed".
+    return { state: "ambiguous" };
+  }
+
+  if (scan.legacy && !scan.legacyRelease) {
+    if (scan.legacy.state === "corrupt") return { state: "malformed" };
+    if (scan.legacy.state === "valid-live") return { state: "live" };
+    // state is "valid-dead": pidAliveConservative() folds any kill() errno other than EPERM
+    // into "dead", including indeterminate probes such as EIO, so it is not an exact death
+    // proof. Re-prove death exactly before ever reporting it, mirroring the esrch-only
+    // reproof recoverCurrentLock performs before treating a legacy owner as releasable.
+    if (scan.legacy.pid === undefined) return { state: "ambiguous" };
+    let legacyDead: boolean;
+    try {
+      legacyDead = isProcessDefinitelyDeadFn(scan.legacy.pid);
+    } catch {
+      return { state: "ambiguous" };
+    }
+    return { state: legacyDead ? "dead" : "live" };
+  }
+
+  const claimsByTicket = new Map(scan.claims.map((claim) => [claim.ticket, claim]));
+
+  // A ticket strictly behind the current (lowest unresolved) one is ordinary on-disk state for
+  // a live waiter: withGitHubJournal has it publish its claim to disk and then poll, so a queued
+  // claim or raw claim there does not imply its owner is dead, alive, or even fully written yet.
+  // Once the current owner is proven dead we therefore cannot report "dead" while any later
+  // ticket remains unresolved -- that queued entry could belong to a still-live pre-#34 process
+  // that will recover the dead owner and mutate concurrently with a #34 migration. Fail
+  // conservative ("ambiguous") rather than guess it is safe.
+  const hasLaterUnresolvedTicket = (currentTicket: bigint): boolean => {
+    for (let ticket = currentTicket + 1n; ticket <= scan.highestTicket; ticket += 1n) {
+      const ticketText = formatLockTicket(ticket);
+      if (scan.rawClaims.has(ticketText) && !scan.rawReleases.has(ticketText)) return true;
+      if (claimsByTicket.has(ticketText) && !scan.releases.has(ticketText)) return true;
+    }
+    return false;
+  };
+
+  for (let ticket = 1n; ticket <= scan.highestTicket; ticket += 1n) {
+    const ticketText = formatLockTicket(ticket);
+    const rawClaim = scan.rawClaims.get(ticketText);
+    if (rawClaim) {
+      if (scan.rawReleases.has(ticketText)) continue;
+      return { state: "malformed" };
+    }
+    const claim = claimsByTicket.get(ticketText);
+    if (!claim) return { state: "malformed" };
+    if (scan.releases.has(ticketText)) continue;
+    // This is the current (lowest unresolved) claim. Prove death exactly or default to live.
+    let dead: boolean;
+    try {
+      dead = isProcessDefinitelyDeadFn(claim.pid);
+    } catch {
+      return { state: "ambiguous" };
+    }
+    if (!dead) return { state: "live" };
+    if (hasLaterUnresolvedTicket(ticket)) return { state: "ambiguous" };
+    return { state: "dead" };
+  }
+  return { state: "absent" };
 }

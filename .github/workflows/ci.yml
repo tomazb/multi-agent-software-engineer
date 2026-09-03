@@ -15,7 +15,11 @@ concurrency:
 jobs:
   canonical-node-24-18-0:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # This job runs the full suite plus the Issue 11 contention loops and the
+    # package-verification steps, so it is the longest of the three. Raised
+    # from 10 to 20 when Issue #34 grew the suite past the previous ceiling:
+    # main was already running at 9m20s of a 10m cap before that change.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7

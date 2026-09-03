@@ -91,6 +91,7 @@ test("each bounded rate-limit retry receives a fresh request deadline", async (t
       http: createFetchGitHubHttpClient({ timeoutMs: 15, fetchFn }),
       sideEffects: new GitHubSideEffectStore(root),
       readOnlyChecks: true,
+      repositoryId: 424242,
       owner: "owner",
       repo: "repo",
       pullRequestNumber: 1,

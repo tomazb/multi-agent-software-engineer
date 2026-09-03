@@ -8,6 +8,22 @@ The project follows semantic versioning once a public release process is establi
 
 ### Added
 
+- Issue #34 stable GitHub repository identity: GitHub's immutable numeric `repository.id` is now
+  the sole identity anchor for repository authorization, association keys, publication and
+  association-identity fences, installation-token scope, and check ownership. Mutable `owner/repo`
+  is routing and display metadata that never authorizes anything. Adds
+  `githubApp.allowedRepositoryIds` as the only operational authorization list, the
+  `repository-identity(repositoryId)` GitHub journal kind, ID-scoped least-privilege installation
+  tokens per purpose (`metadata-reconcile`, `pull-request-read`, `checks`), authenticated bounded
+  canonical-name reconciliation, typed permanent-versus-retryable dispatch disposition with a
+  process-local observability-only `permanentRepositoryDropsSinceStart` counter, and legacy
+  attempt-1 check aliasing onto stable keys.
+- `maswe github-migrate-repository --from <legacy-owner/repo> --repository-id <positive-safe-integer> [--json]`:
+  an explicit, restartable operator migration of pre-#34 name-keyed state. `--from` is a local
+  selector only, normalized to lowercase, and is never identity proof. The command requires GitHub
+  App credentials and a live allowlist containing the ID, holds the `repository-identity` fence,
+  and never starts a webhook listener or worker.
+
 - Issue #30 terminal worktree cleanup recovery: durable terminal workflow publication before
   deletion; independent `terminalCleanup` lifecycle (`pending`, `complete`, `failed`,
   `preserved`); retryable `maswe cleanup <run-id>` for `pending`/`failed`; Issue #28 preserved
@@ -97,6 +113,30 @@ The project follows semantic versioning once a public release process is establi
 - Enabled `githubApp` JSON Schema validation now matches runtime policy by requiring
   `readOnlyChecks: true` and at least one allowed repository; disabled configuration may retain an
   empty repository list.
+- An enabled `githubApp` now requires at least one entry in `allowedRepositoryIds` **or**
+  `allowedRepositories`, so a historical name-only configuration still loads for offline
+  inspection and migration preparation. Only `allowedRepositoryIds` authorizes operations;
+  `allowedRepositories` is retained purely to load historical configuration, select and diagnose
+  unresolved legacy records, and display operator context.
+- `maswe github-webhook` now refuses to reach listener readiness while `allowedRepositoryIds` is
+  empty, so there is no supported window in which repository deliveries are accepted under
+  name-only authorization.
+- **Removed the transitional name-primary GitHub surfaces.** The name-scoped
+  `createInstallationAccessToken()` helper, the adapter's name-scoped `tokenProvider` constructor
+  option, and the ambiguous generic association APIs `find`, `bind`, `suspend`, and
+  `findAllByRepositoryBranch` are gone. Callers must name the key namespace explicitly:
+  `findStable`/`bindStable`/`suspendStable`/`findAllStableByRepositoryBranch` for stable records,
+  or `findLegacy`/`suspendLegacy`/`findAllLegacyByRepository`/`migrateLegacy` for unresolved
+  pre-#34 records.
+- **Cutover is required and ordered.** Stop every pre-#34 listener and manual publisher, configure
+  `allowedRepositoryIds`, run `maswe github-migrate-repository` to completion for **every**
+  repository holding pre-#34 state (not only renamed ones — check keys are ID-derived, so an
+  unmigrated repository duplicates every check on its first post-cutover publication), start the
+  new listener, then inspect GitHub delivery history and explicitly redeliver anything GitHub
+  reports as failed during the outage. Suspended pre-#34 legacy associations are deliberately not
+  migrated and stay name-keyed permanently; they are inert and carry no authority. After
+  stable-identity state is written, downgrade to a pre-#34 binary is unsupported and old binaries
+  are expected to fail closed on exact validation.
 - Cursor CLI doctor classification now separates executable-unavailable, version-check failures,
   catalogue failures, role-resolution failures, skipped-prerequisite failures, probe invocation
   failures, probe transport timeouts, cleanup failures, and doctor unexpected errors.

@@ -4,12 +4,14 @@ This document specifies the GitHub App integration. **Phase A (read-only checks)
 
 ## Phase A status (implemented)
 
-- CLI: `maswe github-webhook`, `maswe github-publish-checks <run-id>`
+- CLI: `maswe github-webhook`, `maswe github-publish-checks <run-id>`,
+  `maswe github-migrate-repository --from <owner/repo> --repository-id <id> [--json]`
 - Modules: `src/github/` (signature verify, normalized durable inbox, association index,
   installation token helper, check publisher, adapter, webhook server)
 - File-backed state under `.maswe/github/` (hash-addressed delivery state/queue, side-effect
   idempotency keys, associations, and immutable ownership journals)
-- Config: optional `githubApp` with `readOnlyChecks: true` required when enabled
+- Config: optional `githubApp` with `readOnlyChecks: true` required when enabled, and
+  `allowedRepositoryIds` as the only operational repository authorization list
 - Check names: specification compliance, deterministic quality, independent verification, review comments resolved (always `neutral` in Phase A)
 - Non-goals still deferred (Phase B / later): push, PR create/update, comment replies, digest-bound GitHub approvals, Actions artifact ingestion, Postgres control plane
 
@@ -72,14 +74,22 @@ Each logical association, check-create key, and delivery uses a permanent hash-a
 ```text
 .maswe/github/journals/
 ├── association/<sha256-logical-key>/.lock-journal-v3/
+├── association-identity/<sha256-repositoryId-and-pr>/.lock-journal-v3/
 ├── check-create/<sha256-logical-key>/.lock-journal-v3/
 ├── delivery/<sha256-logical-key>/.lock-journal-v3/
-└── publication/<sha256-repository-and-pr>/.lock-journal-v3/
+├── publication/<sha256-repositoryId-and-pr>/.lock-journal-v3/
+└── repository-identity/<sha256-repositoryId>/.lock-journal-v3/
     ├── format.json
     ├── data/{claims,releases,tmp}/
     ├── admin/{claims,releases,tmp}/
     └── admin-recovery/{claims,releases,tmp}/
 ```
+
+`repository-identity` is keyed by the stable numeric repository ID and serializes legacy identity
+migration, canonical-name reconciliation, repository authorization suspension/recovery, and
+repository-scoped publication entry. `publication` and `association-identity` are keyed by
+`<repositoryId>#<pullRequestNumber>`. No operational path acquires a name-keyed publication or
+association-identity fence.
 
 Claims and releases are canonical, digest-bound immutable files published with hard links. No
 published ownership pathname is deleted, replaced, or reused. Before the webhook listener accepts
@@ -114,15 +124,40 @@ marker and retains the old pathname. A live, malformed, or changing legacy owner
 Mixed old/new active binaries are unsupported, and operators must not delete retained paths or
 journal records.
 
+## Stable repository identity
+
+GitHub's immutable numeric `repository.id` is the sole repository identity anchor. A mutable
+`owner/repo` name is routing and display metadata that never authorizes anything.
+
+- `githubApp.allowedRepositoryIds` is the only operational authorization list. Every
+  repository-scoped association, reconciliation, credential mint, workflow mutation, and check
+  publication requires a non-empty live list containing the exact target ID.
+- `githubApp.allowedRepositories` is still accepted, but only to load historical project
+  configuration during migration, to select and diagnose unresolved legacy local records, and to
+  display operator context. A name in that list grants nothing.
+- Look the ID up once with an authenticated request such as
+  `gh api repos/<owner>/<repo> --jq .id`, then record it in `allowedRepositoryIds`. The example
+  configuration ships with an empty list, which denies everything.
+- Repository URLs, redirects, remotes, branch names, PR SHAs, and check resources are never
+  substitutes for the ID. MASWE never follows a rename redirect to establish identity: it re-reads
+  the canonical name from the authenticated installation-repository listing under the ID it
+  already holds.
+- Canonical-name lookup traverses at most 100 bounded `per_page=100` pages (10,000 repositories).
+  Exhausting that limit is reported as `traversal-limit-exceeded`; it is an ambiguous failure, not
+  evidence of absence or of revoked access. Narrow the installation's repository scope rather than
+  treating it as a missing repository.
+
 ## Repository permissions
 
-Each repository-scoped Phase A installation token requests exactly these permissions:
+Each Phase A installation token is minted for exactly one stable repository ID
+(`repository_ids: [<repositoryId>]`) with the exact least-privilege permission set for its purpose.
+There is no name-scoped token path anywhere in the credential chain.
 
-| Permission | Access | Purpose |
+| Purpose | Permissions | Used by |
 |---|---|---|
-| Metadata | Read | Required by GitHub Apps |
-| Pull requests | Read | Read PR identity and current head; Phase A refuses PR/comment writes |
-| Checks | Write | List, create, and update MASWE check runs |
+| `metadata-reconcile` | Metadata: read | Canonical repository lookup and rename reconciliation |
+| `pull-request-read` | Metadata: read; Pull requests: read | PR identity, head/base SHA, and ownership proof |
+| `checks` | Metadata: read; Pull requests: read; Checks: write | List, create, update, and alias MASWE check runs |
 
 Webhook subscriptions do not broaden the installation token. Phase A does not request Contents,
 Actions, Commit statuses, Issues, or pull-request write permission.
@@ -161,6 +196,7 @@ Subscribe to:
 {
   "eventId": "github-delivery-id",
   "type": "review_comment.created",
+  "repositoryId": 1308655205,
   "repository": "owner/repo",
   "installationId": 12345,
   "pullRequestNumber": 42,
@@ -172,6 +208,10 @@ Subscribe to:
   "receivedAt": "2026-07-22T12:00:00Z"
 }
 ```
+
+`repositoryId` is the authoritative field; `repository` travels with it for routing and display
+only. A new repository-bearing webhook payload without a well-formed `repository.id` is rejected
+with HTTP 400 during normalization, before durable enqueue.
 
 The review body is untrusted and never becomes a command.
 
@@ -196,6 +236,13 @@ Every check run includes:
 - Summary of acceptance criteria and blocking findings.
 - Conclusion: success, failure, neutral, cancelled, timed_out, or action_required.
 
+Check idempotency keys and the external IDs derived from them are keyed by the stable repository
+ID, not by the repository name. A pre-#34 check therefore carries a legacy, name-derived external
+ID that the post-#34 key can no longer find. Repository identity migration aliases each existing
+attempt-1 production check onto its stable key so the check is adopted rather than duplicated;
+until a repository has been migrated, the first post-cutover publication would create a second
+copy of every check.
+
 A new head SHA invalidates all previous success conclusions. The app creates or updates checks only for the SHA that was actually evaluated.
 The run record retains a bounded set of pending old-head cancellations until every cancellation and
 the current-head publication succeeds. A retry therefore cannot forget uncancelled checks after a
@@ -211,12 +258,32 @@ context-fenced associated-head path. Append-only events determine the return gat
 `PR_REVIEW` returns there, otherwise recovery returns to `PR_READY`; stale-head recovery never
 restores `MERGE_READY` directly.
 
-Manual and webhook Phase A follow one lock order: per-PR publication, per-PR association identity,
-per-run target mutation, global association index, then run-store data. Authorization suspension
-uses the applicable suffix (identity, association, store). The run mutation fence is released
-before checks are posted; routing itself reacquires it through the shared revalidation service.
-This prevents a builder/resolver publication from committing against the prior head between the
-association update and the durable request/retarget event.
+Manual and webhook Phase A follow one stable lock order:
+
+```text
+repository-identity(repositoryId)
+  -> publication / association-identity(repositoryId#pullRequestNumber)
+    -> run target mutation fence(runId)
+      -> global association transaction / check-create lock
+        -> run-store data
+```
+
+The single exception is authority-reducing removal of an *unresolved pre-#34 legacy* association
+(for example `installation.deleted` against a record that has no `repositoryId`). That branch uses
+the common suffix only:
+
+```text
+run target mutation fence(runId)
+  -> global association transaction
+```
+
+It never acquires a name-keyed publication/association-identity fence and never invents a
+repository-ID fence for a record that has no ID. Authorization suspension otherwise uses the
+applicable suffix (identity, association, store). The run mutation fence is released before checks
+are posted; routing itself reacquires it through the shared revalidation service. This prevents a
+builder/resolver publication from committing against the prior head between the association update
+and the durable request/retarget event. No code path may invert `association transaction -> run
+target fence`.
 
 Association state is exact-schema validated and permits one active PR per run ID. PR closure uses
 a distinct suspension reason, so a valid `reopened` event can reactivate it. Installation deletion
@@ -355,6 +422,32 @@ bounded pagination across every advertised page; patch a recovered check with th
 - CI failure: builder/resolver correction loop under budget.
 - Ambiguous review comment: `WAITING_FOR_HUMAN`.
 - Permission change or installation removal: suspend every listed repository (including multi-repo `repositories_removed`) and reconcile run records even when the index was already suspended; run-save errors other than missing runs surface to the handler.
+- Repository-scoped dispatch is typed as either retryable or **permanent**. A permanent
+  disposition performs zero authority-increasing mutation, emits a bounded typed reason, consumes
+  the durable delivery instead of retrying it, and never falls back to name-based authorization.
+  Permanent reasons include: the ID is not live-allowlisted; stable authorization is not
+  configured because the cutover order was violated; the same name resolves a conflicting ID; an
+  ordinary historical event carries no stable ID; run/index stable identity conflicts; an
+  authenticated live result proves a different identity; and a fully and safely exhausted
+  installation-repository listing with the target ID absent when no existing association can be
+  authority-reduced (`repository-access-revoked`).
+- Rate limits, transient transport or 5xx failures, temporary token/API failures without proven
+  authorization loss, pagination page-limit exhaustion, malformed or unsafe pagination responses,
+  lock contention, and recoverable durable I/O stay **retryable**. An ambiguous API or pagination
+  failure is never proof of revocation.
+- If a fully traversed listing proves access was revoked and an affected association is
+  successfully suspended as `authorization-revoked`, dispatch returns `applied`: the allowed
+  authority-reducing mutation happened and the delivery completes normally. This `applied` case
+  does **not** increment `permanentRepositoryDropsSinceStart`: that counter tracks deliveries
+  consumed for identity/policy reasons without an authority-reducing mutation, not the successful
+  suspension itself.
+- Each permanently consumed repository-scoped delivery increments a process-local
+  `permanentRepositoryDropsSinceStart` counter. It saturates at `Number.MAX_SAFE_INTEGER`, resets
+  on process restart, is never persisted, is never exposed through `doctor`, and its only reader
+  is the listener diagnostic callback. It is observability only and never changes dispatch,
+  retry, authorization, or migration behavior. A non-zero count means deliveries were dropped for
+  identity/policy reasons: investigate the configuration and migration state rather than
+  redelivering blindly.
 
 ## Capacity, retention, shutdown, and recovery
 

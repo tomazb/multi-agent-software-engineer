@@ -331,6 +331,7 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     const association = github as Record<string, unknown>;
     const allowed = new Set([
       "installationId",
+      "repositoryId",
       "repository",
       "pullRequestNumber",
       "baseSha",
@@ -347,6 +348,14 @@ export function migrateRunRecord(raw: unknown): RunRecord {
     const installationId = association.installationId;
     if (!Number.isSafeInteger(installationId) || (installationId as number) < 1) {
       throw new Error("Run record github.installationId must be a positive integer");
+    }
+    // Additive schema-v1 field: historical associations persisted before stable identity omit it.
+    const repositoryId = association.repositoryId;
+    if (
+      repositoryId !== undefined &&
+      (!Number.isSafeInteger(repositoryId) || (repositoryId as number) < 1)
+    ) {
+      throw new Error("Run record github.repositoryId must be a positive integer when set");
     }
     if (
       typeof association.repository !== "string" ||

@@ -1,8 +1,6 @@
 import { createSign, createPrivateKey } from "node:crypto";
 import type { GitHubHttpClient } from "./http.ts";
 
-export type GitHubTokenHttp = GitHubHttpClient;
-
 function base64Url(input: Buffer | string): string {
   const buf = typeof input === "string" ? Buffer.from(input, "utf8") : input;
   return buf.toString("base64url");
@@ -23,30 +21,77 @@ export function createGitHubAppJwt(appId: string, privateKeyPem: string, nowMs =
   return `${data}.${signature}`;
 }
 
-export async function createInstallationAccessToken(options: {
+/** Explicit least-privilege installation-token purposes; #34 must not broaden or add to this set implicitly. */
+export type GitHubInstallationTokenPurpose =
+  | "metadata-reconcile"
+  | "pull-request-read"
+  | "checks";
+
+export type GitHubRepositoryTokenProvider = (
+  installationId: number,
+  repositoryId: number,
+  purpose: GitHubInstallationTokenPurpose,
+) => Promise<string>;
+
+/**
+ * Exact least-privilege permission set per token purpose (design doc §4).
+ * Phase B write authority stays disabled; #34 must not broaden these
+ * implicitly and must not add new purposes here.
+ */
+const REPOSITORY_TOKEN_PERMISSIONS: Record<GitHubInstallationTokenPurpose, Record<string, string>> = {
+  "metadata-reconcile": { metadata: "read" },
+  "pull-request-read": { metadata: "read", pull_requests: "read" },
+  checks: { checks: "write", metadata: "read", pull_requests: "read" },
+};
+
+/**
+ * Requests a repository-ID-scoped installation access token. All requests
+ * use `repository_ids: [repositoryId]`; there is no name fallback anywhere
+ * in this credential path.
+ */
+export async function createRepositoryInstallationAccessToken(options: {
   appId: string;
   privateKeyPem: string;
   installationId: number;
-  http: GitHubTokenHttp;
-  /** Canonical owner/name repository identity; the API body receives the name component. */
-  repository: string;
-  /** Phase A least-privilege scope; only an explicit false opts out. */
+  repositoryId: number;
+  purpose: GitHubInstallationTokenPurpose;
+  http: GitHubHttpClient;
   readOnlyChecks?: boolean;
-  nowMs?: number;
 }): Promise<string> {
   if (options.readOnlyChecks === false) {
     throw new Error("GitHub installation tokens require the read-only checks policy");
   }
-  const repositoryMatch = options.repository.match(/^[^/\s]+\/([^/\s]+)$/);
-  if (!repositoryMatch) {
-    throw new Error("GitHub repository must use the owner/name form");
+  if (!Number.isSafeInteger(options.installationId) || options.installationId <= 0) {
+    throw new Error("GitHub installation id must be a positive safe integer");
   }
-  const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem, options.nowMs);
-  const body: Record<string, unknown> = { repositories: [repositoryMatch[1]!] };
-  body.permissions = {
-    checks: "write",
-    pull_requests: "read",
-    metadata: "read",
+  if (!Number.isSafeInteger(options.repositoryId) || options.repositoryId <= 0) {
+    throw new Error("GitHub repository id must be a positive safe integer");
+  }
+  // Object.hasOwn guards against Object.prototype keys ("constructor",
+  // "toString", "valueOf", "hasOwnProperty", ...): REPOSITORY_TOKEN_PERMISSIONS
+  // is a plain object literal, so a bare `[options.purpose]` lookup on one of
+  // those keys resolves to an inherited function rather than `undefined`. A
+  // function is truthy, so a `!permissions` guard alone fails open, and
+  // JSON.stringify (src/github/http.ts) silently drops function-valued
+  // properties -- the request would go out with `permissions` omitted
+  // entirely, which GitHub interprets as "grant the installation's full
+  // permission set". Reject unless `purpose` is one of this table's own
+  // (non-inherited) keys.
+  if (!Object.hasOwn(REPOSITORY_TOKEN_PERMISSIONS, options.purpose)) {
+    throw new Error(`Unknown GitHub installation token purpose: ${String(options.purpose)}`);
+  }
+  const permissions = REPOSITORY_TOKEN_PERMISSIONS[options.purpose];
+  // Belt-and-braces: even with the own-property guard above, assert the
+  // resolved value is a plain permissions object before it is used to build
+  // the request body, so a future refactor of this table cannot silently
+  // reintroduce a non-object (or non-plain-object) value on this path.
+  if (permissions === null || typeof permissions !== "object" || Array.isArray(permissions)) {
+    throw new Error(`Unknown GitHub installation token purpose: ${String(options.purpose)}`);
+  }
+  const jwt = createGitHubAppJwt(options.appId, options.privateKeyPem);
+  const body: Record<string, unknown> = {
+    repository_ids: [options.repositoryId],
+    permissions,
   };
   const response = await options.http.request(
     "POST",

@@ -1,8 +1,18 @@
 import { createHash } from "node:crypto";
 import type { RunRecord } from "../domain.ts";
+import { parseOwnerRepo } from "./adapter-identities.ts";
 import type { GitHubHttpClient } from "./http.ts";
+import {
+  GitHubPaginationError,
+  headerValue,
+  isRateLimited,
+  nextGitHubLink,
+  requireSafeGitHubPageUrl,
+} from "./pagination.ts";
 import type { GitHubSideEffectStore } from "./side-effect-store.ts";
 import { MASWE_CHECK_NAMES, type MasweCheckName } from "./types.ts";
+
+export { isRateLimited } from "./pagination.ts";
 
 export type { GitHubHttpClient } from "./http.ts";
 
@@ -98,14 +108,38 @@ export function buildCheckConclusions(
   };
 }
 
-function idempotencyKey(
-  owner: string,
-  repo: string,
+/**
+ * Stable check-run idempotency key (design doc §15). Keyed by the stable
+ * numeric repository id, never mutable `owner/repo` text, so the derived
+ * external id -- and therefore check ownership -- remains identical across
+ * any future rename.
+ */
+export function checkRunIdempotencyKey(
+  repositoryId: number,
   pullRequestNumber: number,
   headSha: string,
   checkName: string,
   attempt: number,
 ): string {
+  return `check-run:${repositoryId}/${pullRequestNumber}/${headSha}/${checkName}/${attempt}`;
+}
+
+/**
+ * Reproduces the pre-#34 baseline check-run idempotency key byte-for-byte
+ * (design doc §15.1/§15.2): a mutable-name key with `owner` and `repo`
+ * interpolated as two separate path segments, exactly as the historical
+ * `idempotencyKey` helper produced. Used only to compute the legacy external
+ * id/local record selector during one-time attempt-1 aliasing -- never as an
+ * ongoing identity.
+ */
+export function legacyCheckRunIdempotencyKey(
+  repository: string,
+  pullRequestNumber: number,
+  headSha: string,
+  checkName: string,
+  attempt: number,
+): string {
+  const { owner, repo } = parseOwnerRepo(repository);
   return `check-run:${owner}/${repo}/${pullRequestNumber}/${headSha}/${checkName}/${attempt}`;
 }
 
@@ -115,113 +149,28 @@ export function externalIdFor(key: string): string {
 
 const CHECK_RECONCILIATION_PAGE_LIMIT = 10;
 
-function headerValue(
-  headers: Record<string, string>,
-  expectedName: string,
-): string | undefined {
-  const normalizedExpectedName = expectedName.toLowerCase();
-  for (const [name, value] of Object.entries(headers)) {
-    if (name.toLowerCase() === normalizedExpectedName) return value;
-  }
-  return undefined;
-}
-
-function nextLinkFrom(headers: Record<string, string>): string | undefined {
-  const value = headerValue(headers, "link");
-  if (value === undefined) return undefined;
-  if (value.trim() === "") throw new Error("GitHub check-run pagination Link header is malformed");
-
-  let nextUrl: string | undefined;
-  for (const segment of value.split(",")) {
-    const link = /^\s*<([^<>]+)>(.*)$/.exec(segment);
-    if (!link) throw new Error("GitHub check-run pagination Link header is malformed");
-    const parameterText = link[2]!;
-    const parameters = parameterText.split(";");
-    if (parameters.shift()!.trim() !== "") {
-      throw new Error("GitHub check-run pagination Link header is malformed");
+/**
+ * Extracted `nextGitHubLink`/`requireSafeGitHubPageUrl` (pagination.ts) throw
+ * a generic `GitHubPaginationError` since their signatures are frozen and
+ * carry no caller-specific message context. This remaps the extracted error
+ * codes back onto the exact historical check-run pagination strings that
+ * existing tests assert on verbatim, so the extraction changes no observable
+ * behavior.
+ */
+function remapCheckPaginationError(error: unknown): never {
+  if (error instanceof GitHubPaginationError) {
+    switch (error.code) {
+      case "link-header-malformed":
+        throw new Error("GitHub check-run pagination Link header is malformed");
+      case "link-multiple-next":
+        throw new Error("GitHub check-run pagination Link header has multiple next links");
+      case "link-url-malformed":
+        throw new Error("GitHub check-run pagination Link URL is malformed");
+      case "link-url-unsafe":
+        throw new Error("GitHub check-run pagination Link URL is unsafe");
     }
-
-    let relations: string[] = [];
-    let hasRelationParameter = false;
-    for (const parameter of parameters) {
-      const parsed = /^\s*([^=\s]+)\s*=\s*(?:"([^"]*)"|([^"\s;]+))\s*$/.exec(parameter);
-      if (!parsed) throw new Error("GitHub check-run pagination Link header is malformed");
-      if (parsed[1]!.toLowerCase() === "rel") {
-        if (hasRelationParameter) {
-          throw new Error("GitHub check-run pagination Link header is malformed");
-        }
-        hasRelationParameter = true;
-        relations = (parsed[2] ?? parsed[3] ?? "").split(/\s+/).filter(Boolean);
-        const normalizedRelations = relations.map((relation) => relation.toLowerCase());
-        if (new Set(normalizedRelations).size !== normalizedRelations.length) {
-          throw new Error("GitHub check-run pagination Link header is malformed");
-        }
-      }
-    }
-    if (!relations.some((relation) => relation.toLowerCase() === "next")) continue;
-    if (nextUrl !== undefined) {
-      throw new Error("GitHub check-run pagination Link header has multiple next links");
-    }
-    nextUrl = link[1]!;
   }
-  return nextUrl;
-}
-
-function safePaginationUrl(
-  rawUrl: string,
-  endpointPath: string,
-  checkName: string,
-): string {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    throw new Error("GitHub check-run pagination Link URL is malformed");
-  }
-  const allowedQueryKeys = new Set(["check_name", "filter", "per_page", "page"]);
-  const hasOnlyAllowedQueryKeys = Array.from(parsed.searchParams.keys()).every((key) =>
-    allowedQueryKeys.has(key),
-  );
-  const hasExactSingleValue = (key: string, expected: string): boolean => {
-    const values = parsed.searchParams.getAll(key);
-    return values.length === 1 && values[0] === expected;
-  };
-  const pageValues = parsed.searchParams.getAll("page");
-  const hasValidPage =
-    pageValues.length === 0 ||
-    (pageValues.length === 1 && /^[1-9]\d*$/.test(pageValues[0]!));
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.origin !== "https://api.github.com" ||
-    parsed.username !== "" ||
-    parsed.password !== "" ||
-    parsed.pathname !== endpointPath ||
-    parsed.hash !== "" ||
-    !hasOnlyAllowedQueryKeys ||
-    !hasExactSingleValue("check_name", checkName) ||
-    !hasExactSingleValue("filter", "all") ||
-    !hasExactSingleValue("per_page", "100") ||
-    !hasValidPage
-  ) {
-    throw new Error("GitHub check-run pagination Link URL is unsafe");
-  }
-  return parsed.toString();
-}
-
-export function isRateLimited(
-  status: number,
-  headers: Record<string, string>,
-  body: unknown,
-): boolean {
-  if (status === 429) return true;
-  if (status !== 403) return false;
-  const remaining = headerValue(headers, "x-ratelimit-remaining");
-  if (remaining === "0") return true;
-  const message =
-    body && typeof body === "object" && "message" in body
-      ? String((body as { message: unknown }).message)
-      : "";
-  return /rate limit/i.test(message);
+  throw error;
 }
 
 function rateLimitDelayMs(headers: Record<string, string>, attempt: number): number {
@@ -245,6 +194,7 @@ export class CheckPublisher {
   private readonly http: GitHubHttpClient;
   private readonly sideEffects: GitHubSideEffectStore;
   private readonly readOnlyChecks: boolean;
+  private readonly repositoryId: number;
   private readonly owner: string;
   private readonly repo: string;
   private readonly pullRequestNumber: number;
@@ -257,6 +207,8 @@ export class CheckPublisher {
     http: GitHubHttpClient;
     sideEffects: GitHubSideEffectStore;
     readOnlyChecks: boolean;
+    /** Stable repository id (design doc §15). Owner/repo remain REST routing only. */
+    repositoryId: number;
     owner: string;
     repo: string;
     pullRequestNumber: number;
@@ -268,6 +220,7 @@ export class CheckPublisher {
     this.http = options.http;
     this.sideEffects = options.sideEffects;
     this.readOnlyChecks = options.readOnlyChecks;
+    this.repositoryId = options.repositoryId;
     this.owner = options.owner;
     this.repo = options.repo;
     this.pullRequestNumber = options.pullRequestNumber;
@@ -303,9 +256,8 @@ export class CheckPublisher {
 
   private async invalidatePreviousSha(previousHeadSha: string): Promise<void> {
     for (const name of MASWE_CHECK_NAMES) {
-      const key = idempotencyKey(
-        this.owner,
-        this.repo,
+      const key = checkRunIdempotencyKey(
+        this.repositoryId,
         this.pullRequestNumber,
         previousHeadSha,
         name,
@@ -334,9 +286,8 @@ export class CheckPublisher {
     headSha: string,
     outcome: CheckOutcome,
   ): Promise<void> {
-    const key = idempotencyKey(
-      this.owner,
-      this.repo,
+    const key = checkRunIdempotencyKey(
+      this.repositoryId,
       this.pullRequestNumber,
       headSha,
       name,
@@ -413,9 +364,29 @@ export class CheckPublisher {
       );
       if (match) return match.id;
 
-      const nextLink = nextLinkFrom(response.headers);
+      let nextLink: string | undefined;
+      try {
+        nextLink = nextGitHubLink(response.headers);
+      } catch (error) {
+        remapCheckPaginationError(error);
+      }
       if (nextLink === undefined) return undefined;
-      const nextUrl = safePaginationUrl(nextLink, endpointPath, name);
+      let nextUrl: string;
+      try {
+        nextUrl = requireSafeGitHubPageUrl(nextLink, {
+          origin: "https://api.github.com",
+          pathname: endpointPath,
+          requiredQuery: {
+            check_name: name,
+            filter: "all",
+            per_page: "100",
+          },
+          optionalPositiveIntegerQuery: ["page"],
+          allowedQueryKeys: ["check_name", "filter", "per_page", "page"],
+        });
+      } catch (error) {
+        remapCheckPaginationError(error);
+      }
       if (visited.has(nextUrl)) {
         throw new Error("GitHub check-run pagination Link loop detected");
       }

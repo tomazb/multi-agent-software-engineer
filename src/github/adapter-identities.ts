@@ -1,4 +1,8 @@
-import type { GitHubAppConfig } from "../domain.ts";
+import type {
+  GitHubAppConfig,
+  RunGitHubAssociation,
+  StableRunGitHubAssociation,
+} from "../domain.ts";
 import path from "node:path";
 
 const MAX_PENDING_CANCELLATION_HEADS = 64;
@@ -13,12 +17,73 @@ export function parseOwnerRepo(repository: string): { owner: string; repo: strin
   return { owner: match[1]!, repo: match[2]! };
 }
 
+/**
+ * NOT an authorization predicate (design doc §3.2).
+ *
+ * Under Issue #34, only `isRepositoryIdAllowed` (backed by
+ * `allowedRepositoryIds`) authorizes anything. `allowedRepositories` is
+ * retained solely for legacy selection/diagnosis and operator display, and
+ * this helper exists to read that field back -- it must never be consulted
+ * for an authorization decision. It currently has no production caller and
+ * must not acquire one for authorization purposes.
+ */
 export function isRepoAllowed(
   config: GitHubAppConfig,
   repository: string | undefined,
 ): boolean {
   if (!repository) return false;
   return config.allowedRepositories.includes(repository);
+}
+
+/**
+ * Operational repository authorization (design doc §3.2).
+ *
+ * Consults `allowedRepositoryIds` only. A mutable `owner/repo` name is
+ * routing/display/candidate metadata and must never authorize anything, so a
+ * name present in `allowedRepositories` grants nothing here.
+ */
+export function isRepositoryIdAllowed(
+  config: GitHubAppConfig,
+  repositoryId: number | undefined,
+): boolean {
+  if (repositoryId === undefined) return false;
+  return config.allowedRepositoryIds.includes(repositoryId);
+}
+
+/**
+ * The single validity predicate for a stable repository id: a positive safe
+ * integer. Every guard that decides whether a record/association is stable
+ * must delegate here so their strictness cannot drift apart.
+ */
+export function isStableRepositoryId(repositoryId: number | undefined): repositoryId is number {
+  return (
+    typeof repositoryId === "number" && Number.isSafeInteger(repositoryId) && repositoryId > 0
+  );
+}
+
+/**
+ * Rejects unresolved legacy state before any stable repository/PR publication
+ * fence is acquired (design doc §8).
+ *
+ * An ID-less (or malformed-ID) association is a historical record that has not
+ * been migrated yet. It is never silently upgraded here -- resolving it needs
+ * live installation proof -- so this fails closed with an explicit
+ * migration-required error that names the legacy selector.
+ */
+export function requireStableGitHubAssociation(
+  association: RunGitHubAssociation | undefined,
+): StableRunGitHubAssociation {
+  if (association === undefined) {
+    throw new Error(
+      "GitHub association is missing its stable repository id; explicit migration is required",
+    );
+  }
+  if (!isStableRepositoryId(association.repositoryId)) {
+    throw new Error(
+      `GitHub association ${association.repository}#${association.pullRequestNumber} is missing its stable repository id; explicit migration is required`,
+    );
+  }
+  return association as StableRunGitHubAssociation;
 }
 
 export function pendingCancellationHeads(
