@@ -80,12 +80,18 @@ Status: owner-approved direction under Issue #31. MH-00 / Issue #32 is published
 
 MH-00 publishes architecture only. External harness runtime support is not implemented by that publication.
 
+**Completed design reconciliation:** Issue #51 applies MH-00 to Cursor-native child execution,
+Projects, Automations, skills, hooks, cloud isolation, and follow-up turns in the
+[2026-09-28 Cursor reconciliation](superpowers/specs/2026-09-28-mh-00-cursor-orchestration-reconciliation.md).
+It is independent of Phase B and must be recorded before final MH-01 design approval; it is not a
+Phase-B entry gate or runtime authorization.
+
 Required order:
 
 1. **Done:** complete Issue #27 and revalidate `main` at the accepted post-hardening SHA.
 2. **Done:** publish, review, and approve MH-00 / Issue #32 and ADR-0008.
-3. **Done:** complete Issue #34 before GitHub Phase B obtains write authority. **Next:** complete the remaining Issue #3 Phase B, then revalidate its exact merged `main` head before multi-harness runtime implementation.
-4. Reconcile Cursor-native orchestration against MH-00/MH-01 documentation before final MH-01 design approval; this design-only work does not block Phase B.
+3. **Done:** complete Issue #34 before GitHub Phase B obtains write authority.
+4. **Next:** complete the remaining Issue #3 Phase B, then revalidate its exact merged `main` head before multi-harness runtime implementation.
 5. MH-01: prove harness-neutral domain/configuration/capability/attempt/evidence contracts against Cursor direct and transitive execution as well as Hermes and DeepSeek Harness.
 6. MH-02: refactor current Cursor/mock runtimes behind the harness registry without semantic drift.
 7. MH-03: define deterministic global/project/private/invocation configuration hierarchy.
@@ -95,10 +101,6 @@ Required order:
 11. MH-09 / #4: freeze distributed worker schemas only after local contracts and initial adapter conformance evidence exist.
 
 Hermes Agent and DeepSeek Harness remain planning-only until their complete entry gates and owner approval are satisfied. MH-00 validates their architecture requirements but does not authorize either adapter or runtime implementation.
-
-The [2026-09-28 Cursor reconciliation](superpowers/specs/2026-09-28-mh-00-cursor-orchestration-reconciliation.md)
-adds Cursor-native child execution, Projects, Automations, skills, hooks, cloud isolation, and
-follow-up turns as MH-01 validation cases. It does not add a new runtime or alter the Phase-B gate.
 
 Routing is capability-negotiated: harness, transport/protocol, profile/composition, provider/model, permissions, ambient/hidden state, retry/delegation behavior, isolation, and evidence completeness remain separate facts. Unknown required capabilities fail closed.
 
