@@ -18,6 +18,9 @@ MASWE is an **orchestrator-first system with a thin Cursor plugin** today and an
 The accepted MH-00 baseline is `23f06f3900598443dc40c65c35336aecda76ea2f`. The normative planned
 multi-harness design is `docs/superpowers/specs/2026-08-26-mh-00-multi-harness-execution-architecture.md`
 and ADR-0008. No external harness adapter is implemented by MH-00.
+The dated [Cursor orchestration reconciliation](superpowers/specs/2026-09-28-mh-00-cursor-orchestration-reconciliation.md)
+applies the same planned rules to Cursor-native delegation, Projects, Automations, skills, hooks,
+and local/cloud execution without changing the historical MH-00 baseline or current adapters.
 
 This prevents a single parent model or external harness from becoming an implicit, long-lived workflow engine.
 
@@ -408,6 +411,18 @@ Direct and transitive product identity remain distinct: `MASWE -> Codex` is not 
 `MASWE -> DeepSeek Harness -> Codex`. Hermes validates transport/provider/model/memory/delegation
 separation; DeepSeek Harness additionally validates exact Cordis profile/composition, internal
 retry/workflow/plugin/sandbox, hidden-state, and evidence-completeness separation.
+
+Cursor is a third concrete validation case for MH-01. A direct MASWE-to-Cursor role invocation and
+a Cursor parent/coordinator with foreground, background, nested, or cloud children are different
+execution shapes. Cursor child worktrees and branches cannot silently replace MASWE's exact-base
+workspace; Project shared files, rules, skills (including inherited Claude/Codex directories),
+hooks, and cloud synchronization are material context when admitted. A parent answer or SDK
+terminal indication does not alone settle an attempt with pending child/follow-up activity.
+Cursor Projects, subscriptions, and Automations may trigger requests but have no MASWE workflow,
+approval, retry, evidence-acceptance, or publication authority. The initial future high-assurance
+Cursor profile requires demonstrable denial of ungoverned delegation/child workspaces and a
+declared context disposition; an unproven control makes that candidate ineligible. MH-02 still
+preserves the existing Cursor CLI/SDK observable semantics.
 
 The complete planned contract and delivery ordering are defined by the MH-00 design spec and
 ADR-0008. Multi-harness runtime implementation remains blocked until #3 Phase B, MH-01, and MH-02

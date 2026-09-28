@@ -447,6 +447,15 @@ second scheduler/approval/retry plane.
 - Harness approvals/permission prompts are execution safety evidence or requests; they cannot
   satisfy MASWE brainstorm/design approval or authorize fallback/publication/privilege expansion.
 
+**Cursor reconciliation:** Cursor Projects can synchronize context between cloud/local agents
+and subscribe to PR, CI, Slack, or scheduled signals; Automations can start cloud agents from
+external events. Cursor discovers project/user skills, including Claude/Codex compatible
+directories, and may cloud-sync personal skills. A future governed Cursor profile must account for
+the effective context and prohibit those native triggers/coordinators from becoming MASWE
+workflow authority. A prompt or an unverified hook configuration does not prove denial of native
+delegation, hidden context, or child worktree creation. Unknown required enforcement is
+ineligible for a high-assurance role.
+
 **Status/gap:** Architecture requirement only. The exact assurance-profile and ambient-input schema
 belongs to MH-01/MH-08 and harness-specific conformance work.
 
@@ -469,6 +478,15 @@ cancel may also leave descendant processes running after MASWE has treated the a
 - Prompt-level cancellation support is an explicit capability; absent support does not remove the
   outer quiescence requirement.
 
+**Cursor reconciliation:** Foreground/background and nested subagents, including isolated local
+worktrees or cloud environments, can leave pending descendants and follow-up turns after a parent
+answer. Cursor's Python SDK describes background results as later turns on the same local run.
+Hook events and SDK completion/cancellation are evidence at their observed strength, not proof of
+MASWE attempt settlement or process/workspace quiescence. Cursor hook failures are fail-open by
+default for applicable failure modes unless configured otherwise; even a qualified `failClosed`
+hook is subordinate to MASWE's outer policy and post-execution workspace checks. Current SDK
+deadline/quiescence remediation remains #49.
+
 **Status/gap:** Architecture requirement only. Exact persistence, retention bounds, process
 supervision, and completeness enums must be approved/tested in later implementation tranches.
 
@@ -484,6 +502,11 @@ and profile provenance.
 - A nested leaf product does not satisfy a direct-adapter assurance contract for that product.
 - Differential verification treats harness and provider/model dimensions independently and
   preserves disagreement instead of converting multiple outputs into implicit consensus.
+
+**Cursor reconciliation:** `MASWE -> Cursor parent -> Cursor child -> Cursor grandchild` is one
+governed parent with transitive descendants unless a later approved delegation contract creates
+MASWE-visible sub-attempts. Cursor's configured per-child model can fall back under plan/admin
+limits, so requested model and observed model/identity strength must remain distinct.
 
 **Status/gap:** Architecture requirement only; child/transitive identity fields belong to MH-01 and
 future governed delegation/adapters.

@@ -358,6 +358,30 @@ The second path remains a DeepSeek Harness attempt with a nested Codex product e
 not satisfy the future direct Codex adapter contract. The same rule applies to Claude Code or any
 other product invoked behind Hermes, DeepSeek Harness, or another harness.
 
+The [Cursor reconciliation](superpowers/specs/2026-09-28-mh-00-cursor-orchestration-reconciliation.md)
+also distinguishes `MASWE -> Cursor` from `MASWE -> Cursor parent -> child -> grandchild`.
+Foreground/background and cloud children remain transitive Cursor execution unless a later
+approved contract admits MASWE-visible sub-attempts. The planned parent record must distinguish a
+child's requested and observed model, permissions, workspace/branch/head, context, cancellation,
+cost, failure, and settlement without fabricating missing child evidence.
+
+### Cursor context and settlement validation (planned MH-01)
+
+The future context manifest must be capable of identifying effective Cursor rules, workspace
+instructions, project skills, inherited Claude/Codex skills, user/global skills, cloud skill-sync
+disposition, hook definitions, and persistent Project shared files when material to an admitted
+execution. Each component is individually attributable or explicitly disabled/unknown; mutable
+components require invalidation on change. A repository digest is not evidence that ambient
+user/cloud context was absent.
+
+The future attempt settlement record must distinguish a parent model answer, transport/SDK
+terminal indication, pending background-child follow-up turns, child outcomes, cancellation,
+late-event drain, outer process/workspace quiescence, evidence flush, and MASWE assurance acceptance.
+Cursor's local Python SDK documents background-child results as later turns on the same run, with
+`run.wait()` draining them; that API behavior alone does not prove MASWE quiescence or evidence
+completeness. This paragraph adds no schema-v1 fields and does not modify current Cursor
+CLI/SDK behavior or the separate #49 deadline issue.
+
 ### Raw evidence and normalized evidence
 
 Where a structured harness/session protocol provides evidence, the future contract should retain a

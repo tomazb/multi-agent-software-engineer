@@ -110,6 +110,29 @@ DeepSeek Harness is the second mandatory validation case.
 
 If a routing design cannot distinguish two materially different DSH Cordis compositions under the same harness name, it does not satisfy this ADR.
 
+## 2026-09-28 Cursor reconciliation
+
+The original MH-00 decision and `BASE_SHA` above remain historical. The
+[dated reconciliation](../superpowers/specs/2026-09-28-mh-00-cursor-orchestration-reconciliation.md)
+adds Cursor itself as a third concrete validation case for the same decision:
+
+- `MASWE -> Cursor` is distinct from `MASWE -> Cursor parent/coordinator -> child -> grandchild`;
+  the latter retains transitive lineage and cannot be counted as independent MASWE roles.
+- Foreground/background, parallel, nested, local-worktree, and cloud child execution require
+  attributable identity, exact workspace/branch/head provenance, bounded cancellation,
+  child settlement, and evidence completeness before a future delegation profile can admit them.
+- Cursor Project shared context, rules, skills, hooks, and personal/cloud-synced inputs are
+  declared/digest-bound or explicitly excluded according to assurance policy; Project
+  subscriptions and Automations are external triggers, not MASWE workflow authority.
+- Hooks can add inner evidence/enforcement, but their observed result cannot replace MASWE's
+  outer workspace, policy, approval, settlement, and publication checks.
+- A future high-assurance Cursor profile must qualify actual restrictions for the exact
+  transport/version. An unavailable or unproven required restriction makes the candidate
+  ineligible; this is not a claim about the current CLI/SDK adapters.
+
+This documentation reconciliation precedes final MH-01 design approval and does not change
+the #3 Phase-B entry gate or MH-02's current-Cursor compatibility requirement.
+
 ## Consequences
 
 ### Positive
