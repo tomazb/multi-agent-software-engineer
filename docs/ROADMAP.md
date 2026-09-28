@@ -76,22 +76,29 @@ Issue #34 must establish stable GitHub repository identity across owner/name ren
 
 ## Multi-harness execution programme
 
-Status: owner-approved direction under Issue #31. MH-00 architecture publication is the current tranche under Issue #32, based exactly on `23f06f3900598443dc40c65c35336aecda76ea2f`.
+Status: owner-approved direction under Issue #31. MH-00 / Issue #32 is published from exact baseline `23f06f3900598443dc40c65c35336aecda76ea2f`; Issue #3 Phase B remains the runtime entry gate.
 
 MH-00 publishes architecture only. External harness runtime support is not implemented by that publication.
+
+**Completed design reconciliation:** Issue #51 applies MH-00 to Cursor-native child execution,
+Projects, Automations, skills, hooks, cloud isolation, and follow-up turns in the
+[2026-09-28 Cursor reconciliation](superpowers/specs/2026-09-28-mh-00-cursor-orchestration-reconciliation.md).
+It is independent of Phase B and must be recorded before final MH-01 design approval; it is not a
+Phase-B entry gate or runtime authorization.
 
 Required order:
 
 1. **Done:** complete Issue #27 and revalidate `main` at the accepted post-hardening SHA.
-2. **Current:** publish, review, and approve MH-00 / Issue #32 and ADR-0008.
-3. Complete Issue #34 before GitHub Phase B obtains write authority; complete the remaining Issue #3 Phase B before multi-harness runtime implementation.
-4. MH-01: prove harness-neutral domain/configuration/capability/attempt/evidence contracts.
-5. MH-02: refactor current Cursor/mock runtimes behind the harness registry without semantic drift.
-6. MH-03: define deterministic global/project/private/invocation configuration hierarchy.
-7. Add planned direct external harnesses as read-only workers after their individual entry gates and owner approval: Claude Code (MH-04), Codex CLI (MH-05), Copilot CLI/OpenCode (MH-06), Hermes Agent (MH-06H), and DeepSeek Harness (#36 / MH-06D).
-8. MH-07: separately govern external writer authority; MASWE retains deterministic commit/publication authority.
-9. MH-08: assurance profiles and differential verification.
-10. MH-09 / #4: freeze distributed worker schemas only after local contracts and initial adapter conformance evidence exist.
+2. **Done:** publish, review, and approve MH-00 / Issue #32 and ADR-0008.
+3. **Done:** complete Issue #34 before GitHub Phase B obtains write authority.
+4. **Next:** complete the remaining Issue #3 Phase B, then revalidate its exact merged `main` head before multi-harness runtime implementation.
+5. MH-01: prove harness-neutral domain/configuration/capability/attempt/evidence contracts against Cursor direct and transitive execution as well as Hermes and DeepSeek Harness.
+6. MH-02: refactor current Cursor/mock runtimes behind the harness registry without semantic drift.
+7. MH-03: define deterministic global/project/private/invocation configuration hierarchy.
+8. Add planned direct external harnesses as read-only workers after their individual entry gates and owner approval: Claude Code (MH-04), Codex CLI (MH-05), Copilot CLI/OpenCode (MH-06), Hermes Agent (MH-06H), and DeepSeek Harness (#36 / MH-06D).
+9. MH-07: separately govern external writer authority; MASWE retains deterministic commit/publication authority.
+10. MH-08: assurance profiles and differential verification.
+11. MH-09 / #4: freeze distributed worker schemas only after local contracts and initial adapter conformance evidence exist.
 
 Hermes Agent and DeepSeek Harness remain planning-only until their complete entry gates and owner approval are satisfied. MH-00 validates their architecture requirements but does not authorize either adapter or runtime implementation.
 
