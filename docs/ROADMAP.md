@@ -50,7 +50,7 @@ Accepted post-#27 baseline: `23f06f3900598443dc40c65c35336aecda76ea2f`.
 
 ## v0.3 — GitHub App pilot
 
-Status: **Phase A (read-only checks) implemented**; Phase B remains on Issue #3. The #27 correctness-hardening entry gate is complete. Issue #34 must be completed or explicitly dispositioned before Phase B obtains GitHub write authority.
+Status: **Phase A (read-only checks) implemented**; Phase B remains on Issue #3. The #27 correctness-hardening and #34 stable-repository-identity entry gates are complete, as recorded in [Issue #3](https://github.com/tomazb/multi-agent-software-engineer/issues/3).
 
 ### Phase A (done)
 
@@ -72,7 +72,10 @@ Required order within #3:
 
 Cross-cutting requirements include exact repository/PR/head/artifact identity, stable idempotency keys, installation-scoped credentials, stale-head revalidation through the hardened core, and bounded crash/retry recovery.
 
-Issue #34 must establish stable GitHub repository identity across owner/name renames, or be explicitly dispositioned, before Phase B obtains write authority.
+**Next design review:** [B1 authenticated GitHub approval comments](superpowers/specs/2026-11-03-issue-3-b1-github-approvals-design.md).
+This is a proposed specification, not an implemented capability. It keeps B1 scoped to
+explicit artifact-bound approval for an existing PR/run association; implementation planning
+follows owner approval. B2/B3/B4 and the multi-harness entry gates retain their existing order.
 
 ## Multi-harness execution programme
 
@@ -163,3 +166,4 @@ Exit criteria:
 - Automated UI/browser evidence capture.
 - Cross-repository plans and coordinated PRs.
 - Model quality/cost routing based on task risk while preserving explicit user policy and no silent identity substitution.
+
