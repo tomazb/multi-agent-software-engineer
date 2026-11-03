@@ -323,14 +323,21 @@ continues through every association before aggregating failures.
 
 ## Approval model
 
-Initial options, in increasing assurance:
+The local `maswe approve <run-id> <gate>` command is implemented. Remote approvals remain
+proposed under [Issue #3 B1](https://github.com/tomazb/multi-agent-software-engineer/issues/3).
 
-1. Maintainer runs local `maswe approve` command.
-2. Authorized user adds a configured label.
-3. Authorized user comments `/maswe approve brainstorm <artifact-digest>`.
-4. Web dashboard approval tied to GitHub identity and artifact digest.
+The [B1 approval-comment specification](superpowers/specs/2026-11-03-issue-3-b1-github-approvals-design.md)
+is **proposed for owner review**, with no runtime implementation in its documentation PR.
+It selects an explicit PR conversation command carrying the run/version, gate, and immutable artifact
+digest; fresh actor permission and association checks; and a stable comment-operation receipt
+paired with the authoritative approval event. A remote approval would commit the gate transition
+without starting a model; the existing `maswe run <run-id>` command would continue execution.
 
-Production should authorize users through repository permission or a configured team. The approval record must include actor, timestamp, artifact digest, and source event ID.
+The pilot requires an existing same-repository PR/run association and explicit opt-in by both
+listener and run configuration. It also requires Issues: read for the App's `issue_comment`
+subscription; the existing narrowed REST read-token purpose remains unchanged. Labels,
+dashboard approvals, automatic continuation, and issue-to-run intake remain deferred. The
+specification records the exact grammar, permission contract, failure handling, and proposed tests.
 
 ## Branch and worktree policy
 
@@ -485,3 +492,4 @@ active-state deletion is unsupported.
 4. Enable automatic in-scope resolution for low-risk categories.
 5. Add thread resolution only after observed reliability targets are met.
 6. Add issue-driven intake and approval commands.
+
