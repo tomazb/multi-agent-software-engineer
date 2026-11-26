@@ -333,15 +333,20 @@ digest; fresh actor permission and association checks; and a stable comment-oper
 paired with the authoritative approval event. A remote approval would commit the gate transition
 without starting a model; the existing `maswe run <run-id>` command would continue execution.
 
-The pilot requires an existing same-repository PR/run association and explicit opt-in by both
-listener and run configuration. It also requires Issues: read for the App's `issue_comment`
-subscription; the existing narrowed REST read-token purpose remains unchanged. Labels,
-dashboard approvals, automatic continuation, and issue-to-run intake remain deferred. The
-specification records the exact grammar, permission contract, failure handling, and proposed tests.
+The pilot requires an existing same-repository PR/run association on an **isolated managed worktree**
+(`useIsolatedWorktree: true`; `operator-checkout` runs remain local-only), full opt-in across both
+listener and run configuration, rejection of GitHub App-attributed comments
+(`performed_via_github_app`), raw-byte artifact digest verification, and a finite B1 retry window
+with `retry-exhausted` operator recovery. Receipts (64 KiB max each) and their journals follow the
+retention and monitoring contract below. The pilot also requires Issues: read for the App's
+`issue_comment` subscription; the existing narrowed REST read-token purpose remains unchanged.
+Labels, dashboard approvals, automatic continuation, and issue-to-run intake remain deferred. The
+specification records the exact grammar, permission contract, pilot setup, failure handling, and
+proposed tests.
 
 ## Branch and worktree policy
 
-- Use a dedicated branch `maswe/<run-id>-<slug>`.
+- Use a dedicated branch `maswe/<run-id>` (matching managed-worktree bootstrap).
 - Builder executes in an isolated clone or worktree.
 - Deterministic code, not the model, creates commits and pushes.
 - Before push, verify the branch base and no disallowed files changed.
@@ -463,7 +468,11 @@ evidence, and immutable journal claims/releases are retained for the lifetime of
 installation. There is no supported automatic pruning: webhook signatures have no replay-expiry
 field, and silently deleting a tombstone could re-enable a replayed side effect. Monitor free
 bytes, inode consumption, queue depth, oldest queued receive time, retry diagnostics, and journal
-growth; provision capacity or stop ingress before the filesystem becomes full.
+growth; provision capacity or stop ingress before the filesystem becomes full. When proposed B1
+approval comments are enabled, this same non-evicting retention and operator-monitoring boundary
+extends to 64 KiB comment-operation receipts and `approval-operation` journals; subscribing to
+`issue_comment` grows permanent `.maswe/github` state for every signed `issue_comment` delivery
+(including issue comments, edits, deletes, and non-candidate PR comments).
 
 The worker uses one lease at a time, a 30-second lease with a five-second heartbeat, exponential
 retry from 250 ms capped at 30 seconds, and a five-second default drain budget when an embedding
@@ -486,10 +495,9 @@ active-state deletion is unsupported.
 
 ## Rollout plan
 
-1. Read-only GitHub App that posts check summaries but cannot push.
-2. Enable branch creation/push for allowlisted repositories.
-3. Enable PR comment classification with human-approved resolution.
-4. Enable automatic in-scope resolution for low-risk categories.
-5. Add thread resolution only after observed reliability targets are met.
-6. Add issue-driven intake and approval commands.
-
+1. Read-only GitHub App that posts check summaries but cannot push (Phase A, implemented).
+2. Enable authenticated digest-bound PR approval comments on allowlisted repositories (Phase B1, proposed).
+3. Enable deterministic branch creation/push and PR creation for allowlisted repositories (Phase B2).
+4. Enable PR review-comment classification with human-approved resolution, followed by Actions terminal-state/artifact ingestion (Phases B3–B4).
+5. Enable automatic in-scope resolution for low-risk categories and thread resolution only after observed reliability targets are met.
+6. Add issue-driven intake commands under separate authorization and lifecycle design.

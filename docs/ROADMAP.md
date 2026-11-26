@@ -166,4 +166,3 @@ Exit criteria:
 - Automated UI/browser evidence capture.
 - Cross-repository plans and coordinated PRs.
 - Model quality/cost routing based on task risk while preserving explicit user policy and no silent identity substitution.
-
