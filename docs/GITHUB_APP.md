@@ -160,7 +160,8 @@ There is no name-scoped token path anywhere in the credential chain.
 | `checks` | Metadata: read; Pull requests: read; Checks: write | List, create, update, and alias MASWE check runs |
 
 Webhook subscriptions do not broaden the installation token. Phase A does not request Contents,
-Actions, Commit statuses, Issues, or pull-request write permission.
+Actions, Commit statuses, Issues, or pull-request write permission. The proposed B1 approval
+pilot adds Issues: read only, for the `issue_comment` subscription (see [Approval model](#approval-model)).
 
 Phase B may add Contents, pull-request, and Issues writes only with a separate feature gate and
 permission review. Avoid administration, secrets, environments, deployments, and organization
@@ -174,7 +175,8 @@ Subscribe to:
 - `pull_request_review`: submitted, edited, dismissed.
 - `pull_request_review_comment`: created, edited, deleted.
 - `pull_request_review_thread`: resolved, unresolved where available.
-- `issue_comment`: created for command/approval comments on PRs and issues.
+- `issue_comment`: created. The proposed B1 pilot admits approval commands only from PR
+  conversation comments; issue comments carry no B1 command authority.
 - `push`: invalidate evidence on branch updates not represented by PR synchronize handling.
 - `check_run` and `check_suite`: consume external CI results.
 - `workflow_run`: consume GitHub Actions terminal status and artifacts when configured.
