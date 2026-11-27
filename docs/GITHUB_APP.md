@@ -336,7 +336,9 @@ paired with the authoritative approval event. A remote approval would commit the
 without starting a model; the existing `maswe run <run-id>` command would continue execution.
 
 The pilot requires an existing same-repository PR/run association on an **isolated managed worktree**
-(`useIsolatedWorktree: true`; `operator-checkout` runs remain local-only), full opt-in across both
+(`useIsolatedWorktree: true`; `operator-checkout` runs remain local-only, and B1 `issue_comment`
+ingress must not run against a `.maswe/` state directory while an `operator-checkout` run executes
+from that checkout), full opt-in across both
 listener and run configuration, rejection of GitHub App-attributed comments
 (`performed_via_github_app`), raw-byte artifact digest verification, and a finite B1 retry window
 with `retry-exhausted` operator recovery. Receipts (64 KiB max each) and their journals follow the
